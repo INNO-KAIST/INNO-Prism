@@ -92,6 +92,7 @@ label.ctl > span { padding-left: 1px; }
 .badge.scan2d { background: #c98500; color: #1a1a19; }
 .badge.histogram { background: #9085e9; color: #1a1a19; }
 .badge.rise_time { background: #7a5fd0; }
+.badge.darkening { background: #8a4b6e; }
 .badge.generic { background: #55554f; }
 .badge.error { background: var(--bad); }
 #drop-hint {
@@ -251,7 +252,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.2.1</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.3.0</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -37239,6 +37240,11 @@ const RISE_MODELS = {
     f: (p, t) => p[0] + p[1] * Math.exp(-Math.exp(p[2]) * t) + p[3] * Math.exp(-Math.exp(p[4]) * t),
     raw: (p) => ({ yf: p[0], A1: p[1], tau1: 1 / Math.exp(p[2]), A2: p[3], tau2: 1 / Math.exp(p[4]) }),
   },
+  stretched_decay: { // KWW — heterogeneous ensembles (photodarkening standard)
+    k: 4, names: ["yf", "A", "k", "beta"],
+    f: (p, t) => p[0] + p[1] * Math.exp(-Math.pow(Math.max(Math.exp(p[2]) * t, 0), clamp(p[3], 0.2, 2.5))),
+    raw: (p) => ({ yf: p[0], A: p[1], tau: 1 / Math.exp(p[2]), beta: clamp(p[3], 0.2, 2.5) }),
+  },
 };
 
 function riseAICc(rss, n, k) {
@@ -37403,6 +37409,7 @@ function riseAnalyzeEdge(tArr, cArr, kind, baseline, baselineSD, opts) {
     }
   } else {
     tryFit("exp_decay", [[steady, Math.abs(span), lnk0], [steady, Math.abs(span), lnk0 + 1.5]]);
+    tryFit("stretched_decay", [[steady, Math.abs(span), lnk0, 1.0], [steady, Math.abs(span), lnk0, 0.6]]);
     tryFit("double_decay", [
       [steady, 0.6 * Math.abs(span), lnk0, 0.4 * Math.abs(span), lnk0 - Math.log(5)],
     ]);
@@ -37608,11 +37615,109 @@ function riseBootstrap(input, analysis, bootOpts, onProgress) {
   return { nBoot, seed, ci, modelStability: { logisticFrac: logisticCount / nBoot } };
 }
 
+/* =============================================================================
+ * DarkenFit — ANP photodarkening analysis
+ *
+ * Physics context: under sustained excitation ANP emission can decay over
+ * seconds–minutes (photodarkening: trap/color-center formation, charge
+ * migration to surface quenchers). For avalanching particles this matters
+ * three ways: (1) the giant nonlinearity AMPLIFIES any absorption/quenching
+ * change, so darkening near threshold collapses emission disproportionately;
+ * (2) darkening during a power scan corrupts s(P)/PA values (exposure-history
+ * artifacts, up/down hysteresis) — the safe dwell/power budget must be known;
+ * (3) applications need a photostability budget (loss %/time at operating
+ * power) and the DARKENING ONSET POWER, whose position relative to P_th
+ * discriminates mechanism (avalanche-population-driven vs direct multiphoton).
+ *
+ * Per-power trace analysis reuses the RiseFit edge machinery (isotonic
+ * model-free crossings + AICc model selection incl. KWW stretched
+ * exponential — the standard heterogeneous-ensemble darkening law).
+ * Reported per trace: loss fraction, t50/t90 darkening half-time, τ_eff,
+ * model + params, direction verdict (다크닝/브라이트닝/안정).
+ * Summary: onset power (first significant loss), loss(P), τ(P).
+ * ========================================================================== */
+function darkenAnalyze(input, opts) {
+  const o = opts || {};
+  const nBins = o.nBins || 140;
+  const out = { engine: "DarkenFit 1.0", perTrace: [], summary: null, acqTime: input.acqTime };
+  for (const tr of input.traces) {
+    const t = [], c = [];
+    for (let i = 0; i < tr.t.length; i++) if (isFinite(tr.t[i]) && isFinite(tr.c[i])) { t.push(tr.t[i]); c.push(tr.c[i]); }
+    const rec = { label: tr.label, P: tr.P, n: t.length, ok: false };
+    out.perTrace.push(rec);
+    if (t.length < 20) { rec.note = "포인트 부족"; continue; }
+    const t0 = t[0];
+    const ts = t.map((v) => v - t0);
+    // robust initial level from the first 2% (≥5 samples)
+    const nHead = Math.max(5, Math.floor(0.02 * ts.length));
+    const head = c.slice(0, nHead);
+    const I0 = median(head);
+    const I0sd = mad(head) || Math.sqrt(Math.max(I0, 1));
+    rec.I0 = I0;
+    // direction pre-test → pick the edge family (decay models can't fit a
+    // BRIGHTENING trace with nonneg amplitudes; use the rise family there)
+    const tail0 = [];
+    for (let i = Math.floor(0.9 * c.length); i < c.length; i++) tail0.push(c[i]);
+    const kindGuess = median(tail0) < I0 ? "decay" : "rise";
+    const edge = riseAnalyzeEdge(ts, c, kindGuess, I0, I0sd, { nBins });
+    rec.Iend = edge.steady;
+    rec.span = edge.span; // steady − I0 : negative → darkening
+    rec.duration = ts[ts.length - 1];
+    // I(0): the 2% head median UNDERESTIMATES fast decays, and KWW (β<0.5)
+    // extrapolation to t=0 is singular/overestimates. Honest choice: the
+    // MEASURED initial level — median of the first 3 samples (counts are
+    // large → relative noise ≲0.5%), taking whichever of {first-3, head}
+    // lies further in the pre-transition direction.
+    const m3 = median(c.slice(0, 3));
+    const I0eff = edge.span < 0 ? Math.max(m3, I0) : Math.min(m3, I0);
+    rec.I0eff = I0eff;
+    rec.loss = isFinite(edge.steady) && I0eff > 0 ? 1 - edge.steady / I0eff : NaN;
+    if (!edge.ok) {
+      rec.verdict = "stable";
+      rec.note = "유의한 변화 없음";
+      rec.ok = true;
+      continue;
+    }
+    rec.ok = true;
+    rec.verdict = edge.span < 0 ? "darkening" : "brightening";
+    rec.free = edge.free;          // t10/t50/t90/t1e (진행도 기준), induction 등
+    rec.fit = edge.fit || null;    // model, params, tauEff, curve
+    rec.aiccTable = edge.aiccTable || null;
+    // model-free initial rate: fractional loss per second over the first
+    // decile of the transition (robust, from isotonic crossings)
+    if (edge.free && isFinite(edge.free.t10) && edge.free.t10 > 0) {
+      rec.initRate = 0.1 * Math.abs(I0eff - edge.steady) / I0eff / edge.free.t10; // frac/s
+    }
+  }
+  // ---- summary over powers ----
+  const sig = out.perTrace.filter((r) => r.ok && r.verdict !== "stable");
+  const dark = sig.filter((r) => r.verdict === "darkening");
+  let onset = null;
+  for (const r of out.perTrace) { // first significant DARKENING by power order
+    if (r.verdict === "darkening") { onset = r; break; }
+  }
+  let worst = null;
+  for (const r of dark) if (!worst || r.loss > worst.loss) worst = r;
+  out.summary = {
+    nTraces: out.perTrace.length,
+    nDark: dark.length,
+    nBright: sig.length - dark.length,
+    onsetP: onset ? onset.P : NaN,
+    maxLoss: worst ? worst.loss : 0,
+    maxLossP: worst ? worst.P : NaN,
+    maxLossT50: worst && worst.free ? worst.free.t50 : NaN,
+    maxLossTauEff: worst && worst.fit ? worst.fit.tauEff : NaN,
+  };
+  return out;
+}
+
 return {
   VERSION,
   analyze, bootstrap, evaluate, synth,
   // RiseFit (ANP rise-time kinetics)
   riseAnalyze, riseBootstrap, riseLogRebin, RISE_MODELS,
+  // DarkenFit (photodarkening)
+  darkenAnalyze,
   // PA standard layer (paper port)
   PA_CONST, paHighState, paMergeClose, paDarkAndGate, paJumpTerm, paJumpOnTrace,
   paJumpCandidates, paHighStateBranch, paDarkOf,
@@ -37756,6 +37861,10 @@ function detectType(file) {
   if (has("measurement/ni_daq_pulse_resp/times") && has("measurement/ni_daq_pulse_resp/counts")) {
     return { type: "rise_time", label: "Rise time (pulse response)", riseGroup: "measurement/ni_daq_pulse_resp", tree };
   }
+  // photodarkening — per-power time traces under trace_counts/
+  if (tree.some((n) => n.kind === "group" && n.path === "measurement/darkening_measurement/trace_counts")) {
+    return { type: "darkening", label: "Photodarkening", darkGroup: "measurement/darkening_measurement", tree };
+  }
   if (tree.some((n) => n.path === `${KEYS.EMCCD_READOUT}/spectrum`)) {
     return { type: "emccd_readout", label: "EMCCD spectrum", tree };
   }
@@ -37808,6 +37917,59 @@ function detectType(file) {
 }
 
 /* --------------------------- typed extractors ----------------------------- */
+/**
+ * Photodarkening extraction. Confirmed schema (measurement/darkening_measurement):
+ *   trace_counts/NNN_XX.XuW  (1, N)  APD count rate vs time at fixed power
+ *   trace_times/NNN_...      (1, N)  time axis [s]
+ *   trace_powers/NNN_...     (1, N)  polled power [W]
+ *   apd_counter_powers (nTraces)     setpoint powers [W] · wheel_positions
+ *   apd_counter_acq_times            integration time per sample [s]
+ * Returns {traces:[{label, P, t, c, pTrace}], acqTime, wheelPositions}.
+ */
+function extractDarkening(file, darkGroup) {
+  const g = darkGroup || "measurement/darkening_measurement";
+  const cg = safeGet(file, `${g}/trace_counts`);
+  if (!cg || !isGroup(cg)) throw new Error("trace_counts 그룹이 없습니다");
+  const keys = cg.keys().slice().sort();
+  const powersR = readDataset(file, `${g}/apd_counter_powers`);
+  const powers = powersR ? Array.from(powersR.data, Number) : null;
+  const acqR = readDataset(file, `${g}/apd_counter_acq_times`);
+  const acqTime = acqR && acqR.data.length ? Number(acqR.data[0]) : NaN;
+  const wpR = readDataset(file, `${g}/wheel_positions`);
+  const traces = [];
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const c = readDataset(file, `${g}/trace_counts/${k}`);
+    const t = readDataset(file, `${g}/trace_times/${k}`);
+    if (!c || !t) continue;
+    const cArr = Array.from(c.data, Number), tArr = Array.from(t.data, Number);
+    const n = Math.min(cArr.length, tArr.length);
+    // 카운터 글리치 제거: 음수(32-bit 롤오버) 및 이웃 대비 5배 이상 고립 스파이크 → NaN
+    for (let j = 0; j < n; j++) {
+      const v = cArr[j];
+      if (!isFinite(v) || v < 0) { cArr[j] = NaN; continue; }
+      const L = j > 0 ? cArr[j - 1] : v, R = j < n - 1 ? cArr[j + 1] : v;
+      const nb = Math.max(Math.abs(L) || 1, Math.abs(R) || 1);
+      if (v > 5 * nb && v - Math.max(L, R) > 10 * Math.sqrt(nb)) cArr[j] = NaN;
+    }
+    // power: setpoint array by index, else parse from label "000_30.7uW"
+    let P = powers && isFinite(powers[i]) ? powers[i] : NaN;
+    if (!isFinite(P)) {
+      const m = k.match(/([\d.]+)\s*u[wW]/);
+      if (m) P = Number(m[1]) * 1e-6;
+    }
+    const pr = readDataset(file, `${g}/trace_powers/${k}`);
+    traces.push({
+      label: k, P,
+      t: tArr.slice(0, n), c: cArr.slice(0, n),
+      pMed: pr ? (() => { const a = Array.from(pr.data, Number).filter(isFinite).sort((x, y) => x - y); return a.length ? a[a.length >> 1] : NaN; })() : NaN,
+    });
+  }
+  if (!traces.length) throw new Error("darkening 트레이스를 읽지 못했습니다");
+  traces.sort((a, b) => a.P - b.P);
+  return { traces, acqTime, wheelPositions: wpR ? Array.from(wpR.data, Number) : null, group: g };
+}
+
 /**
  * Rise-time (pulse response) extraction. Confirmed schema
  * (measurement/ni_daq_pulse_resp): 1D equal-length datasets
@@ -38192,7 +38354,7 @@ return {
   KEYS, readDataset, rows2D, attrsOf, walkTree, detectType,
   extractPowerScanAPD, extractPowerScanEMCCD, extractEmccdReadout, extractPLE,
   extract2DMaps, readForPreview, extractMeta, findPleGroup, safeGet,
-  extractHistogram, scanAxes, extractPATrace, extractRiseTime, extractWaveScan,
+  extractHistogram, scanAxes, extractPATrace, extractRiseTime, extractWaveScan, extractDarkening,
 };
 });
 
@@ -38304,6 +38466,7 @@ function initWorker() {
       "try{if(cmd==='analyze2'){const r=PrismFit.analyze(payload.branch,payload.options);self.postMessage({id,ok:true,result:r});}" +
       "else if(cmd==='boot2'){const r=PrismFit.bootstrap(payload.analysis,payload.options,function(f,l){self.postMessage({id,progress:f,label:l});});self.postMessage({id,ok:true,result:r});}" +
       "else if(cmd==='rise2'){const r=PrismFit.riseAnalyze(payload.input,payload.options);self.postMessage({id,ok:true,result:r});}" +
+      "else if(cmd==='dark2'){const r=PrismFit.darkenAnalyze(payload.input,payload.options);self.postMessage({id,ok:true,result:r});}" +
       "else if(cmd==='riseboot2'){const r=PrismFit.riseBootstrap(payload.input,payload.analysis,payload.options,function(f,l){self.postMessage({id,progress:f,label:l});});self.postMessage({id,ok:true,result:r});}" +
       "else{self.postMessage({id,ok:false,error:'unknown cmd'});}}" +
       "catch(err){self.postMessage({id,ok:false,error:String(err&&err.message||err)});}};";
@@ -38329,6 +38492,7 @@ function rpc(cmd, payload, onProgress) {
           if (cmd === "analyze2") resolve(PrismFit.analyze(payload.branch, payload.options));
           else if (cmd === "boot2") resolve(PrismFit.bootstrap(payload.analysis, payload.options, onProgress));
           else if (cmd === "rise2") resolve(PrismFit.riseAnalyze(payload.input, payload.options));
+          else if (cmd === "dark2") resolve(PrismFit.darkenAnalyze(payload.input, payload.options));
           else if (cmd === "riseboot2") resolve(PrismFit.riseBootstrap(payload.input, payload.analysis, payload.options, onProgress));
           else reject(new Error("unknown cmd"));
         } catch (err) { reject(err); }
@@ -38468,11 +38632,12 @@ function renderAll() {
     case "scan2d": return renderScan2D(rec);
     case "histogram": return renderHistogram(rec);
     case "rise_time": return renderRiseTime(rec);
+    case "darkening": return renderDarkening(rec);
     default: return renderGeneric(rec);
   }
 }
 function viewTabLabel(rec) {
-  return { power_apd: "분석 · Power scan", power_emccd: "분석 · Power scan", emccd_readout: "스펙트럼", ple: "PLE 맵", scan2d: "2D 맵", histogram: "히스토그램", rise_time: "분석 · Rise time", generic: "미리보기" }[rec.det.type] || "보기";
+  return { power_apd: "분석 · Power scan", power_emccd: "분석 · Power scan", emccd_readout: "스펙트럼", ple: "PLE 맵", scan2d: "2D 맵", histogram: "히스토그램", rise_time: "분석 · Rise time", darkening: "분석 · Darkening", generic: "미리보기" }[rec.det.type] || "보기";
 }
 
 /* --------------------------- beam calibration ----------------------------- */
@@ -39854,7 +40019,7 @@ function fmtTCI(est, ci, key) {
 const RISE_MODEL_LABEL = {
   single_exp: "단일 지수", logistic_delay: "지연 로지스틱 (avalanche)",
   double_exp: "이중 지수", stretched_exp: "신장 지수", rise_relax: "상승-이완",
-  exp_decay: "단일 지수 감쇠", double_decay: "이중 지수 감쇠",
+  exp_decay: "단일 지수 감쇠", double_decay: "이중 지수 감쇠", stretched_decay: "신장 지수 감쇠 (KWW)",
 };
 const RISE_VERDICT_STYLE = {
   avalanche: ["var(--accent)", "AVALANCHE"], exponential: ["var(--s3)", "지수형"],
@@ -40112,6 +40277,189 @@ function exportRiseCSV(rec, d, a) {
     }
   }
   downloadText(rec.name.replace(/\.h5$/i, "") + "_risetime.csv", rowsToCsv(rows), "text/csv");
+}
+
+/* ----------------------------- darkening ---------------------------------- */
+/** turbo colorscale sample (0..1) → css color (linear interp of stops) */
+function turboColor(f) {
+  const s = TURBO_SCALE;
+  f = Math.max(0, Math.min(1, f));
+  for (let i = 1; i < s.length; i++) {
+    if (f <= s[i][0]) {
+      const [f0, c0] = s[i - 1], [f1, c1] = s[i];
+      const u = (f - f0) / Math.max(f1 - f0, 1e-9);
+      const hex = (c) => [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)];
+      const a = hex(c0), b = hex(c1);
+      return `rgb(${a.map((v, j) => Math.round(v + u * (b[j] - v))).join(",")})`;
+    }
+  }
+  return s[s.length - 1][1];
+}
+const DARK_VERDICT = { darkening: ["다크닝", "var(--bad)"], brightening: ["광활성화↑", "var(--s3)"], stable: ["안정", "var(--text-muted)"] };
+
+async function renderDarkening(rec) {
+  const view = $("#view");
+  let d;
+  try { d = rec.cache.darkData || (rec.cache.darkData = PrismH5.extractDarkening(rec.h5, rec.det.darkGroup)); }
+  catch (e) { view.innerHTML = `<div class="panel"><h3>Darkening 데이터 읽기 실패</h3><div class="mono">${esc(e.message)}</div></div>`; return; }
+  view.innerHTML = `
+  <div class="panel">
+    <div class="controls-row">
+      <label class="ctl"><span>표시</span><select id="dk-norm"><option value="norm">정규화 I(t)/I₀</option><option value="raw">원시 count rate</option></select></label>
+      <label class="ctl"><span>트레이스 강조/피팅</span><select id="dk-sel"><option value="-1">전체 (강조 없음)</option>
+        ${d.traces.map((tr, i) => `<option value="${i}">${fmt(tr.P * 1e6, 4)} µW</option>`).join("")}</select></label>
+      <label class="ctl"><span>시간축</span><select id="dk-xax"><option value="lin">linear</option><option value="log">log</option></select></label>
+      <label class="ctl"><span>요약 지표</span><select id="dk-metric"><option value="loss">손실률 (%)</option><option value="t50">다크닝 반감시간 t₅₀ (s)</option><option value="rate">초기 손실률 (%/s)</option></select></label>
+      <span class="right flex"><button id="dk-csv" class="small">CSV</button><button id="dk-json" class="small">JSON</button></span>
+    </div>
+  </div>
+  <div class="panel"><h3>출력별 시간 트레이스 <span class="muted small">${d.traces.length}개 · ${fmt(d.traces[0].t[d.traces[0].t.length - 1], 4)} s · dt ${fmt((d.acqTime || 0.1) * 1e3, 3)} ms</span></h3>
+    <div id="chart-dark" class="chart chart-tall"></div></div>
+  <div class="panel"><h3>출력 의존성 요약</h3><div id="chart-darksum" class="chart chart-short"></div></div>
+  <div class="panel"><h3>분석 결과 <span class="muted small" id="dk-engine"></span></h3><div id="dk-results"><span class="muted">분석 중…</span></div></div>`;
+
+  let a = rec.cache.darkA;
+  if (!a) {
+    try {
+      a = await rpc("dark2", { input: { traces: d.traces, acqTime: d.acqTime }, options: {} });
+      rec.cache.darkA = a;
+    } catch (e) { const el = $("#dk-results"); if (el) el.innerHTML = `<span class="tag-Poor">분석 실패: ${esc(e.message)}</span>`; return; }
+  }
+  if (!document.getElementById("chart-dark")) return;
+  $("#dk-engine").textContent = a.engine;
+  const redraw = () => { drawDarkChart(rec, d, a); drawDarkSummary(rec, d, a); };
+  renderDarkResults(rec, d, a);
+  redraw();
+  $("#dk-norm").addEventListener("change", () => drawDarkChart(rec, d, a));
+  $("#dk-sel").addEventListener("change", () => drawDarkChart(rec, d, a));
+  $("#dk-xax").addEventListener("change", () => drawDarkChart(rec, d, a));
+  $("#dk-metric").addEventListener("change", () => drawDarkSummary(rec, d, a));
+  $("#dk-csv").addEventListener("click", () => exportDarkCSV(rec, d, a));
+  $("#dk-json").addEventListener("click", () => downloadText(rec.name.replace(/\.h5$/i, "") + "_darkening.json",
+    JSON.stringify({ file: rec.name, analysis: { engine: a.engine, summary: a.summary, perTrace: a.perTrace.map((r) => ({ ...r, fit: r.fit ? { ...r.fit, curveT: undefined, curveY: undefined } : null })) } }, null, 1), "application/json"));
+}
+
+function drawDarkChart(rec, d, a) {
+  const el = document.getElementById("chart-dark");
+  if (!el) return;
+  const norm = $("#dk-norm").value === "norm";
+  const selIdx = Number($("#dk-sel").value);
+  const logx = $("#dk-xax").value === "log";
+  const traces = [];
+  d.traces.forEach((tr, i) => {
+    const rr = a.perTrace[i];
+    const I0 = rr && isFinite(rr.I0eff) ? rr.I0eff : (rr && rr.I0) || 1;
+    const stride = Math.max(1, Math.ceil(tr.t.length / 1500));
+    const x = [], y = [];
+    for (let j = 0; j < tr.t.length; j += stride) {
+      x.push(tr.t[j]);
+      y.push(isFinite(tr.c[j]) ? (norm ? tr.c[j] / I0 : tr.c[j]) : null);
+    }
+    const emph = selIdx === i, dim = selIdx >= 0 && !emph;
+    traces.push({
+      x, y, mode: "lines", name: `${fmt(tr.P * 1e6, 4)} µW`,
+      line: { color: turboColor(i / Math.max(d.traces.length - 1, 1)), width: emph ? 2.6 : 1.2 },
+      opacity: dim ? 0.25 : 0.95,
+      hovertemplate: `t=%{x:.1f}s<br>${norm ? "I/I₀=%{y:.3f}" : "%{y:.4g} Hz"}<extra>${fmt(tr.P * 1e6, 4)} µW</extra>`,
+    });
+    if (emph && rr && rr.fit) {
+      const I0n = norm ? I0 : 1;
+      traces.push({
+        x: rr.fit.curveT, y: rr.fit.curveY.map((v) => v / (norm ? I0 : 1)),
+        mode: "lines", name: `피팅 (${rr.fit.model}${rr.fit.params.beta ? `, β=${fmt(rr.fit.params.beta, 3)}` : ""})`,
+        line: { color: "#f4f4f0", width: 2, dash: "dash" },
+      });
+    }
+  });
+  newPlot(el, traces, {
+    xaxis: Object.assign(baseLayout().xaxis, { title: { text: "시간 (s)" }, type: logx ? "log" : "linear" }),
+    yaxis: Object.assign(baseLayout().yaxis, { title: { text: norm ? "정규화 강도 I(t)/I₀" : "APD count rate (Hz)" } }),
+    showlegend: false,
+  });
+}
+
+function drawDarkSummary(rec, d, a) {
+  const el = document.getElementById("chart-darksum");
+  if (!el) return;
+  const metric = $("#dk-metric").value;
+  const xs = [], ys = [], cols = [];
+  a.perTrace.forEach((r, i) => {
+    const v = metric === "loss" ? 100 * r.loss
+      : metric === "t50" ? (r.verdict === "darkening" && r.free ? r.free.t50 : NaN)
+      : (r.verdict === "darkening" && isFinite(r.initRate) ? 100 * r.initRate : NaN);
+    if (!isFinite(v)) return;
+    xs.push(r.P * 1e6); ys.push(v);
+    cols.push(turboColor(i / Math.max(a.perTrace.length - 1, 1)));
+  });
+  const label = { loss: "손실률 (%)", t50: "t₅₀ (s)", rate: "초기 손실률 (%/s)" }[metric];
+  const shapes = [];
+  if (isFinite(a.summary.onsetP)) {
+    shapes.push({ type: "line", x0: a.summary.onsetP * 1e6, x1: a.summary.onsetP * 1e6, yref: "paper", y0: 0, y1: 1, line: { color: PALETTE.yellow, width: 1.4, dash: "dash" } });
+  }
+  newPlot(el, [{
+    x: xs, y: ys, mode: "lines+markers", marker: { size: 9, color: cols, line: { width: 1, color: "#1a1a19" } },
+    line: { color: "#55554f", width: 1.2 },
+    hovertemplate: "P=%{x:.4g} µW<br>%{y:.3g}<extra></extra>",
+  }], {
+    xaxis: Object.assign(baseLayout().xaxis, { title: { text: "Power (µW)" }, type: "log" }),
+    yaxis: Object.assign(baseLayout().yaxis, { title: { text: label } }),
+    shapes,
+    annotations: isFinite(a.summary.onsetP) ? [{ x: Math.log10(a.summary.onsetP * 1e6), yref: "paper", y: 1.05, text: "다크닝 시작", showarrow: false, font: { size: 10.5, color: PALETTE.yellow } }] : [],
+  });
+}
+
+function renderDarkResults(rec, d, a) {
+  const el = document.getElementById("dk-results");
+  if (!el) return;
+  const s = a.summary;
+  const kd = densityFactor();
+  const dens = (P) => isFinite(kd) && isFinite(P) ? ` <span class="muted small">= ${fmtDensityAuto(P * kd, 4)}</span>` : "";
+  const cards = [];
+  cards.push(`<div class="card hero"><div class="k">다크닝 시작 출력 (onset)</div>
+    <div class="v">${isFinite(s.onsetP) ? fmt(s.onsetP * 1e6, 4) + " µW" : "미검출"}</div>
+    <div class="s">유의한 감쇠가 처음 나타나는 출력${isFinite(s.onsetP) ? dens(s.onsetP) : ""}</div></div>`);
+  cards.push(`<div class="card"><div class="k">최대 손실</div>
+    <div class="v">${fmt(100 * s.maxLoss, 4)}%</div>
+    <div class="s">@ ${fmt(s.maxLossP * 1e6, 4)} µW · ${fmt(d.traces[0].t[d.traces[0].t.length - 1], 3)} s 노출${dens(s.maxLossP)}</div></div>`);
+  cards.push(`<div class="card"><div class="k">최대출력 다크닝 반감시간 t₅₀</div>
+    <div class="v">${isFinite(s.maxLossT50) ? fmt(s.maxLossT50, 4) + " s" : "–"}</div>
+    <div class="s">손실의 50% 도달 시간 (모델프리)</div></div>`);
+  cards.push(`<div class="card"><div class="k">판정 분포</div>
+    <div class="v small" style="font-size:14px">다크닝 ${s.nDark} · 활성화 ${s.nBright} · 안정 ${s.nTraces - s.nDark - s.nBright}</div>
+    <div class="s">${s.nTraces}개 출력 트레이스</div></div>`);
+  let html = `<div class="cards">${cards.join("")}</div>`;
+  html += `<div style="margin-top:12px;"><table class="res">
+    <tr><th>출력 (µW)</th><th>판정</th><th>손실</th><th>t₅₀</th><th>t₉₀</th><th>모델</th><th>β</th><th>I₀ → I<sub>end</sub> (Hz)</th></tr>` +
+    a.perTrace.map((r, i) => {
+      const [vt, vc] = DARK_VERDICT[r.verdict] || DARK_VERDICT.stable;
+      return `<tr${Number($("#dk-sel") && $("#dk-sel").value) === i ? ' class="sel"' : ""}>
+        <td class="num">${fmt(r.P * 1e6, 4)}</td>
+        <td style="color:${vc}">${vt}</td>
+        <td class="num">${isFinite(r.loss) ? fmt(100 * r.loss, 3) + "%" : "–"}</td>
+        <td class="num">${r.verdict !== "stable" && r.free ? fmt(r.free.t50, 3) + " s" : "–"}</td>
+        <td class="num">${r.verdict !== "stable" && r.free ? fmt(r.free.t90, 3) + " s" : "–"}</td>
+        <td>${r.fit ? (RISE_MODEL_LABEL[r.fit.model] || r.fit.model) : "–"}</td>
+        <td class="num">${r.fit && isFinite(r.fit.params.beta) ? fmt(r.fit.params.beta, 3) : "–"}</td>
+        <td class="num">${fmt(r.I0eff || r.I0, 4)} → ${fmt(r.Iend, 4)}</td></tr>`;
+    }).join("") + `</table></div>
+  <div class="small muted" style="margin-top:6px;">β&lt;1 (신장지수 KWW) = 불균일 앙상블 다크닝 · onset이 PA 임계 부근이면 avalanche 개체군 매개 손상, 완만한 멱법칙 증가면 직접 다광자 과정 시사 · Power scan 측정 시 이 onset 미만/짧은 dwell로 다크닝 왜곡 회피</div>`;
+  el.innerHTML = html;
+}
+
+function exportDarkCSV(rec, d, a) {
+  const rows = [["# INNO Prism DarkenFit", a.engine, rec.name]];
+  const s = a.summary;
+  rows.push(["# onset_uW", isFinite(s.onsetP) ? s.onsetP * 1e6 : ""], ["# max_loss_frac", s.maxLoss], ["# max_loss_at_uW", s.maxLossP * 1e6]);
+  rows.push([]);
+  rows.push(["power_uW", "verdict", "loss_frac", "t50_s", "t90_s", "t10_s", "tau_eff_s", "init_rate_frac_per_s", "model", "beta", "I0_Hz", "Iend_Hz", "duration_s"]);
+  for (const r of a.perTrace) {
+    rows.push([r.P * 1e6, r.verdict || "", isFinite(r.loss) ? r.loss : "",
+      r.free ? r.free.t50 : "", r.free ? r.free.t90 : "", r.free ? r.free.t10 : "",
+      r.fit ? r.fit.tauEff : "", isFinite(r.initRate) ? r.initRate : "",
+      r.fit ? r.fit.model : "", r.fit && isFinite(r.fit.params.beta) ? r.fit.params.beta : "",
+      r.I0eff || r.I0 || "", r.Iend || "", r.duration || ""]);
+  }
+  downloadText(rec.name.replace(/\.h5$/i, "") + "_darkening.csv", rowsToCsv(rows), "text/csv");
 }
 
 /* --------------------------- generic + structure -------------------------- */
