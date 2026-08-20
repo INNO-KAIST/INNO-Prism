@@ -252,7 +252,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.3.0</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.3.1</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -35389,7 +35389,11 @@ function fitGaussian2D(img, opts) {
     const [B, A, x0, y0, sx, sy, th] = theta;
     const c2 = Math.cos(th), s2 = Math.sin(th);
     const a = c2 * c2 / (2 * sx * sx) + s2 * s2 / (2 * sy * sy);
-    const b = -s2 * c2 / (2 * sx * sx) + s2 * c2 / (2 * sy * sy);
+    // NOTE sign: expanding u=dx·cosθ+dy·sinθ, v=−dx·sinθ+dy·cosθ gives
+    // +sinθcosθ/(2σx²) − sinθcosθ/(2σy²). The opposite sign (used before
+    // v2.3.1) mirrors the reported θ, so the drawn ellipse tilted the wrong
+    // way for rotated beams. Now matches the ISO moment convention.
+    const b = s2 * c2 / (2 * sx * sx) - s2 * c2 / (2 * sy * sy);
     const cc = s2 * s2 / (2 * sx * sx) + c2 * c2 / (2 * sy * sy);
     return { B, A, a, b, cc, x0, y0 };
   };
@@ -35661,7 +35665,7 @@ function residualClipMask(img, fit, k, satLevel) {
   const { B, A, x0, y0, sx, sy, theta } = fit;
   const c2 = Math.cos(theta), s2 = Math.sin(theta);
   const a = c2 * c2 / (2 * sx * sx) + s2 * s2 / (2 * sy * sy);
-  const b = -s2 * c2 / (2 * sx * sx) + s2 * c2 / (2 * sy * sy);
+  const b = s2 * c2 / (2 * sx * sx) - s2 * c2 / (2 * sy * sy); // sign per fitGaussian2D note
   const cc = s2 * s2 / (2 * sx * sx) + c2 * c2 / (2 * sy * sy);
   const sat = isFinite(satLevel) ? satLevel : Infinity;
   const resid = new Float64Array(w * h).fill(NaN);
@@ -35837,10 +35841,178 @@ function fitBeam(img, opts) {
   fit.nClip = nClip;
   fit.roi = roi;
   fit.nSat = nSatPre;
+  // ISO 11146 second-moment (rotated D4σ) — model-free cross-check on the
+  // same corrected frame the Gaussian fit used
+  try { fit.moments = momentsD4Sigma({ w, h, data: spl.data }, o); }
+  catch (e) { fit.moments = null; }
+  if (fit.moments && fit.success && fit.sx > 0) {
+    // non-Gaussianity: D4σ area vs fitted 1/e² area (1.0 = perfectly Gaussian)
+    fit.d4sAreaRatio = (fit.moments.sigmaMajor * fit.moments.sigmaMinor) / (fit.sx * fit.sy);
+  }
   fit.nStreakCols = stk.nCols; fit.nStreakRows = stk.nRows;
   fit.streakColAmp = stk.colAmp; fit.streakRowAmp = stk.rowAmp;
   fit.maskedData = spl.data; // full-frame, streak-corrected + ghosts masked (preview)
   return fit;
+}
+
+/**
+ * ISO 11146 second-moment beam widths — the MODEL-FREE (rotated) D4σ.
+ *
+ * Why rotation must be handled: the naive per-camera-axis D4σ ignores the
+ * cross moment σxy and reports the widths of the ellipse's BOUNDING BOX, so
+ * the implied area σx·σy overestimates the true σa·σb (e.g. +25% for a 2:1
+ * ellipse at 45°) and the peak irradiance is underestimated by the same
+ * factor. ISO 11146 fixes this by diagonalising the second-moment matrix:
+ *
+ *   σx² = Σ I·(x−x̄)²/ΣI,  σy² = Σ I·(y−ȳ)²/ΣI,  σxy = Σ I·(x−x̄)(y−ȳ)/ΣI
+ *   γ  = sign(σx²−σy²)
+ *   dσa = 2√2 · [ (σx²+σy²) + γ·√((σx²−σy²)² + 4σxy²) ]^½
+ *   dσb = 2√2 · [ (σx²+σy²) − γ·√((σx²−σy²)² + 4σxy²) ]^½
+ *   φ   = ½·atan2(2σxy, σx²−σy²)
+ *
+ * Unlike the Gaussian fit this makes NO shape assumption, so comparing the
+ * two is a direct non-Gaussianity test (wings/pedestal/flat-top inflate D4σ).
+ * Second moments are r²-weighted and therefore noise-sensitive, so ISO
+ * mandates background subtraction and a finite integration aperture: here the
+ * aperture is an ellipse of `apertureFactor`× the D4σ diameters centred on
+ * the centroid, iterated to convergence, with the background re-estimated
+ * from the annulus outside it each round.
+ *
+ * img: {w, h, data} — should already be streak/ghost/annotation corrected
+ * (NaN = excluded). Returns null if there is no usable signal.
+ */
+function momentsD4Sigma(img, opts) {
+  const o = opts || {};
+  const { w, h } = img;
+  const src = img.data;
+  const n = w * h;
+  // Aperture size: ISO 11146-3 suggests ~3× the beam diameter, but second
+  // moments are r²-weighted so the (signal-free) outer ring only injects
+  // variance. Measured on synthetic rotated Gaussians (12 seeds × 3 SNRs):
+  //   apF 1.5 → bias −4.5% (tail truncated)      · sd 0.05–0.95%
+  //   apF 2.0 → bias −0.2…+0.1% (unbiased)       · sd 0.17–2.3%   ← default
+  //   apF 3.0 → bias −0.3…+0.6%                  · sd 0.55–8.7%
+  // 2× keeps ISO's unbiasedness at 3–4× lower dispersion; still configurable.
+  const apF = isFinite(o.apertureFactor) ? o.apertureFactor : 2;
+  const maxIter = o.maxIter || 30;
+
+  // --- initial background from the frame border ---
+  const border = [];
+  for (let x = 0; x < w; x++) { border.push(src[x], src[(h - 1) * w + x]); }
+  for (let y = 0; y < h; y++) { border.push(src[y * w], src[y * w + w - 1]); }
+  let B = nanmedian(border.filter(isFinite));
+  if (!isFinite(B)) B = 0;
+  const lows = [];
+  for (let i = 0; i < n; i++) if (isFinite(src[i]) && src[i] <= B) lows.push(B - src[i]);
+  const sigBg = 1.4826 * nanmedian(lows) || 1;
+
+  // --- seed centroid/size from a thresholded first pass ---
+  let vmax = -Infinity;
+  for (let i = 0; i < n; i++) if (isFinite(src[i]) && src[i] > vmax) vmax = src[i];
+  if (!(vmax > B)) return null;
+  const thr = B + Math.max(0.1 * (vmax - B), 5 * sigBg);
+  let s0 = 0, sx0 = 0, sy0 = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const v = src[y * w + x];
+    if (!isFinite(v) || v < thr) continue;
+    const q = v - B;
+    s0 += q; sx0 += q * x; sy0 += q * y;
+  }
+  if (!(s0 > 0)) return null;
+  let cx = sx0 / s0, cy = sy0 / s0;
+  let mxx = 0, myy = 0, mxy = 0, sw = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const v = src[y * w + x];
+    if (!isFinite(v) || v < thr) continue;
+    const q = v - B, dx = x - cx, dy = y - cy;
+    sw += q; mxx += q * dx * dx; myy += q * dy * dy; mxy += q * dx * dy;
+  }
+  mxx /= sw; myy /= sw; mxy /= sw;
+
+  // --- ISO iteration: aperture → moments → aperture … ---
+  let converged = false, iter = 0, apertureClipped = false;
+  let nMasked = 0, nInside = 0, fluxIn = 0;
+  let prevA = Infinity, prevB2 = Infinity;
+  let sa2 = mxx, sb2 = myy, phi = 0;
+  for (; iter < maxIter; iter++) {
+    // principal decomposition of the current moment matrix
+    const sum = mxx + myy, diff = mxx - myy;
+    const g = diff >= 0 ? 1 : -1;
+    const root = Math.sqrt(diff * diff + 4 * mxy * mxy);
+    sa2 = Math.max(0.5 * (sum + g * root), 0.01);
+    sb2 = Math.max(0.5 * (sum - g * root), 0.01);
+    phi = 0.5 * Math.atan2(2 * mxy, diff);
+    const sa = Math.sqrt(sa2), sb = Math.sqrt(sb2);
+    // aperture semi-axes: apF × D4σ / 2 = apF × 2σ
+    let ra = apF * 2 * sa, rb = apF * 2 * sb;
+    const rMax = Math.max(w, h);
+    if (ra > rMax || rb > rMax) { ra = Math.min(ra, rMax); rb = Math.min(rb, rMax); apertureClipped = true; }
+    const ct = Math.cos(phi), st = Math.sin(phi);
+    // background from the annulus just outside the aperture (1.0–1.4×)
+    const ring = [];
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const v = src[y * w + x];
+      if (!isFinite(v)) continue;
+      const dx = x - cx, dy = y - cy;
+      const u = (dx * ct + dy * st) / ra, t = (-dx * st + dy * ct) / rb;
+      const r2 = u * u + t * t;
+      if (r2 > 1 && r2 <= 1.96) ring.push(v);
+    }
+    if (ring.length >= 30) B = nanmedian(ring);
+    // moments inside the aperture (signed values — no clipping: clipping the
+    // negative noise excursions would bias the background upward)
+    let S = 0, Sx = 0, Sy = 0;
+    nInside = 0; nMasked = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const dx = x - cx, dy = y - cy;
+      const u = (dx * ct + dy * st) / ra, t = (-dx * st + dy * ct) / rb;
+      if (u * u + t * t > 1) continue;
+      nInside++;
+      const v = src[y * w + x];
+      if (!isFinite(v)) { nMasked++; continue; }
+      const q = v - B;
+      S += q; Sx += q * x; Sy += q * y;
+    }
+    if (!(S > 0)) return null;
+    const ncx = Sx / S, ncy = Sy / S;
+    let nxx = 0, nyy = 0, nxy = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const dx0 = x - cx, dy0 = y - cy;
+      const u = (dx0 * ct + dy0 * st) / ra, t = (-dx0 * st + dy0 * ct) / rb;
+      if (u * u + t * t > 1) continue;
+      const v = src[y * w + x];
+      if (!isFinite(v)) continue;
+      const q = v - B, dx = x - ncx, dy = y - ncy;
+      nxx += q * dx * dx; nyy += q * dy * dy; nxy += q * dx * dy;
+    }
+    cx = ncx; cy = ncy; fluxIn = S;
+    mxx = nxx / S; myy = nyy / S; mxy = nxy / S;
+    if (!(isFinite(mxx) && isFinite(myy) && isFinite(mxy)) || mxx <= 0 || myy <= 0) return null;
+    const dA = Math.abs(Math.sqrt(Math.max(sa2, 0)) - prevA) / Math.max(prevA, 1e-9);
+    const dB = Math.abs(Math.sqrt(Math.max(sb2, 0)) - prevB2) / Math.max(prevB2, 1e-9);
+    prevA = Math.sqrt(Math.max(sa2, 0)); prevB2 = Math.sqrt(Math.max(sb2, 0));
+    if (dA < 1e-3 && dB < 1e-3) { converged = true; break; }
+  }
+  // final principal decomposition
+  const sum = mxx + myy, diff = mxx - myy;
+  const g = diff >= 0 ? 1 : -1;
+  const root = Math.sqrt(diff * diff + 4 * mxy * mxy);
+  const sigA = Math.sqrt(Math.max(0.5 * (sum + g * root), 0));
+  const sigB = Math.sqrt(Math.max(0.5 * (sum - g * root), 0));
+  const theta = 0.5 * Math.atan2(2 * mxy, diff);
+  return {
+    cx, cy,
+    sigmaMajor: sigA, sigmaMinor: sigB, theta,      // principal axes (rotated)
+    d4sMajor: 4 * sigA, d4sMinor: 4 * sigB,
+    sigmaXlab: Math.sqrt(Math.max(mxx, 0)),         // camera-axis (naive) values
+    sigmaYlab: Math.sqrt(Math.max(myy, 0)),
+    sigmaXY: mxy,
+    // how much a rotation-blind D4σ would overestimate the effective area
+    naiveAreaRatio: (sigA * sigB) > 0 ? Math.sqrt(mxx * myy) / (sigA * sigB) : NaN,
+    background: B, sigBg, converged, iter: iter + 1,
+    apertureClipped, maskedFraction: nInside ? nMasked / nInside : 0,
+    flux: fluxIn,
+  };
 }
 
 /**
@@ -35879,6 +36051,7 @@ return {
   detectScanMode, splitBranches,
   // beam profile
   fitGaussian2D, beamMetrics, isolateMainBlob, splitTouchingBlobs, removeStreaks, fitBeam,
+  momentsD4Sigma,
 };
 });
 
@@ -38394,6 +38567,7 @@ const App = {
     beam: null,                   // fitGaussian2D 결과 (+binFactor)
     metrics: null,                // beamMetrics 결과
     densityMode: "peak",          // peak | e2avg | fwhm
+    areaBasis: "gauss",           // gauss (1/e² Gaussian 피팅) | d4sigma (ISO 11146 회전 D4σ)
     enabled: false,
   },
 };
@@ -38671,6 +38845,59 @@ function calibAreaCm2() {
   const um2 = { peak: m.areaPeakUm2, e2avg: m.area1e2Um2, fwhm: m.areaFwhmUm2 }[App.calib.densityMode] || m.areaPeakUm2;
   return um2 * 1e-8;
 }
+/** 두 폭 정의(회전 Gaussian 1/e² vs ISO 11146 회전 D4σ) 비교 + 회전 무시 시
+ *  발생하는 면적 과대평가량 + 품질 경고를 한 블록으로 렌더링. */
+function beamBasisCompareHtml(c) {
+  const b = c.beam;
+  if (!b || !b.moments) return "";
+  const m = b.moments;
+  const eff = calibEffUmPerPx();
+  const s = isFinite(eff) ? eff * (b.binFactor || 1) : NaN;
+  const um = (v) => isFinite(s) ? `${fmt(v * s, 4)} µm` : `${fmt(v, 4)} px`;
+  const ratio = b.d4sAreaRatio;
+  const naive = m.naiveAreaRatio;
+  const bits = [];
+  bits.push(`<span class="muted">─ 폭 정의 비교 ─</span>`);
+  bits.push(`Gaussian 1/e² 지름: ${um(4 * b.sx)} × ${um(4 * b.sy)} (θ=${fmt(b.theta * 180 / Math.PI, 3)}°)` +
+    ` · ISO D4σ: ${um(m.d4sMajor)} × ${um(m.d4sMinor)} (θ=${fmt(m.theta * 180 / Math.PI, 3)}°)`);
+  if (isFinite(ratio)) {
+    const dev = Math.abs(ratio - 1);
+    const cls = dev > 0.15 ? "tag-Poor" : dev > 0.07 ? "tag-Low" : "tag-High";
+    const msg = dev > 0.15 ? "빔이 Gaussian에서 크게 벗어남 (날개/평정부) — ISO D4σ 기준 권장"
+      : dev > 0.07 ? "약한 비-Gaussian성" : "Gaussian과 잘 일치 (두 기준 등가)";
+    bits.push(`면적비 D4σ/Gaussian = <b class="${cls}">${fmt(ratio, 4)}</b> — <span class="${cls}">${msg}</span>`);
+  }
+  if (isFinite(naive)) {
+    bits.push(`<span style="color:var(--s4)">회전 보정 효과</span>: 회전을 무시한 카메라축 D4σ` +
+      ` (${um(4 * m.sigmaXlab)} × ${um(4 * m.sigmaYlab)}) 사용 시 유효면적 <b>+${fmt(100 * (naive - 1), 3)}%</b> 과대평가` +
+      ` → 파워밀도 ${fmt(100 * (1 - 1 / naive), 3)}% 과소평가 (현재는 주축 보정 적용됨)`);
+  }
+  const warn = [];
+  if (!m.converged) warn.push("모멘트 조리개 미수렴");
+  if (m.apertureClipped) warn.push("조리개가 이미지 경계에 잘림");
+  if (m.maskedFraction > 0.02) warn.push(`조리개 내 마스크 픽셀 ${fmt(100 * m.maskedFraction, 3)}% (주석/반사광 제거 영역 — D4σ 신뢰도 저하)`);
+  if (warn.length) bits.push(`<span class="tag-Low">⚠ ${warn.join(" · ")}</span>`);
+  return bits.join("<br>");
+}
+
+/** 선택된 면적 기준의 σ/θ (px) — Gaussian 피팅 또는 ISO 11146 회전 D4σ 모멘트.
+ *  두 기준 모두 회전을 반영한 주축 σ를 쓰므로 면적이 과대평가되지 않는다. */
+function calibBasisSigma(beam) {
+  const b = beam || App.calib.beam;
+  if (!b) return null;
+  if (App.calib.areaBasis === "d4sigma" && b.moments && isFinite(b.moments.sigmaMajor)) {
+    return { sx: b.moments.sigmaMajor, sy: b.moments.sigmaMinor, theta: b.moments.theta, src: "d4sigma" };
+  }
+  return { sx: b.sx, sy: b.sy, theta: b.theta, src: "gauss" };
+}
+/** 현재 기준으로 beamMetrics 재계산 (µm 스케일 = 유효 px × 비닝) */
+function calibComputeMetrics() {
+  const c = App.calib;
+  const eff = calibEffUmPerPx();
+  const bs = calibBasisSigma();
+  if (!c.beam || !bs || !isFinite(eff)) return null;
+  return PrismEngine.beamMetrics(bs, eff * (c.beam.binFactor || 1));
+}
 function densityFactor() {
   if (!App.calib.enabled) return NaN;
   const { C } = calibCoefficient();
@@ -38776,6 +39003,9 @@ function openCalibModal() {
           <option value="peak">Peak irradiance I₀=2P/(π·wx·wy) (권장·논문 표준)</option>
           <option value="e2avg">1/e² 면적 내 평균 (86.5% power)</option>
           <option value="fwhm">FWHM 면적 내 평균 (50% power)</option></select></label>
+        <label class="ctl"><span>면적 기준 (빔 폭 정의)</span><select id="cb-basis">
+          <option value="gauss">회전 Gaussian 피팅 1/e² (기본)</option>
+          <option value="d4sigma">ISO 11146 회전 D4σ (2차 모멘트·모델 무가정)</option></select></label>
       </div>
       <div id="cb-beam-status" class="small muted" style="margin-top:6px;">${c.metrics ? "" : "이미지를 열면 자동으로 피팅됩니다."}</div>
       <div id="cb-beam-chart" class="chart" style="height:340px;display:${c.beam ? "" : "none"};"></div>
@@ -38814,11 +39044,13 @@ function openCalibModal() {
     c.cameraPitch = Number(back.querySelector("#cb-pitch").value) || 6.45;
     c.objMag = back.querySelector("#cb-mag").value === "" ? null : Number(back.querySelector("#cb-mag").value);
     c.densityMode = back.querySelector("#cb-mode").value;
+    const basisSel = back.querySelector("#cb-basis");
+    if (basisSel) c.areaBasis = basisSel.value;
     c.enabled = back.querySelector("#cb-enable").checked;
     const eff = calibEffUmPerPx();
     back.querySelector("#cb-effpx").textContent = isFinite(eff)
       ? `${fmt(c.cameraPitch, 4)}/${fmt(c.objMag ?? NaN, 4)} = ${fmt(eff, 5)} µm/px` : "배율 입력 필요";
-    if (c.beam && isFinite(eff)) c.metrics = PrismEngine.beamMetrics(c.beam, eff * (c.beam.binFactor || 1));
+    c.metrics = calibComputeMetrics() || c.metrics;
     refreshCalibUI();
     saveCalib();
   };
@@ -38829,14 +39061,16 @@ function openCalibModal() {
         (isFinite(cc.spreadPct) ? ` · 회차 간 편차 ${fmt(cc.spreadPct, 3)}%` : "")
       : `<span class="muted">측정쌍을 입력하세요.</span>`;
     const m = c.metrics;
+    const basisName = c.areaBasis === "d4sigma" ? "ISO 11146 회전 D4σ" : "회전 Gaussian 1/e²";
     back.querySelector("#cb-beam-out").innerHTML = m ? [
-      `1/e² 지름 (4σ): <b>${fmt(m.d1e2Xum, 4)} × ${fmt(m.d1e2Yum, 4)} µm</b> (θ=${fmt(m.thetaDeg, 3)}°)`,
+      `<b>[${basisName}]</b> 지름 (4σ): <b>${fmt(m.d1e2Xum, 4)} × ${fmt(m.d1e2Yum, 4)} µm</b> (θ=${fmt(m.thetaDeg, 3)}°)`,
       `FWHM: ${fmt(m.fwhmXum, 4)} × ${fmt(m.fwhmYum, 4)} µm · σ: ${fmt(m.sigmaXum, 4)} × ${fmt(m.sigmaYum, 4)} µm`,
       `유효 면적 — peak: ${fmt(m.areaPeakUm2, 5)} µm² · 1/e²: ${fmt(m.area1e2Um2, 5)} µm² · FWHM: ${fmt(m.areaFwhmUm2, 5)} µm²`,
       c.beam ? `피팅 R²(ROI)=${fmt(c.beam.r2, 4)} · 포화 제외 ${c.beam.nSat}px` +
         (c.beam.nNear > 0 ? ` · 근접 반사 ${c.beam.nNear}개 분리` : "") +
         (c.beam.nClip > 0 ? ` · 잔차 클립 ${c.beam.nClip}px` : "") : "",
-    ].join("<br>") : `<span class="muted">빔 이미지 미피팅 (배율 선택/입력 + 이미지 필요)</span>`;
+      beamBasisCompareHtml(c),
+    ].filter(Boolean).join("<br>") : `<span class="muted">빔 이미지 미피팅 (배율 선택/입력 + 이미지 필요)</span>`;
     const k = densityFactor();
     back.querySelector("#cb-summary").innerHTML = isFinite(k)
       ? `환산식: <b>mW/cm² = P<sub>PM</sub>(W) × ${fmt(k, 6)}</b> <span class="muted small">(표시 단위는 데이터 범위에 맞춰 mW/cm²~MW/cm² 자동)</span><br>` +
@@ -38844,23 +39078,47 @@ function openCalibModal() {
         `예: PM 1 mW → <b>${fmtDensityAuto(0.001 * k, 5)}</b>`
       : `<span class="muted">계수(1단계)와 빔 면적(2단계)이 준비되면 환산식이 표시됩니다.</span>`;
     back.querySelector("#cb-mode").value = c.densityMode || "peak";
+    back.querySelector("#cb-basis").value = c.areaBasis || "gauss";
     if (c.beam) drawBeamChart();
   };
   const drawBeamChart = () => {
     const b = c.beam;
     if (!b || !b.preview) return;
     back.querySelector("#cb-beam-chart").style.display = "";
-    const ellipse = [];
-    for (let t = 0; t <= 64; t++) {
-      const a2 = 2 * Math.PI * t / 64;
-      const ex = 2 * b.sx * Math.cos(a2), ey = 2 * b.sy * Math.sin(a2);
-      ellipse.push([b.x0 + ex * Math.cos(b.theta) - ey * Math.sin(b.theta), b.y0 + ex * Math.sin(b.theta) + ey * Math.cos(b.theta)]);
-    }
-    newPlot(back.querySelector("#cb-beam-chart"), [
+    const ell = (cx, cy, sx, sy, th) => {
+      const pts = [];
+      for (let t = 0; t <= 64; t++) {
+        const a2 = 2 * Math.PI * t / 64;
+        const ex = 2 * sx * Math.cos(a2), ey = 2 * sy * Math.sin(a2);
+        pts.push([cx + ex * Math.cos(th) - ey * Math.sin(th), cy + ex * Math.sin(th) + ey * Math.cos(th)]);
+      }
+      return pts;
+    };
+    const gEll = ell(b.x0, b.y0, b.sx, b.sy, b.theta);
+    const useD4 = c.areaBasis === "d4sigma";
+    const traces = [
       { z: b.preview, type: "heatmap", colorscale: "Viridis", colorbar: { outlinewidth: 0, thickness: 12 }, hovertemplate: "x=%{x} y=%{y} I=%{z:.1f}<extra></extra>" },
-      { x: ellipse.map((q) => q[0]), y: ellipse.map((q) => q[1]), mode: "lines", name: "피팅된 1/e² 경계 (지름 4σ) — 유효면적", line: { color: "#e66767", width: 2 },
-        hovertemplate: "피팅된 1/e² 강도 경계<extra></extra>" },
-    ], {
+      { x: gEll.map((q) => q[0]), y: gEll.map((q) => q[1]), mode: "lines",
+        name: `Gaussian 1/e² 경계 (4σ)${useD4 ? "" : " — 유효면적 기준"}`,
+        line: { color: "#e66767", width: useD4 ? 1.4 : 2.2, dash: useD4 ? "dot" : "solid" },
+        hovertemplate: "Gaussian 피팅 1/e² 경계<extra></extra>" },
+    ];
+    if (b.moments && isFinite(b.moments.sigmaMajor)) {
+      const m = b.moments;
+      const mEll = ell(m.cx, m.cy, m.sigmaMajor, m.sigmaMinor, m.theta);
+      traces.push({
+        x: mEll.map((q) => q[0]), y: mEll.map((q) => q[1]), mode: "lines",
+        name: `ISO 회전 D4σ 경계${useD4 ? " — 유효면적 기준" : ""}`,
+        line: { color: "#38bdf8", width: useD4 ? 2.2 : 1.4, dash: useD4 ? "solid" : "dot" },
+        hovertemplate: "ISO 11146 2차 모멘트 D4σ 경계<extra></extra>" });
+      // 회전을 무시했을 때의 카메라축 D4σ (비교용, 항상 점선)
+      const nEll = ell(m.cx, m.cy, m.sigmaXlab, m.sigmaYlab, 0);
+      traces.push({
+        x: nEll.map((q) => q[0]), y: nEll.map((q) => q[1]), mode: "lines",
+        name: "회전 무시 D4σ (과대평가 — 참고)", line: { color: "#8b8a80", width: 1, dash: "dash" },
+        hovertemplate: "회전 미보정 카메라축 D4σ<extra></extra>" });
+    }
+    newPlot(back.querySelector("#cb-beam-chart"), traces, {
       margin: { l: 46, r: 10, t: 8, b: 36 },
       yaxis: Object.assign(baseLayout().yaxis, { scaleanchor: "x", autorange: "reversed" }),
       showlegend: true,
@@ -38899,6 +39157,7 @@ function openCalibModal() {
     }
   });
   back.querySelector("#cb-mode").addEventListener("change", upd);
+  back.querySelector("#cb-basis").addEventListener("change", upd);
   back.querySelector("#cb-enable").addEventListener("change", upd);
   back.querySelector("#cb-img").addEventListener("click", () => back.querySelector("#cb-img-input").click());
   back.querySelector("#cb-img-input").addEventListener("change", async (e) => {
@@ -38973,10 +39232,17 @@ function openCalibModal() {
       delete fit.maskedData;
       fit.x0 = fit.x0 / pf; fit.y0 = fit.y0 / pf;
       fit.sx = fit.sx / pf; fit.sy = fit.sy / pf;
+      // ISO 모멘트도 미리보기 스케일로 환산 (동일 px 기준 유지)
+      if (fit.moments) {
+        const m = fit.moments;
+        m.cx /= pf; m.cy /= pf;
+        m.sigmaMajor /= pf; m.sigmaMinor /= pf;
+        m.d4sMajor /= pf; m.d4sMinor /= pf;
+        m.sigmaXlab /= pf; m.sigmaYlab /= pf;
+      }
       fit.binFactor = f * pf;
       c.beam = fit;
-      const eff0 = calibEffUmPerPx();
-      if (isFinite(eff0)) c.metrics = PrismEngine.beamMetrics(fit, eff0 * (fit.binFactor || 1));
+      c.metrics = calibComputeMetrics() || c.metrics;
       back.querySelector("#cb-beam-status").innerHTML = `피팅 완료 — ${bmp.width}×${bmp.height}px (${f}× 비닝) · R²(ROI)=${fmt(fit.r2, 4)}` +
         (nAnnRaw > 0 ? ` · <span style="color:var(--s4)">측정 주석(원/선/텍스트) ${nAnnRaw}px 자동 제거</span>` : "") +
         (fit.nStreakCols > 0 ? ` · <span style="color:var(--s7)">세로 잔광(판독 스미어) ${fit.nStreakCols}열 보정</span>` : "") +
