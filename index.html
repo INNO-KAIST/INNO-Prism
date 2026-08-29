@@ -253,7 +253,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.3.2</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.3.4</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -38025,6 +38025,92 @@ function findPleGroup(file, tree) {
   return null;
 }
 
+/** Power-scan 그룹을 **구조로** 탐지 (데이터셋 이름 하드코딩 제거).
+ *
+ *  ScopeFoundry 규약: 한 measurement 그룹 안에
+ *    <collector>_powers        (n,)        · <collector>_powers_raw      (n, reps)
+ *    <collector>_<signal>      (n,)        · <collector>_<signal>_raw    (n, reps[, pix])
+ *    wheel_positions           (n,)
+ *  collector 이름(apd_counter / emccd / …)은 장비마다 다르므로 접두사를 고정하지
+ *  않고, "power를 담은 배열"과 "선두 차원이 같은 신호 배열" 쌍으로 찾는다.
+ *  이 덕분에 새 측정 플랫폼이 다른 검출기 이름(snspd_… 등)이나 _raw 없는 형식을
+ *  써도 인식된다. polled_powers(레이스별 폴링값)와 시간/파장/휠 축은 제외.
+ *  반환: {group, kind:"apd"|"emccd", powerRaw, power1, sigRaw, sig1, wl, n, reps}
+ */
+function findPowerScanGroup(file, tree) {
+  const groups = {};
+  for (const n of tree) {
+    if (n.kind !== "dataset" || !/^measurement\//.test(n.path)) continue;
+    const i = n.path.lastIndexOf("/");
+    (groups[n.path.slice(0, i)] = groups[n.path.slice(0, i)] || [])
+      .push({ leaf: n.path.slice(i + 1), shape: n.shape || [], path: n.path });
+  }
+  // 축·통계 배열: 신호/파워 후보에서 제외
+  const isAxis = (d) => /wheel|positions?$|(^|_)times?$|acq_time|index|wavelength|wls?$|_array$|extent|corner/i.test(d.leaf);
+  const isStat = (d) => /_(std|sem|err|error)$/i.test(d.leaf);
+  const isPowerName = (d) => /power|irradiance|fluence/i.test(d.leaf) && !/polled/i.test(d.leaf);
+  // 같은 물리량의 (평균, 반복, 통계) 세트를 한 묶음으로: powers / powers_reps / powers_std
+  const baseOf = (leaf) => leaf.replace(/_(raw|reps)$/i, "");
+  const bundle = (arr) => {
+    const m = new Map();
+    for (const d of arr) {
+      const b = baseOf(d.leaf);
+      const e = m.get(b) || { base: b, d1: null, d2: null, dN: null };
+      if (d.shape.length === 1) e.d1 = e.d1 || d;
+      else if (d.shape.length === 2) e.d2 = e.d2 || d;
+      else e.dN = e.dN || d;
+      m.set(b, e);
+    }
+    return Array.from(m.values());
+  };
+  let best = null;
+  for (const g of Object.keys(groups)) {
+    const ds = groups[g];
+    // 2D 래스터 스캔 그룹은 제외 (위치 스트림 보유)
+    if (ds.some((d) => /scan_h_positions/i.test(d.leaf)) && ds.some((d) => /scan_v_positions/i.test(d.leaf))) continue;
+    const usable = ds.filter((d) => !isStat(d) && !isAxis(d) && d.shape.length >= 1);
+    const powers = usable.filter(isPowerName);
+    if (!powers.length) continue;
+    const pB = bundle(powers).sort((a, b) =>
+      ((b.d2 ? 2 : 0) + (b.d1 ? 1 : 0)) - ((a.d2 ? 2 : 0) + (a.d1 ? 1 : 0)))[0];
+    const pAny = pB.d2 || pB.d1 || pB.dN;
+    if (!pAny || !(pAny.shape[0] >= 4)) continue;
+    const n = pAny.shape[0];
+    // 신호 후보: 파워가 아니고 선두 차원(측정점 수)이 일치하는 모든 배열.
+    // **이름 어휘에 의존하지 않는다** — 새 플랫폼이 detector·signal·sensor 등
+    // 무엇으로 부르든 인식된다. 어휘 일치는 가점으로만 사용.
+    const sigs = usable.filter((d) => !isPowerName(d) && d.shape[0] === n);
+    if (!sigs.length) continue;
+    const wl = ds.find((d) => d.shape.length === 1 && /wavelength|wls?$/i.test(d.leaf));
+    // 마지막 축이 파장 길이와 같으면 스펙트럼 → EMCCD 계열
+    const spec = wl ? sigs.filter((d) => d.shape.length >= 2 && d.shape[d.shape.length - 1] === wl.shape[0]) : [];
+    let kind, sigRaw, sig1, sigScore;
+    if (spec.length) {
+      kind = "emccd";
+      sigRaw = spec.sort((a, b) =>
+        ((b.shape.length === 3 ? 4 : 0) + (/spect/i.test(b.leaf) ? 2 : 0)) -
+        ((a.shape.length === 3 ? 4 : 0) + (/spect/i.test(a.leaf) ? 2 : 0)))[0];
+      sig1 = null; sigScore = 6;
+    } else {
+      kind = "apd";
+      const vocab = (b) => /count|rate|intensity|signal|photon|detect|sensor|adu|volt/i.test(b.base) ? 4 : 0;
+      const sB = bundle(sigs).sort((a, b) =>
+        (vocab(b) + (b.d2 ? 2 : 0) + (b.d1 ? 1 : 0)) - (vocab(a) + (a.d2 ? 2 : 0) + (a.d1 ? 1 : 0)))[0];
+      if (!sB) continue;
+      sigRaw = sB.d2; sig1 = sB.d1 || sB.dN;
+      if (!sigRaw && !sig1) continue;
+      sigScore = vocab(sB) + (sigRaw ? 2 : 0);
+    }
+    const score = (/power[_-]?scan/i.test(g) ? 10 : 0) + (pB.d2 ? 2 : 0) + sigScore +
+      (ds.some((d) => /wheel_positions/i.test(d.leaf)) ? 2 : 0) + Math.min(n / 100, 2);
+    if (!best || score > best.score) {
+      best = { score, group: g, kind, powerRaw: pB.d2, power1: pB.d1, sigRaw, sig1, wl,
+        n, reps: (sigRaw && sigRaw.shape[1]) || (pB.d2 && pB.d2.shape[1]) || 1 };
+    }
+  }
+  return best;
+}
+
 /** Detect the measurement type of an open file. Returns {type, label, detail}. */
 function detectType(file) {
   const tree = walkTree(file);
@@ -38063,7 +38149,21 @@ function detectType(file) {
     }
   }
   // 2D scan heuristic: measurement/* group whose name suggests a scan and holds a 2D+ map
-  const scanGroups = tree.filter((n) => n.kind === "group" && /measurement\/[^/]*(2d|scan|map|raster)[^/]*$/i.test(n.path));
+  // 전용 스키마(PLE·rise·darkening·histogram)를 모두 통과한 뒤에야 구조 기반
+  // power scan 판정. darkening 그룹도 powers/count_rates 배열을 갖고 있어
+  // 구조만으로는 구분되지 않으므로 순서가 중요하다.
+  const ps = findPowerScanGroup(file, tree);
+  if (ps) {
+    return ps.kind === "emccd"
+      ? { type: "power_emccd", label: "Power scan · EMCCD", tree, ps }
+      : { type: "power_apd", label: "Power scan · APD", tree, ps };
+  }
+  // 주의: "power_scan"도 "scan"을 포함하므로 이름만으로 2D 스캔이라 판단하면
+  // power scan이 오분류된다. power scan 후보 그룹은 명시적으로 배제한다.
+  const psGroup = (ps || {}).group;
+  const scanGroups = tree.filter((n) => n.kind === "group" && n.path !== psGroup &&
+    !/power/i.test(n.path.split("/").pop()) &&
+    /measurement\/[^/]*(2d|scan|map|raster)[^/]*$/i.test(n.path));
   for (const g of scanGroups) {
     const maps = tree.filter((n) => n.kind === "dataset" && n.path.startsWith(g.path + "/") &&
       n.shape && n.shape.filter((s) => s >= 4).length >= 2);
@@ -38218,21 +38318,25 @@ function extractRiseTime(file, riseGroup) {
 }
 
 /** Acquisition-order PA trace: 1D powers/intensities + wheel_positions (setpoint key). */
-function extractPATrace(file, type, bandMin, bandMax) {
-  const base = "measurement/power_scan";
+function extractPATrace(file, type, bandMin, bandMax, det) {
+  const ps = det && det.ps;
+  const base = ps ? ps.group : "measurement/power_scan";
   const wp = readDataset(file, `${base}/wheel_positions`);
   if (!wp) return null;
   const W = Array.from(wp.data, Number);
   if (type === "power_apd") {
-    const P = readDataset(file, `${base}/apd_counter_powers`);
-    const I = readDataset(file, `${base}/apd_counter_apd_count_rates`);
+    const P = readDataset(file, ps ? ((ps.power1 || ps.powerRaw).path) : `${base}/apd_counter_powers`);
+    const I = readDataset(file, ps ? ((ps.sig1 || ps.sigRaw).path) : `${base}/apd_counter_apd_count_rates`);
     if (!P || !I) return null;
-    return { P: Array.from(P.data, Number), I: Array.from(I.data, Number), W };
+    // (n, reps) 형식이면 반복 평균으로 1D 트레이스 구성
+    const flat1D = (r) => r.shape.length === 1 ? Array.from(r.data, Number)
+      : rows2D(r).map((row) => row.reduce((a, b) => a + b, 0) / row.length);
+    return { P: flat1D(P), I: flat1D(I), W };
   }
   // EMCCD: per-row band integral of the raw spectra (consistent with the viewer band)
-  const P = readDataset(file, `${base}/emccd_powers`);
-  const sp = readDataset(file, `${base}/emccd_spectra_raw`);
-  const wl = readDataset(file, `${base}/emccd_wls`);
+  const P = readDataset(file, ps ? ((ps.power1 || ps.powerRaw).path) : `${base}/emccd_powers`);
+  const sp = readDataset(file, ps ? ps.sigRaw.path : `${base}/emccd_spectra_raw`);
+  const wl = readDataset(file, ps ? ps.wl.path : `${base}/emccd_wls`);
   if (!P || !sp || !wl || sp.shape.length !== 3) return null;
   const wls = Array.from(wl.data, Number);
   let i0 = 0, i1 = wls.length;
@@ -38253,19 +38357,24 @@ function extractPATrace(file, type, bandMin, bandMax) {
   }
   return { P: Array.from(P.data, Number), I, W };
 }
-function extractPowerScanAPD(file) {
-  const count = readDataset(file, KEYS.APD_COUNT);
-  const power = readDataset(file, KEYS.APD_POWER);
+function extractPowerScanAPD(file, det) {
+  const ps = det && det.ps;
+  // 구조 탐지 결과가 있으면 그 경로를, 없으면 레거시 고정 경로를 사용
+  const count = readDataset(file, ps ? ((ps.sigRaw || ps.sig1).path) : KEYS.APD_COUNT);
+  const power = readDataset(file, ps ? ((ps.powerRaw || ps.power1).path) : KEYS.APD_POWER);
   if (!count || !power) throw new Error("APD power-scan datasets missing");
   return { kind: "APD", count2D: rows2D(count), power2D: rows2D(power) };
 }
-function extractPowerScanEMCCD(file) {
-  const spectra = readDataset(file, KEYS.EMCCD_SPECTRA);
-  const power = readDataset(file, KEYS.EMCCD_POWER);
-  const wls = readDataset(file, KEYS.EMCCD_WLS);
+function extractPowerScanEMCCD(file, det) {
+  const ps = det && det.ps;
+  const spectra = readDataset(file, ps ? ps.sigRaw.path : KEYS.EMCCD_SPECTRA);
+  const power = readDataset(file, ps ? ((ps.powerRaw || ps.power1).path) : KEYS.EMCCD_POWER);
+  const wls = readDataset(file, ps ? ps.wl.path : KEYS.EMCCD_WLS);
   if (!spectra || !power || !wls) throw new Error("EMCCD power-scan datasets missing");
-  const sh = spectra.shape;
-  if (sh.length !== 3) throw new Error(`unexpected EMCCD spectra shape [${sh}]`);
+  let sh = spectra.shape;
+  // (n, pix) 형식(반복 없음)도 (n, 1, pix)로 승격해 동일 경로로 처리
+  if (sh.length === 2 && sh[1] === wls.shape[0]) sh = [sh[0], 1, sh[1]];
+  if (sh.length !== 3) throw new Error(`unexpected EMCCD spectra shape [${spectra.shape}]`);
   const data = spectra.data instanceof Float64Array ? spectra.data : Float64Array.from(spectra.data, Number);
   return {
     kind: "EMCCD",
@@ -38534,7 +38643,7 @@ return {
   KEYS, readDataset, rows2D, attrsOf, walkTree, detectType,
   extractPowerScanAPD, extractPowerScanEMCCD, extractEmccdReadout, extractPLE,
   extract2DMaps, readForPreview, extractMeta, findPleGroup, safeGet,
-  extractHistogram, scanAxes, extractPATrace, extractRiseTime, extractWaveScan, extractDarkening,
+  extractHistogram, scanAxes, extractPATrace, findPowerScanGroup, extractRiseTime, extractWaveScan, extractDarkening,
 };
 });
 
@@ -39305,10 +39414,10 @@ function getLoaded(rec) {
   if (rec.cache[key]) return rec.cache[key];
   let loaded;
   if (rec.det.type === "power_apd") {
-    if (!rec.cache.rawAPD) rec.cache.rawAPD = PrismH5.extractPowerScanAPD(rec.h5);
+    if (!rec.cache.rawAPD) rec.cache.rawAPD = PrismH5.extractPowerScanAPD(rec.h5, rec.det);
     loaded = PrismEngine.buildLoadedFromAPD(rec.cache.rawAPD.count2D, rec.cache.rawAPD.power2D);
   } else {
-    if (!rec.cache.rawEMCCD) rec.cache.rawEMCCD = PrismH5.extractPowerScanEMCCD(rec.h5);
+    if (!rec.cache.rawEMCCD) rec.cache.rawEMCCD = PrismH5.extractPowerScanEMCCD(rec.h5, rec.det);
     const r = rec.cache.rawEMCCD;
     loaded = PrismEngine.buildLoadedFromEMCCD(r.spectra, r.power2D, r.wls, App.settings.bandMin, App.settings.bandMax);
   }
@@ -39319,7 +39428,7 @@ function getPATrace(rec) {
   const key = rec.det.type === "power_emccd" ? `patrace:${App.settings.bandMin}-${App.settings.bandMax}` : "patrace";
   if (rec.cache[key] !== undefined) return rec.cache[key];
   let tr = null;
-  try { tr = PrismH5.extractPATrace(rec.h5, rec.det.type, App.settings.bandMin, App.settings.bandMax); } catch (e) {}
+  try { tr = PrismH5.extractPATrace(rec.h5, rec.det.type, App.settings.bandMin, App.settings.bandMax, rec.det); } catch (e) {}
   rec.cache[key] = tr;
   return tr;
 }
@@ -39910,7 +40019,7 @@ async function runDiagnosticsUI(rec) {
 function renderEmccdSpecPreview(rec) {
   const el = $("#chart-spec");
   if (!el) return;
-  const raw = rec.cache.rawEMCCD || (rec.cache.rawEMCCD = PrismH5.extractPowerScanEMCCD(rec.h5));
+  const raw = rec.cache.rawEMCCD || (rec.cache.rawEMCCD = PrismH5.extractPowerScanEMCCD(rec.h5, rec.det));
   const n = raw.spectra.n, pix = raw.spectra.pix, reps = raw.spectra.reps;
   const slider = $("#spec-idx");
   slider.max = String(n - 1);
@@ -40801,6 +40910,34 @@ function previewDataset(rec, path, chartEl, labelEl) {
       { yaxis: Object.assign(baseLayout().yaxis, { scaleanchor: pv.nx === pv.ny ? "x" : undefined }) });
   }
 }
+/** 측정 유형이 왜 그렇게 인식됐는지 설명 (새 측정 플랫폼 연동 시 진단용) */
+function detectionDiagnosticHtml(rec) {
+  const d = rec.det || {};
+  const leaf = (x) => x ? esc(x.path.split("/").pop()) + ` <span class="t-shape">[${x.shape.join("×")}]</span>` : "–";
+  const label = { power_apd: "Power scan · APD", power_emccd: "Power scan · EMCCD", ple: "PLE", scan2d: "2D 스캔",
+    histogram: "TCSPC", rise_time: "Rise time", darkening: "Photodarkening", emccd_readout: "EMCCD 스펙트럼",
+    generic: "인식 실패 (범용 미리보기)" }[d.type] || d.type;
+  const bits = [`<b>측정 유형</b>: ${esc(label)} <span class="muted">(${d.type})</span>`];
+  if (d.ps) {
+    bits.push(`<b>판정 근거</b>: 구조 탐지 — 그룹 <span class="mono">${esc(d.ps.group)}</span>` +
+      ` · 측정점 ${d.ps.n}개 · 반복 ${d.ps.reps}회`);
+    bits.push(`&nbsp;&nbsp;power 배열: <span class="mono">${leaf(d.ps.powerRaw || d.ps.power1)}</span>` +
+      ` · 신호 배열: <span class="mono">${leaf(d.ps.sigRaw || d.ps.sig1)}</span>` +
+      (d.ps.wl ? ` · 파장축: <span class="mono">${leaf(d.ps.wl)}</span>` : ""));
+  } else if (d.type === "power_apd" || d.type === "power_emccd") {
+    bits.push(`<b>판정 근거</b>: 표준 경로 <span class="mono">measurement/power_scan/…</span> 정확 일치`);
+  } else if (d.type === "generic") {
+    bits.push(`<span class="tag-Low">Power scan으로 인식되려면</span> 하나의 <span class="mono">measurement/&lt;그룹&gt;</span> 안에` +
+      ` ① 이름에 <span class="mono">power</span>가 든 배열(측정점 n개)과` +
+      ` ② 선두 차원이 같은 <span class="mono">count/rate/intensity/spectra</span> 계열 신호 배열이 필요합니다.` +
+      ` 검출기 접두사·그룹명·<span class="mono">_raw</span> 유무는 자유입니다` +
+      ` (<span class="mono">polled_powers</span>·시간축·<span class="mono">wheel_positions</span>는 축으로 간주되어 제외).`);
+  } else {
+    bits.push(`<b>판정 근거</b>: <span class="mono">${esc(d.darkGroup || d.riseGroup || d.scanGroup || d.pleGroup || d.histGroup || "전용 스키마 일치")}</span>`);
+  }
+  return `<div class="panel"><h3>측정 유형 감지 진단</h3><div class="small" style="line-height:1.7">${bits.join("<br>")}</div></div>`;
+}
+
 function renderStructure(rec) {
   const tree = rec.det.tree || [];
   const lines = [`<div class="tree">`];
@@ -40816,7 +40953,7 @@ function renderStructure(rec) {
     }
   }
   lines.push("</div>");
-  $("#view").innerHTML = `
+  $("#view").innerHTML = detectionDiagnosticHtml(rec) + `
   <div class="panel"><h3>파일 구조 <span class="muted small">클릭하여 미리보기/속성 확인</span></h3>${lines.join("")}</div>
   <div class="panel" id="struct-detail" style="display:none;"><h3 id="sd-title"></h3>
     <div id="sd-attrs" class="attr-box mono small" style="display:none;"></div>
