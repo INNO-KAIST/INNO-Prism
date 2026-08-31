@@ -253,7 +253,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.3.4</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.4.0</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -288,6 +288,7 @@ a { color: var(--accent); }
 <input id="file-input" type="file" accept=".h5,.hdf5" multiple style="display:none">
 <input id="dir-input" type="file" webkitdirectory style="display:none">
 
+<script>window.PRISM_FIREBASE_URL = "";</script>
 <!-- h5wasm (HDF5 → WASM, wasm embedded, offline) -->
 <script>
 var h5wasm = (() => {
@@ -38685,6 +38686,7 @@ const App = {
     metrics: null,                // beamMetrics 결과
     densityMode: "peak",          // peak | e2avg | fwhm
     areaBasis: "gauss",           // gauss (1/e² Gaussian 피팅) | d4sigma (ISO 11146 회전 D4σ)
+    lensDbUrl: null,              // 공용 렌즈 목록 Firebase RTDB URL (빌드 내장값보다 우선)
     enabled: false,
   },
 };
@@ -38718,7 +38720,10 @@ function downloadBlob(name, blob) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 function downloadText(name, text, mime = "text/plain") {
-  downloadBlob(name, new Blob(["﻿" + text], { type: mime + ";charset=utf-8" }));
+  // BOM은 Excel이 CSV의 한글을 깨뜨리지 않게 하려는 것 → CSV/텍스트에만 붙인다.
+  // JSON에 BOM이 붙으면 엄격한 파서(JSON.parse 등)가 거부한다.
+  const bom = /json/i.test(mime) ? "" : "﻿";
+  downloadBlob(name, new Blob([bom + text], { type: mime + ";charset=utf-8" }));
 }
 function csvEscape(v) {
   const s = v == null ? "" : String(v);
@@ -39096,6 +39101,163 @@ function fmtDensityAuto(mwVal, digits = 4) {
   const u = densityUnitFor(Math.abs(mwVal));
   return `${fmt(mwVal / u.div, digits)} ${u.name}`;
 }
+/* ------------------- 공용 렌즈 목록 동기화 (Firebase RTDB) -------------------
+ * 연구실 여러 PC/브라우저가 같은 대물렌즈 목록을 공유하기 위한 계층.
+ *
+ * 설계 원칙
+ *  · SDK를 번들하지 않고 **REST + SSE(EventSource)** 만 사용한다. 앱의 오프라인
+ *    단일 HTML 원칙을 지키면서(용량 증가 0) 진짜 실시간 push를 받는다.
+ *  · localStorage 사본을 항상 유지한다 → 서버/네트워크가 없어도 목록이 보이고,
+ *    origin이 달라져도(파일 vs GitHub Pages) 최소한 그 브라우저에서는 남는다.
+ *  · 오프라인에서 추가한 항목은 pending으로 표시하고 연결 시 자동 재전송한다.
+ *  · 공유되는 것은 렌즈 제조사/모델/배율뿐이며, 측정 데이터는 전송하지 않는다.
+ */
+let refreshLensUI = null;   // 보정 모달이 열려 있을 때만 설정됨
+const LensSync = {
+  es: null, state: "off", err: "", server: null, retry: 0, timer: null,
+  // 이 PC에서 삭제한 키. 서버가 삭제를 확인할 때까지 병합에서 제외한다.
+  // (없으면: 삭제 직후 도착한 서버 이벤트가 항목을 'pending'으로 되살리고
+  //  재전송까지 해서 삭제가 영구히 취소된다.)
+  tomb: new Set(),
+};
+/** 빌드 내장값(모두 같은 빌드를 쓰면 자동 연결) 또는 앱에서 입력한 값 */
+function lensDbUrl() {
+  const u = (App.calib.lensDbUrl || (typeof PRISM_FIREBASE_URL !== "undefined" ? PRISM_FIREBASE_URL : "") || "").trim();
+  return u ? u.replace(/\/+$/, "") : null;
+}
+/** Firebase 키 제약(. # $ [ ] / 불가)에 맞춘 안정적 식별자 */
+function lensKey(o) {
+  return `${o.maker || ""}~${o.model || ""}~${o.mag}`
+    .toLowerCase().replace(/[.#$/[\]]/g, "_").replace(/\s+/g, " ").trim().slice(0, 200);
+}
+function lensEntry(o) {
+  return { maker: String(o.maker || "").trim(), model: String(o.model || "").trim(), mag: Number(o.mag) };
+}
+/** 표시 목록 = 서버 정본 + (이 PC에서 아직 전송하지 못한 항목).
+ *  서버에 연결돼 있는데 로컬에만 있는 항목은 두 가지 의미가 있으므로 구분한다.
+ *   · _pending  : 이 PC에서 추가했으나 아직 전송 못 함  → 유지하고 재전송
+ *   · 그 외      : 다른 PC에서 삭제된 것                → 로컬에서도 제거
+ *  구분하지 않으면 원격 삭제가 매번 되살아난다. */
+function lensMerge() {
+  const c = App.calib;
+  const local = c.objectives || [];
+  const prevSel = c.objSel >= 0 ? local[c.objSel] : null;
+  let out;
+  if (!LensSync.server) {
+    // 서버 스냅샷 없음(미설정·연결 전·오프라인) → 마지막 로컬 목록을 그대로 유지
+    out = local.map((o) => ({ ...lensEntry(o), _key: o._key || lensKey(o), _pending: o._pending }));
+  } else {
+    out = [];
+    const seen = new Set();
+    for (const k of Object.keys(LensSync.server)) {
+      if (LensSync.tomb.has(k)) continue;           // 삭제 요청 중 — 표시하지 않음
+      const e = LensSync.server[k];
+      if (!e || !isFinite(Number(e.mag))) continue;
+      out.push({ ...lensEntry(e), _key: k }); seen.add(k);
+    }
+    for (const o of local) {
+      const k = o._key || lensKey(o);
+      if (seen.has(k) || LensSync.tomb.has(k)) continue;
+      if (o._pending) out.push({ ...lensEntry(o), _key: k, _pending: true });
+      // _pending이 아닌데 서버에 없다 = 다른 PC에서 삭제됨 → 제거
+    }
+  }
+  out.sort((a, b) => String(a.maker || "").localeCompare(String(b.maker || ""), "ko") || (a.mag - b.mag));
+  c.objectives = out;
+  c.objSel = prevSel ? out.findIndex((x) => x._key === (prevSel._key || lensKey(prevSel))) : -1;
+  saveCalib();
+}
+function lensSyncStatus() {
+  const map = { live: ["● 실시간 공유 중", "var(--good)"], connecting: ["◌ 연결 중…", "var(--text-muted)"],
+    error: ["⚠ 연결 실패 — 로컬 목록 사용 중", "var(--warn)"], off: ["○ 로컬 전용 (공유 미설정)", "var(--text-muted)"] };
+  return map[LensSync.state] || map.off;
+}
+/** 서버 이벤트(put/patch) 적용 */
+function lensApply(path, data, isPatch) {
+  LensSync.server = LensSync.server || {};
+  if (path === "/" || path === "") {
+    if (isPatch) Object.assign(LensSync.server, data || {});
+    else LensSync.server = data || {};
+  } else {
+    const k = path.replace(/^\//, "").split("/")[0];
+    if (data === null || data === undefined) delete LensSync.server[k];
+    else if (isPatch) LensSync.server[k] = Object.assign(LensSync.server[k] || {}, data);
+    else LensSync.server[k] = data;
+  }
+  // 서버 스냅샷에서 사라진 키는 삭제가 확정된 것 → tombstone 해제
+  for (const k of Array.from(LensSync.tomb)) {
+    if (!LensSync.server || !(k in LensSync.server)) LensSync.tomb.delete(k);
+  }
+  lensMerge();
+  if (typeof refreshLensUI === "function") refreshLensUI();
+}
+/** 실시간 스트림 연결 (자동 재시도) */
+function lensSyncStart() {
+  const base = lensDbUrl();
+  lensSyncStop();
+  if (!base) { LensSync.state = "off"; if (typeof refreshLensUI === "function") refreshLensUI(); return; }
+  LensSync.state = "connecting"; LensSync.err = "";
+  if (typeof refreshLensUI === "function") refreshLensUI();
+  try {
+    const es = new EventSource(`${base}/lenses.json`);
+    LensSync.es = es;
+    es.addEventListener("put", (ev) => {
+      try { const m = JSON.parse(ev.data); lensApply(m.path, m.data, false); } catch (e) {}
+      LensSync.state = "live"; LensSync.retry = 0;
+      lensFlushPending();
+      if (typeof refreshLensUI === "function") refreshLensUI();
+    });
+    es.addEventListener("patch", (ev) => {
+      try { const m = JSON.parse(ev.data); lensApply(m.path, m.data, true); } catch (e) {}
+    });
+    es.onerror = () => {
+      LensSync.state = "error";
+      LensSync.err = "스트림 연결 끊김";
+      if (typeof refreshLensUI === "function") refreshLensUI();
+      try { es.close(); } catch (e) {}
+      LensSync.es = null;
+      // 지수 백오프 재시도 (최대 30초)
+      const wait = Math.min(2000 * Math.pow(2, LensSync.retry++), 30000);
+      LensSync.timer = setTimeout(lensSyncStart, wait);
+    };
+  } catch (e) {
+    LensSync.state = "error"; LensSync.err = String(e && e.message || e);
+    if (typeof refreshLensUI === "function") refreshLensUI();
+  }
+}
+function lensSyncStop() {
+  if (LensSync.timer) { clearTimeout(LensSync.timer); LensSync.timer = null; }
+  if (LensSync.es) { try { LensSync.es.close(); } catch (e) {} LensSync.es = null; }
+}
+/** 렌즈 1건 서버 등록 (실패해도 로컬에는 남고 pending으로 재시도) */
+async function lensPush(o) {
+  const base = lensDbUrl();
+  if (!base) return false;
+  const k = lensKey(o);
+  const r = await fetch(`${base}/lenses/${encodeURIComponent(k)}.json`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...lensEntry(o), ts: Date.now() }),
+  });
+  if (!r.ok) throw new Error(`서버 응답 ${r.status}`);
+  return true;
+}
+async function lensRemove(o) {
+  const base = lensDbUrl();
+  if (!base) return false;
+  const k = o._key || lensKey(o);
+  const r = await fetch(`${base}/lenses/${encodeURIComponent(k)}.json`, { method: "DELETE" });
+  if (!r.ok) throw new Error(`서버 응답 ${r.status}`);
+  return true;
+}
+/** 연결 복구 시 미전송 항목 자동 전송 */
+async function lensFlushPending() {
+  const pend = (App.calib.objectives || []).filter((o) => o._pending && !LensSync.tomb.has(o._key || lensKey(o)));
+  for (const o of pend) {
+    try { await lensPush(o); delete o._pending; } catch (e) { break; }
+  }
+  if (pend.length) saveCalib();
+}
+
 function saveCalib() {
   try { localStorage.setItem("innoPrismCalib2", JSON.stringify(App.calib)); } catch (e) {}
 }
@@ -39134,13 +39296,32 @@ function openCalibModal() {
         <label class="ctl"><span>배율 (×)</span><input id="cb-mag" type="number" step="any" value="${c.objMag ?? ""}" style="width:80px"></label>
         <label class="ctl"><span>유효 픽셀 크기</span><span id="cb-effpx" class="mono" style="padding:6px 2px;"></span></label>
       </div>
-      <details class="small" style="margin-top:6px;"><summary class="muted" style="cursor:pointer;">렌즈 목록 관리 (추가/삭제)</summary>
+      <details class="small" style="margin-top:6px;"><summary class="muted" style="cursor:pointer;">렌즈 목록 관리 (추가/삭제 · 연구실 공유)</summary>
         <div class="flex small" style="margin-top:6px;">
           <input id="cb-obj-maker" type="text" placeholder="제조사 (예: Olympus)" style="width:140px">
           <input id="cb-obj-model" type="text" placeholder="모델명 (예: MPLFLN100X)" style="width:170px">
           <input id="cb-obj-mag" type="number" step="any" placeholder="배율" style="width:80px">
           <button id="cb-obj-add" class="small">목록에 추가</button>
           <button id="cb-obj-del" class="small">선택 렌즈 삭제</button>
+        </div>
+        <div class="flex small" style="margin-top:8px;align-items:center;">
+          <span id="cb-sync-state" class="small"></span>
+          <span class="right flex">
+            <button id="cb-lens-export" class="small" title="렌즈 목록을 JSON 파일로 저장">내보내기</button>
+            <button id="cb-lens-import" class="small" title="JSON 파일에서 렌즈 목록 불러오기 (기존 목록에 병합)">가져오기</button>
+            <input id="cb-lens-file" type="file" accept=".json,application/json" style="display:none">
+            <button id="cb-sync-cfg" class="small">공유 설정</button>
+          </span>
+        </div>
+        <div id="cb-sync-box" class="small" style="display:none;margin-top:8px;padding:8px;background:var(--surface-2);border-radius:8px;">
+          <div class="muted" style="margin-bottom:6px;">Firebase Realtime Database URL을 입력하면 이 브라우저가 연구실 공용 목록에 실시간 연결됩니다.
+          빌드에 내장하면(빌드 담당자에게 URL 전달) 모든 PC가 입력 없이 자동 연결됩니다.</div>
+          <div class="flex">
+            <input id="cb-sync-url" type="text" placeholder="https://your-project-default-rtdb.firebaseio.com" style="flex:1;min-width:220px">
+            <button id="cb-sync-save" class="small primary">연결</button>
+            <button id="cb-sync-clear" class="small">해제</button>
+          </div>
+          <div id="cb-sync-err" class="small" style="margin-top:6px;"></div>
         </div>
       </details>
       <div class="flex small" style="margin-top:8px;">
@@ -39176,7 +39357,7 @@ function openCalibModal() {
     const sel = back.querySelector("#cb-obj");
     const opts = ['<option value="-1">직접 입력</option>'];
     (c.objectives || []).forEach((o, i) => {
-      opts.push(`<option value="${i}">${esc(o.maker || "")} ${esc(o.model || "")} (${fmt(o.mag, 4)}×)</option>`);
+      opts.push(`<option value="${i}">${esc(o.maker || "")} ${esc(o.model || "")} (${fmt(o.mag, 4)}×)${o._pending ? " · 미동기화" : ""}</option>`);
     });
     sel.innerHTML = opts.join("");
     sel.value = String(c.objSel != null ? c.objSel : -1);
@@ -39280,28 +39461,112 @@ function openCalibModal() {
     if (i >= 0 && c.objectives[i]) back.querySelector("#cb-mag").value = c.objectives[i].mag;
     upd();
   });
-  back.querySelector("#cb-obj-add").addEventListener("click", () => {
+  back.querySelector("#cb-obj-add").addEventListener("click", async () => {
     const maker = back.querySelector("#cb-obj-maker").value.trim();
     const model = back.querySelector("#cb-obj-model").value.trim();
     const mag = Number(back.querySelector("#cb-obj-mag").value);
     if (!(isFinite(mag) && mag > 0)) { toast("배율을 올바르게 입력하세요"); return; }
     c.objectives = c.objectives || [];
-    const entry = { maker, model, mag };
+    const entry = { maker, model, mag, _key: lensKey({ maker, model, mag }) };
+    if (c.objectives.some((o) => (o._key || lensKey(o)) === entry._key)) { toast("이미 목록에 있는 렌즈입니다"); return; }
+    // 로컬 먼저 반영(오프라인에서도 즉시 사용) → 서버 전송
+    entry._pending = !!lensDbUrl();
     c.objectives.push(entry);
     sortObjectives(entry);
     back.querySelector("#cb-mag").value = mag;
     back.querySelector("#cb-obj-maker").value = ""; back.querySelector("#cb-obj-model").value = ""; back.querySelector("#cb-obj-mag").value = "";
-    fillObjSelect();
-    upd();
-  });
-  back.querySelector("#cb-obj-del").addEventListener("click", () => {
-    const i = Number(back.querySelector("#cb-obj").value);
-    if (i >= 0 && c.objectives[i]) {
-      c.objectives.splice(i, 1);
-      c.objSel = -1;
-      fillObjSelect();
-      upd();
+    fillObjSelect(); upd();
+    if (lensDbUrl()) {
+      try { await lensPush(entry); delete entry._pending; saveCalib(); toast("공용 목록에 추가되어 연구실 전체에 공유됩니다"); }
+      catch (e) { toast("서버 전송 실패 — 로컬에 저장했고 연결되면 자동 전송됩니다"); updateSyncUI(); }
     }
+  });
+  back.querySelector("#cb-obj-del").addEventListener("click", async () => {
+    const i = Number(back.querySelector("#cb-obj").value);
+    if (!(i >= 0 && c.objectives[i])) return;
+    const victim = c.objectives[i];
+    if (lensDbUrl() && !victim._pending &&
+        !confirm(`"${victim.maker} ${victim.model}"을(를) 연구실 공용 목록에서 삭제합니다.\n모든 PC에서 사라집니다. 계속할까요?`)) return;
+    const vkey = victim._key || lensKey(victim);
+    if (lensDbUrl()) LensSync.tomb.add(vkey);   // 서버 확인 전까지 되살아나지 않도록
+    c.objectives.splice(i, 1);
+    c.objSel = -1;
+    fillObjSelect(); upd();
+    if (lensDbUrl()) {
+      try { await lensRemove(victim); }
+      catch (e) {
+        LensSync.tomb.delete(vkey);             // 실패 → 롤백(다음 병합에서 복구)
+        lensMerge(); fillObjSelect();
+        toast("서버 삭제 실패 — 목록을 되돌렸습니다: " + e.message);
+      }
+    }
+  });
+  // ---- 공용 렌즈 목록 동기화 UI ----
+  const updateSyncUI = () => {
+    const el = back.querySelector("#cb-sync-state");
+    if (!el) return;
+    const [txt, col] = lensSyncStatus();
+    const nPend = (c.objectives || []).filter((o) => o._pending).length;
+    el.innerHTML = `<span style="color:${col}">${esc(txt)}</span>` +
+      (lensDbUrl() ? ` <span class="muted">· ${esc(lensDbUrl().replace(/^https?:\/\//, "").slice(0, 40))}</span>` : "") +
+      (nPend ? ` <span class="tag-Low">· 미전송 ${nPend}건</span>` : "");
+    const errEl = back.querySelector("#cb-sync-err");
+    if (errEl) errEl.innerHTML = LensSync.err ? `<span class="tag-Low">${esc(LensSync.err)}</span>` : "";
+  };
+  refreshLensUI = () => { try { fillObjSelect(); updateSyncUI(); } catch (e) {} };
+  updateSyncUI();
+  back.querySelector("#cb-sync-cfg").addEventListener("click", () => {
+    const box = back.querySelector("#cb-sync-box");
+    box.style.display = box.style.display === "none" ? "" : "none";
+    back.querySelector("#cb-sync-url").value = c.lensDbUrl || "";
+  });
+  back.querySelector("#cb-sync-save").addEventListener("click", () => {
+    const u = back.querySelector("#cb-sync-url").value.trim();
+    // https 필수 (사내/로컬 테스트 서버만 http 허용)
+    if (u && !/^https:\/\/[^\s]+$/i.test(u) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(u)) {
+      toast("https:// 로 시작하는 URL을 입력하세요"); return;
+    }
+    c.lensDbUrl = u || null; saveCalib();
+    LensSync.server = null; LensSync.retry = 0;
+    lensSyncStart();
+    toast(u ? "공용 목록에 연결합니다" : "공유 해제 — 로컬 목록만 사용합니다");
+  });
+  back.querySelector("#cb-sync-clear").addEventListener("click", () => {
+    c.lensDbUrl = null; saveCalib();
+    LensSync.server = null; lensSyncStop(); LensSync.state = "off"; LensSync.err = "";
+    back.querySelector("#cb-sync-url").value = "";
+    // 서버 사본 표시는 지우되 목록 자체는 로컬에 남긴다
+    (c.objectives || []).forEach((o) => { delete o._pending; });
+    fillObjSelect(); updateSyncUI(); saveCalib();
+    toast("공유 해제됨 (목록은 이 브라우저에 유지)");
+  });
+  back.querySelector("#cb-lens-export").addEventListener("click", () => {
+    const payload = { app: "INNO Prism", kind: "objective-lens-list", exportedAt: new Date().toISOString(),
+      cameraPitch: c.cameraPitch,
+      lenses: (c.objectives || []).map((o) => ({ maker: o.maker, model: o.model, mag: o.mag })) };
+    downloadText("INNO_Prism_lenses.json", JSON.stringify(payload, null, 1), "application/json");
+  });
+  back.querySelector("#cb-lens-import").addEventListener("click", () => back.querySelector("#cb-lens-file").click());
+  back.querySelector("#cb-lens-file").addEventListener("change", async (e) => {
+    const f = e.target.files[0]; e.target.value = "";
+    if (!f) return;
+    try {
+      const j = JSON.parse(await f.text());
+      const list = Array.isArray(j) ? j : (j.lenses || []);
+      let added = 0;
+      c.objectives = c.objectives || [];
+      for (const raw of list) {
+        const o = { maker: String(raw.maker || "").trim(), model: String(raw.model || "").trim(), mag: Number(raw.mag) };
+        if (!(isFinite(o.mag) && o.mag > 0)) continue;
+        o._key = lensKey(o);
+        if (c.objectives.some((x) => (x._key || lensKey(x)) === o._key)) continue;
+        o._pending = !!lensDbUrl();
+        c.objectives.push(o); added++;
+        if (lensDbUrl()) { try { await lensPush(o); } catch (err) {} }
+      }
+      sortObjectives(null); fillObjSelect(); updateSyncUI(); upd();
+      toast(added ? `${added}개 렌즈를 가져왔습니다${lensDbUrl() ? " (공용 목록에도 반영)" : ""}` : "새로 추가된 렌즈가 없습니다");
+    } catch (err) { toast("가져오기 실패: " + err.message); }
   });
   back.querySelector("#cb-mode").addEventListener("change", upd);
   back.querySelector("#cb-basis").addEventListener("change", upd);
@@ -39404,7 +39669,7 @@ function openCalibModal() {
     }
     e.target.value = "";
   });
-  back.querySelector("#cb-close").addEventListener("click", () => { upd(); back.remove(); if (App.activeId) renderAll(); });
+  back.querySelector("#cb-close").addEventListener("click", () => { upd(); refreshLensUI = null; back.remove(); if (App.activeId) renderAll(); });
   refreshCalibUI();
 }
 
@@ -41122,6 +41387,7 @@ function loadSettings() {
 function boot() {
   loadSettings();
   loadCalib();
+  lensSyncStart();   // 공용 렌즈 목록 실시간 연결 (미설정이면 즉시 off)
   initWorker();
   $("#calib-btn").addEventListener("click", openCalibModal);
   $("#open-files").addEventListener("click", () => $("#file-input").click());
