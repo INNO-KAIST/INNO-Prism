@@ -253,7 +253,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.4.1</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v2.5.0</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -38687,6 +38687,7 @@ const App = {
     densityMode: "peak",          // peak | e2avg | fwhm
     areaBasis: "gauss",           // gauss (1/e² Gaussian 피팅) | d4sigma (ISO 11146 회전 D4σ)
     lensDbUrl: null,              // 공용 렌즈 목록 Firebase RTDB URL (빌드 내장값보다 우선)
+    lambdaNm: 1064,               // 여기 파장 (회절 한계 대조용)
     enabled: false,
   },
 };
@@ -38999,6 +39000,38 @@ function calibAreaCm2() {
 }
 /** 두 폭 정의(회전 Gaussian 1/e² vs ISO 11146 회전 D4σ) 비교 + 회전 무시 시
  *  발생하는 면적 과대평가량 + 품질 경고를 한 블록으로 렌더링. */
+/** 선택된 렌즈의 사양(NA·매질·초점거리)과 회절 한계 대조.
+ *  회절 한계 FWHM ≈ 0.51·λ/NA (침지 시에도 λ는 진공 파장, NA가 n을 포함).
+ *  측정 FWHM이 이 값보다 작으면 물리적으로 불가능 → 배율·픽셀피치·NA 중
+ *  하나가 잘못된 것이므로, 파워밀도가 조용히 틀리는 것을 여기서 잡아낸다. */
+function lensInfoHtml(c) {
+  const o = c.objSel >= 0 && c.objectives ? c.objectives[c.objSel] : null;
+  if (!o) return "";
+  const bits = [];
+  if (isFinite(Number(o.na)) && o.na > 0) bits.push(`NA ${fmt(o.na, 3)}`);
+  if (LENS_MEDIA[o.medium]) bits.push(LENS_MEDIA[o.medium]);
+  const f = lensFocalMm(o);
+  if (f) bits.push(`f = ${fmt(f.mm, 4)} mm` + (f.derived ? ` <span class="muted">(경통렌즈 ${f.tube} mm ÷ ${fmt(o.mag, 4)}× 자동계산)</span>` : ` <span class="muted">(기록값)</span>`));
+  let diag = "";
+  const lam = Number(c.lambdaNm), na = Number(o.na);
+  if (isFinite(lam) && lam > 0 && isFinite(na) && na > 0) {
+    const dlFwhm = 0.51 * (lam * 1e-3) / na;            // µm
+    diag = `<br>회절 한계 FWHM ≈ 0.51·λ/NA = <b>${fmt(dlFwhm, 3)} µm</b>`;
+    const m = c.metrics;
+    if (m && isFinite(m.fwhmXum) && isFinite(m.fwhmYum)) {
+      const meas = Math.sqrt(m.fwhmXum * m.fwhmYum);     // 기하평균
+      const r = meas / dlFwhm;
+      const cls = r < 0.95 ? "tag-Poor" : r < 1.5 ? "tag-High" : r < 5 ? "tag-Low" : "tag-Poor";
+      const msg = r < 0.95 ? "측정값이 회절 한계보다 작습니다 — 배율·픽셀 피치·NA 입력을 확인하세요(파워밀도가 과대평가됩니다)"
+        : r < 1.5 ? "회절 한계에 근접 — 정상적으로 집속됨"
+        : r < 5 ? "회절 한계의 수 배 — 언더필/디포커스 가능"
+        : "회절 한계보다 훨씬 큼 — 의도적 확장빔이 아니라면 정렬·초점을 확인하세요";
+      diag += ` · 측정 ${fmt(meas, 3)} µm <b class="${cls}">(×${fmt(r, 3)})</b> — <span class="${cls}">${msg}</span>`;
+    }
+  }
+  return `선택: <b>${esc(o.maker || "")} ${esc(o.model || "")}</b> ${fmt(o.mag, 4)}×` +
+    (bits.length ? " · " + bits.join(" · ") : "") + diag;
+}
 function beamBasisCompareHtml(c) {
   const b = c.beam;
   if (!b || !b.moments) return "";
@@ -39132,11 +39165,49 @@ function lensDbUrl() {
 }
 /** Firebase 키 제약(. # $ [ ] / 불가)에 맞춘 안정적 식별자 */
 function lensKey(o) {
+  // 공백까지 _ 로 치환해 URL-safe 하게 만든다. 공백이 남으면 요청 시 %20으로
+  // 인코딩되어 서버가 돌려주는 키와 어긋날 여지가 생긴다.
   return `${o.maker || ""}~${o.model || ""}~${o.mag}`
-    .toLowerCase().replace(/[.#$/[\]]/g, "_").replace(/\s+/g, " ").trim().slice(0, 200);
+    .toLowerCase().replace(/[.#$/[\]]/g, "_").replace(/\s+/g, "_").trim().slice(0, 200);
+}
+const LENS_MEDIA = { air: "Air", oil: "Oil", water: "Water", glycerol: "Glycerol" };
+/* 무한보정 대물렌즈의 초점거리는 배럴에 잘 적히지 않는다 — 독립 값이 아니라
+ * f_obj = f_경통렌즈 / 배율 로 결정되고, 경통렌즈 초점거리는 제조사마다 고정이기
+ * 때문. 그래서 제조사+배율로 자동 계산하고, 비표준 광학계나 스펙에 명시된 값이
+ * 있을 때만 수동 입력으로 덮어쓴다. */
+const TUBE_LENS_MM = {
+  olympus: 180, evident: 180, nikon: 200, zeiss: 165, "carl zeiss": 165,
+  leica: 200, mitutoyo: 200, thorlabs: 200, edmund: 200, motic: 200,
+};
+function lensTubeMm(maker) {
+  const k = String(maker || "").trim().toLowerCase();
+  if (TUBE_LENS_MM[k]) return { mm: TUBE_LENS_MM[k], maker: k };
+  for (const name of Object.keys(TUBE_LENS_MM)) if (k.includes(name)) return { mm: TUBE_LENS_MM[name], maker: name };
+  return null;
+}
+/** 초점거리(mm) — 수동 기록값 우선, 없으면 제조사 경통렌즈로 계산 */
+function lensFocalMm(o) {
+  if (isFinite(Number(o && o.f)) && Number(o.f) > 0) return { mm: Number(o.f), derived: false };
+  const t = o && lensTubeMm(o.maker);
+  if (t && isFinite(Number(o.mag)) && Number(o.mag) > 0) {
+    return { mm: t.mm / Number(o.mag), derived: true, tube: t.mm };
+  }
+  return null;
 }
 function lensEntry(o) {
-  return { maker: String(o.maker || "").trim(), model: String(o.model || "").trim(), mag: Number(o.mag) };
+  const e = { maker: String(o.maker || "").trim(), model: String(o.model || "").trim(), mag: Number(o.mag) };
+  const med = String(o.medium || "").toLowerCase();
+  if (LENS_MEDIA[med]) e.medium = med;              // 미지정 렌즈(구버전)는 필드 자체를 생략
+  if (isFinite(Number(o.na)) && Number(o.na) > 0) e.na = Number(o.na);
+  if (isFinite(Number(o.f)) && Number(o.f) > 0) e.f = Number(o.f);   // 수동 기록 초점거리(mm)
+  return e;
+}
+/** 목록 표시용 라벨: "Olympus MPLFLN100X (100×, NA 1.30, Oil)" */
+function lensLabel(o) {
+  const ex = [];
+  if (isFinite(Number(o.na)) && Number(o.na) > 0) ex.push(`NA ${fmt(o.na, 3)}`);
+  if (LENS_MEDIA[o.medium]) ex.push(LENS_MEDIA[o.medium]);
+  return `${o.maker || ""} ${o.model || ""} (${fmt(o.mag, 4)}×${ex.length ? ", " + ex.join(", ") : ""})`;
 }
 /** 표시 목록 = 서버 정본 + (이 PC에서 아직 전송하지 못한 항목).
  *  서버에 연결돼 있는데 로컬에만 있는 항목은 두 가지 의미가 있으므로 구분한다.
@@ -39334,12 +39405,22 @@ function openCalibModal() {
         <label class="ctl"><span>Objective Lens</span><select id="cb-obj" style="min-width:220px"></select></label>
         <label class="ctl"><span>배율 (×)</span><input id="cb-mag" type="number" step="any" value="${c.objMag ?? ""}" style="width:80px"></label>
         <label class="ctl"><span>유효 픽셀 크기</span><span id="cb-effpx" class="mono" style="padding:6px 2px;"></span></label>
+        <label class="ctl"><span>여기 파장 (nm)</span><input type="number" id="cb-lambda" step="any" min="0" style="width:92px" title="회절 한계 대조용 — 측정에 쓰는 여기 레이저 파장"></label>
       </div>
+      <div id="cb-lens-info" class="small mono" style="margin-top:4px;color:var(--text-secondary);"></div>
       <details class="small" style="margin-top:6px;"><summary class="muted" style="cursor:pointer;">렌즈 목록 관리 (추가/삭제 · 연구실 공유)</summary>
         <div class="flex small" style="margin-top:6px;">
           <input id="cb-obj-maker" type="text" placeholder="제조사 (예: Olympus)" style="width:140px">
           <input id="cb-obj-model" type="text" placeholder="모델명 (예: MPLFLN100X)" style="width:170px">
-          <input id="cb-obj-mag" type="number" step="any" placeholder="배율" style="width:80px">
+          <input id="cb-obj-mag" type="number" step="any" placeholder="배율" style="width:72px">
+          <input id="cb-obj-na" type="number" step="any" min="0" placeholder="NA" style="width:70px" title="개구수 (Numerical Aperture) — 선택 입력">
+          <input id="cb-obj-f" type="number" step="any" min="0" placeholder="f (mm)" style="width:78px" title="초점거리 — 비워두면 제조사 경통렌즈 기준으로 자동 계산됩니다">
+          <select id="cb-obj-med" title="침지 매질" style="width:96px">
+            <option value="air">Air</option>
+            <option value="oil">Oil</option>
+            <option value="water">Water</option>
+            <option value="glycerol">Glycerol</option>
+          </select>
           <button id="cb-obj-add" class="small">목록에 추가</button>
           <button id="cb-obj-del" class="small">선택 렌즈 삭제</button>
         </div>
@@ -39396,7 +39477,7 @@ function openCalibModal() {
     const sel = back.querySelector("#cb-obj");
     const opts = ['<option value="-1">직접 입력</option>'];
     (c.objectives || []).forEach((o, i) => {
-      opts.push(`<option value="${i}">${esc(o.maker || "")} ${esc(o.model || "")} (${fmt(o.mag, 4)}×)${o._pending ? " · 미동기화" : ""}</option>`);
+      opts.push(`<option value="${i}">${esc(lensLabel(o))}${o._pending ? " · 미동기화" : ""}</option>`);
     });
     sel.innerHTML = opts.join("");
     sel.value = String(c.objSel != null ? c.objSel : -1);
@@ -39414,6 +39495,8 @@ function openCalibModal() {
     const basisSel = back.querySelector("#cb-basis");
     if (basisSel) c.areaBasis = basisSel.value;
     c.enabled = back.querySelector("#cb-enable").checked;
+    const lam = Number(back.querySelector("#cb-lambda").value);
+    if (isFinite(lam) && lam > 0) c.lambdaNm = lam;
     const eff = calibEffUmPerPx();
     back.querySelector("#cb-effpx").textContent = isFinite(eff)
       ? `${fmt(c.cameraPitch, 4)}/${fmt(c.objMag ?? NaN, 4)} = ${fmt(eff, 5)} µm/px` : "배율 입력 필요";
@@ -39428,6 +39511,10 @@ function openCalibModal() {
         (isFinite(cc.spreadPct) ? ` · 회차 간 편차 ${fmt(cc.spreadPct, 3)}%` : "")
       : `<span class="muted">측정쌍을 입력하세요.</span>`;
     const m = c.metrics;
+    const infoEl = back.querySelector("#cb-lens-info");
+    if (infoEl) infoEl.innerHTML = lensInfoHtml(c);
+    const lamEl = back.querySelector("#cb-lambda");
+    if (lamEl && document.activeElement !== lamEl) lamEl.value = c.lambdaNm || "";
     const basisName = c.areaBasis === "d4sigma" ? "ISO 11146 회전 D4σ" : "회전 Gaussian 1/e²";
     back.querySelector("#cb-beam-out").innerHTML = m ? [
       `<b>[${basisName}]</b> 지름 (4σ): <b>${fmt(m.d1e2Xum, 4)} × ${fmt(m.d1e2Yum, 4)} µm</b> (θ=${fmt(m.thetaDeg, 3)}°)`,
@@ -39492,7 +39579,7 @@ function openCalibModal() {
       legend: { orientation: "h", y: 1.08, x: 0, bgcolor: "rgba(0,0,0,0)", font: { size: 11 } },
     });
   };
-  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag").forEach((el) => el.addEventListener("change", upd));
+  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda").forEach((el) => el.addEventListener("change", upd));
   fillObjSelect();
   back.querySelector("#cb-obj").addEventListener("change", () => {
     const i = Number(back.querySelector("#cb-obj").value);
@@ -39504,16 +39591,27 @@ function openCalibModal() {
     const maker = back.querySelector("#cb-obj-maker").value.trim();
     const model = back.querySelector("#cb-obj-model").value.trim();
     const mag = Number(back.querySelector("#cb-obj-mag").value);
+    const naRaw = back.querySelector("#cb-obj-na").value;
+    const na = naRaw === "" ? null : Number(naRaw);
+    const medium = back.querySelector("#cb-obj-med").value;
+    const fRaw = back.querySelector("#cb-obj-f").value;
+    const fMm = fRaw === "" ? null : Number(fRaw);
+    if (fMm !== null && !(isFinite(fMm) && fMm > 0)) { toast("초점거리는 0보다 큰 값이어야 합니다"); return; }
     if (!(isFinite(mag) && mag > 0)) { toast("배율을 올바르게 입력하세요"); return; }
+    if (na !== null && !(isFinite(na) && na > 0 && na < 2.0)) { toast("NA는 0보다 크고 2.0 미만이어야 합니다"); return; }
+    if (na !== null && medium === "air" && na >= 1.0) { toast("Air 대물렌즈의 NA는 1.0 미만입니다 — 매질을 확인하세요"); return; }
     c.objectives = c.objectives || [];
-    const entry = { maker, model, mag, _key: lensKey({ maker, model, mag }) };
+    const entry = { maker, model, mag, medium, ...(na !== null ? { na } : {}), ...(fMm !== null ? { f: fMm } : {}),
+      _key: lensKey({ maker, model, mag }) };
     if (c.objectives.some((o) => (o._key || lensKey(o)) === entry._key)) { toast("이미 목록에 있는 렌즈입니다"); return; }
     // 로컬 먼저 반영(오프라인에서도 즉시 사용) → 서버 전송
     entry._pending = !!lensDbUrl();
     c.objectives.push(entry);
     sortObjectives(entry);
     back.querySelector("#cb-mag").value = mag;
-    back.querySelector("#cb-obj-maker").value = ""; back.querySelector("#cb-obj-model").value = ""; back.querySelector("#cb-obj-mag").value = "";
+    back.querySelector("#cb-obj-maker").value = ""; back.querySelector("#cb-obj-model").value = "";
+    back.querySelector("#cb-obj-mag").value = ""; back.querySelector("#cb-obj-na").value = "";
+    back.querySelector("#cb-obj-f").value = "";
     fillObjSelect(); upd();
     if (lensDbUrl()) {
       try { await lensPush(entry); delete entry._pending; saveCalib(); toast("공용 목록에 추가되어 연구실 전체에 공유됩니다"); }
@@ -39525,7 +39623,7 @@ function openCalibModal() {
     if (!(i >= 0 && c.objectives[i])) return;
     const victim = c.objectives[i];
     if (lensDbUrl() && !victim._pending &&
-        !confirm(`"${victim.maker} ${victim.model}"을(를) 연구실 공용 목록에서 삭제합니다.\n모든 PC에서 사라집니다. 계속할까요?`)) return;
+        !confirm(`"${lensLabel(victim)}"을(를) 연구실 공용 목록에서 삭제합니다.\n모든 PC에서 사라집니다. 계속할까요?`)) return;
     const vkey = victim._key || lensKey(victim);
     if (lensDbUrl()) LensSync.tomb.add(vkey);   // 서버 확인 전까지 되살아나지 않도록
     c.objectives.splice(i, 1);
@@ -39582,7 +39680,7 @@ function openCalibModal() {
   back.querySelector("#cb-lens-export").addEventListener("click", () => {
     const payload = { app: "INNO Prism", kind: "objective-lens-list", exportedAt: new Date().toISOString(),
       cameraPitch: c.cameraPitch,
-      lenses: (c.objectives || []).map((o) => ({ maker: o.maker, model: o.model, mag: o.mag })) };
+      lenses: (c.objectives || []).map((o) => lensEntry(o)) };
     downloadText("INNO_Prism_lenses.json", JSON.stringify(payload, null, 1), "application/json");
   });
   back.querySelector("#cb-lens-import").addEventListener("click", () => back.querySelector("#cb-lens-file").click());
@@ -39595,7 +39693,7 @@ function openCalibModal() {
       let added = 0;
       c.objectives = c.objectives || [];
       for (const raw of list) {
-        const o = { maker: String(raw.maker || "").trim(), model: String(raw.model || "").trim(), mag: Number(raw.mag) };
+        const o = lensEntry(raw);
         if (!(isFinite(o.mag) && o.mag > 0)) continue;
         o._key = lensKey(o);
         if (c.objectives.some((x) => (x._key || lensKey(x)) === o._key)) continue;
