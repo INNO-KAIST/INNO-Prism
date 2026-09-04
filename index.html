@@ -255,7 +255,36 @@ a { color: var(--accent); }
 .ledger-badge.ok { border-color: var(--good); color: var(--good); background: rgba(25, 158, 112, 0.1); }
 .ledger-badge.err { border-color: var(--bad); color: var(--bad); background: rgba(200, 60, 60, 0.08); }
 .ledger-badge-warn { color: var(--warn); }
+.ledger-badge-ok2 { color: var(--good); }
 
+
+/* ---- v2.6 뷰어 레이어 칩 --------------------------------------------------
+   기본 화면을 "데이터 + 피팅 곡선 + PA + I_th + 잔차"로 줄이고, 나머지는
+   필요할 때만 켠다. 칩은 켜짐 상태가 한눈에 보여야 하므로 채움으로 구분한다. */
+.chips {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin: 2px 0 8px 0;
+}
+.chip {
+  font-size: 11.5px; line-height: 1; padding: 5px 10px; border-radius: 999px;
+  border: 1px solid var(--border); background: transparent; color: var(--text-secondary);
+  cursor: pointer; white-space: nowrap; transition: background .12s, color .12s, border-color .12s;
+}
+.chip:hover { border-color: #5a5a52; color: var(--text-primary); }
+.chip.on {
+  background: rgba(25, 158, 112, 0.18); border-color: #199e70; color: #7fd9b8;
+}
+.chip-sep { width: 1px; height: 16px; background: var(--border); margin: 0 3px; }
+
+/* ---- v2.6 결과 경고 배너 ---- */
+.warnbar {
+  margin: 0 0 10px 0; padding: 8px 11px; border-radius: 6px;
+  border: 1px solid rgba(230,103,103,0.45); background: rgba(230,103,103,0.10);
+  color: #f0a8a8; font-size: 12px; line-height: 1.5;
+}
+.warnbar.muted-warn {
+  border-color: rgba(201,133,0,0.45); background: rgba(201,133,0,0.10); color: #e0bf7a;
+}
 
 </style>
 </head>
@@ -35994,7 +36023,29 @@ function estimateVarianceModel(x, I, reps) {
   }
   const pts = [];
   for (let i = 0; i < n; i++) if (isFinite(ptVar[i]) && ptVar[i] > 0 && isFinite(I[i])) pts.push([Math.max(I[i], 0), ptVar[i]]);
-  return fitVarianceLaw(pts, I, ptVar, source);
+  const law = fitVarianceLaw(pts, I, ptVar, source);
+  // v2.6: 반복 분산은 자유도가 (nRep−1) 뿐이라 개별 추정이 매우 시끄럽고,
+  // log-분산 최소제곱이 전체 스케일을 크게 빗나갈 수 있다(합성 검증에서 4.5배 관측).
+  // 법칙은 '모양'만 제공하고 전체 스케일은 데이터가 다시 못박게 한다 —
+  // 파일럿 잔차 경로가 이미 쓰는 것과 같은 보정이다.
+  // 보정 기준: median(χ²_ν/ν) (ν = nRep−1). ν≤0 이거나 점이 적으면 보정하지 않는다.
+  if (source === "replicates" && pts.length >= 6) {
+    const nu = Math.max(median(reps.map((r) => Math.max(finite(r || []).length, 1))) - 1, 1);
+    const medChi = 1 - 2 / (9 * nu);                       // Wilson–Hilferty 근사
+    const ratios = [];
+    for (const [Ii, v] of pts) {
+      const lv = law.sigmaOfI(Ii);
+      if (isFinite(lv) && lv > 0) ratios.push(v / (lv * lv));
+    }
+    const c = ratios.length ? clamp((median(ratios) || medChi) / medChi, 0.05, 20) : 1;
+    if (isFinite(c) && Math.abs(Math.log(c)) > 0.05) {
+      law.a0 *= Math.sqrt(c); law.a1 *= c; law.a2 *= Math.sqrt(c);
+      const A0 = law.a0, A1 = law.a1, A2 = law.a2;
+      law.sigmaOfI = (Ii) => Math.sqrt(Math.max(A0 * A0 + A1 * Math.max(Ii, 0) + A2 * A2 * Ii * Ii, 1e-300));
+      law.scaleCal = c;
+    }
+  }
+  return law;
 }
 /** Robust fit of Var(I) = a0² + a1·I + (a2·I)² to (I, var) points. */
 function fitVarianceLaw(pts, I, ptVar, source) {
@@ -36219,19 +36270,26 @@ function fitPSpline(x, y, w, opts) {
    B handled separately: uB with B=softplus(uB) (scaled). Full θ = [uB, ...].
 */
 const H_NPARAMS = { 0: 3, 1: 6, 2: 9 };
+/* v2.6 (E4): 전이 폭 w 의 하한. 0.02 는 실측 점화 전선(0.01 dec 급)보다 3–4배 넓어
+   s_max 를 데이터가 아니라 제약이 결정하게 만들었다. 하한을 낮추는 대신
+   analyze() 에서 "격자보다 좁은 전이" 게이트와 boundHits 경고를 함께 낸다. */
+const W_FLOOR_DEFAULT = 0.005;
+const W_FLOOR = { v: W_FLOOR_DEFAULT };
+const THETA_BOX = 60;
 function unpackH(order, th, scaleB) {
+  const WF = W_FLOOR.v;
   const B = softplus(th[0]) * scaleB;
   if (order === 0) {
     return { B, c: th[1], k1: softplus(th[2]), k2: softplus(th[2]), k3: softplus(th[2]), t1: NaN, t2: NaN, w: NaN, v: NaN };
   }
   if (order === 1) {
     const k1 = softplus(th[2]), k2 = softplus(th[3]);
-    const w = 0.02 + softplus(th[5]);
+    const w = WF + softplus(th[5]);
     return { B, c: th[1], k1, k2, k3: k2, t1: th[4], t2: NaN, w, v: NaN };
   }
   const k1 = softplus(th[2]), k2 = softplus(th[3]), k3 = softplus(th[4]);
-  const w = 0.02 + softplus(th[7]), v = 0.02 + softplus(th[8]);
-  const t1 = th[5], t2 = th[5] + 0.02 + softplus(th[6]);
+  const w = WF + softplus(th[7]), v = WF + softplus(th[8]);
+  const t1 = th[5], t2 = th[5] + WF + softplus(th[6]);
   return { B, c: th[1], k1, k2, k3, t1, t2, w, v };
 }
 function hOf(p, x, order) {
@@ -36275,7 +36333,7 @@ function fitHinge(order, x, I, sigG, lamG, scaleB, starts, huberC, mask) {
     return r;
   };
   const np = H_NPARAMS[order];
-  const lo = new Array(np).fill(-60), hi = new Array(np).fill(60);
+  const lo = new Array(np).fill(-THETA_BOX), hi = new Array(np).fill(THETA_BOX);
   const xlo = Math.min(...x), xhi = Math.max(...x);
   if (order >= 1) { lo[4] = xlo - 1.5; hi[4] = xhi + 1.5; }
   if (order === 2) { lo[5] = xlo - 1.5; hi[5] = xhi + 1.5; }
@@ -36322,7 +36380,7 @@ function fitHinge(order, x, I, sigG, lamG, scaleB, starts, huberC, mask) {
 }
 
 /** deterministic starts derived from the spline slope curve */
-function hingeStarts(order, x, I, spline, lamG, scaleB) {
+function hingeStarts(order, x, I, spline, lamG, scaleB, darkPrior) {
   const xlo = Math.min(...x), xhi = Math.max(...x);
   const span = Math.max(xhi - xlo, 0.3);
   const grid = [];
@@ -36336,16 +36394,20 @@ function hingeStarts(order, x, I, spline, lamG, scaleB) {
   // c: choose so that h(x_mid) matches data mid
   const uB0 = invSoftplus(Math.max(Imin / scaleB, 1e-9));
   const uBsmall = invSoftplus(Math.max(0.05 * Imin / scaleB, 1e-12));
+  // v2.6 (E6): 암계수 D 를 알면 배경 B 의 시작값으로 쓴다. B 를 0 근처에서 출발시키면
+  // 평탄한 암계수 바닥을 "기울기 0인 멱법칙"(k1→0)으로 표현하게 되어 B↔k1 축퇴가 생긴다.
+  const uBdark = isFinite(darkPrior) && darkPrior > 0 ? invSoftplus(Math.max(darkPrior / scaleB, 1e-9)) : null;
+  const uBs = uBdark === null ? [uB0, uBsmall] : [uBdark, uB0, uBsmall];
   const mkC = (k1) => yLow - k1 * xlo;
   const S = [];
   if (order === 0) {
     for (const k1 of [Math.max(sMax, 0.2), Math.max(sLo, 0.2), 1, 2]) {
-      for (const uB of [uB0, uBsmall]) S.push([uB, mkC(k1), invSoftplus(k1)]);
+      for (const uB of uBs) S.push([uB, mkC(k1), invSoftplus(k1)]);
     }
   } else if (order === 1) {
     for (const [k1, k2] of [[Math.max(sLo, 0.05), Math.max(sMax, sLo + 0.3)], [Math.max(sMax, 0.3), Math.max(sHi, 0.02)], [1, 3], [2, 0.3]]) {
       for (const t1 of [xMax, xlo + span * 0.35, xlo + span * 0.65]) {
-        for (const uB of [uB0, uBsmall]) {
+        for (const uB of uBs) {
           S.push([uB, mkC(k1), invSoftplus(k1), invSoftplus(k2), t1, invSoftplus(0.13)]);
         }
       }
@@ -36355,8 +36417,8 @@ function hingeStarts(order, x, I, spline, lamG, scaleB) {
     const k3c = Math.max(Math.min(sHi, sMax * 0.5), 0.02);
     for (const k2 of [Math.max(sMax, 1), Math.max(sMax * 1.4, 2)]) {
       for (const [t1, t2] of [[xMax - 0.35 * span * 0.5, xMax + 0.35 * span * 0.5], [xMax - 0.15, xMax + 0.2], [xlo + 0.3 * span, xlo + 0.7 * span]]) {
-        for (const uB of [uB0, uBsmall]) {
-          S.push([uB, mkC(k1c), invSoftplus(k1c), invSoftplus(k2), invSoftplus(k3c), t1, invSoftplus(Math.max(t2 - t1 - 0.02, 0.05)), invSoftplus(0.11), invSoftplus(0.11)]);
+        for (const uB of uBs) {
+          S.push([uB, mkC(k1c), invSoftplus(k1c), invSoftplus(k2), invSoftplus(k3c), t1, invSoftplus(Math.max(t2 - t1 - W_FLOOR.v, 0.05)), invSoftplus(0.11), invSoftplus(0.11)]);
         }
       }
     }
@@ -36394,6 +36456,9 @@ function normCdf(z) {
  */
 function analyze(branch, opts) {
   const o = Object.assign({ monotone: true, huberC: 1.345, lambdaFactor: 1, aiccGuard: 4, maxOrder: 2, nGrid: 240, fast: false }, opts);
+  // dwell time / 계수형 검출기 여부는 branch 에 실려 오면 그대로 상속 (opts 가 우선)
+  if (!isFinite(o.acqTime) && branch && isFinite(branch.acqTime)) o.acqTime = branch.acqTime;
+  if (o.counting === undefined && branch) o.counting = !!branch.counting;
   // ---- curation: finite, P>0; keep I of any sign; sort by x ----
   const P0 = branch.powerAvg, I0 = branch.intensityAvg;
   const reps0 = branch.intensityReplicates || null;
@@ -36408,13 +36473,57 @@ function analyze(branch, opts) {
   const n = x.length;
 
   // ---- noise model & glog scale ----
+  // v2.6 (E2): 노이즈는 2성분이다.
+  //   σ²(I) = [a0² + a1·I]   계수 통계 — 원시 반복에서 측정, Poisson 바닥 a1 ≥ 1/τ,
+  //                            반복 평균으로 1/nRep 만큼 줄어든다
+  //         + (a2·I)²        setpoint 간 초과(드리프트/점멸) — 파일럿 잔차에서 측정,
+  //                            반복을 늘려도 줄지 않는다
+  // 어느 한쪽만 쓰면 반드시 틀린다: 반복만 쓰면 밝은 구간 가중이 5배 과대(χ²/dof 폭주),
+  // 파일럿만 쓰면 암계수 구간 상대오차가 과소평가되어 정보량 0인 점들이 피팅을 지배한다.
   const vm = estimateVarianceModel(x, I, reps);
   const nRepsArr = reps ? reps.map((r) => Math.max(finite(r || []).length, 1)) : new Array(n).fill(1);
-  const sigI = I.map((Ii, i) => vm.sigmaOfI(Ii) / Math.sqrt(nRepsArr[i]));
-  const lamGBox = { v: Math.max(3 * vm.a0, 1e-12 * Math.max(Math.abs(quantile(I, 0.9)), 1)) };
-  const y = I.map((Ii) => glog10(Ii, lamGBox.v));
-  const sigG = I.map((Ii, i) => Math.max(sigI[i] * dglog10(Ii, lamGBox.v), 1e-5));
-  const wgt = sigG.map((s) => 1 / (s * s));
+  // max-of-N 집계가 실제로 일어난 점의 극값 보정 계수 (정규 근사; 부트스트랩은 극값에 비일관)
+  const EV_C = { 1: 1, 2: 0.8256, 3: 0.7480, 4: 0.7011, 5: 0.6690, 6: 0.6457, 7: 0.6278, 8: 0.6136, 9: 0.6019, 10: 0.5922 };
+  const evFactor = (N) => (N <= 1 ? 1 : (EV_C[N] !== undefined ? EV_C[N] : Math.max(1 / Math.sqrt(2 * Math.log(N)), 0.35)));
+  const aggN0 = branch.aggApplied || null;
+  const aggArr = aggN0 ? idx.map((i) => Math.max(Number(aggN0[i]) || 1, 1)) : new Array(n).fill(1);
+  const cAgg = aggArr.map(evFactor);
+  // 계수 통계 성분 (원시 반복이 있을 때만 분리 가능)
+  const cnt = vm.source === "replicates" ? { a0: vm.a0, a1: vm.a1, a2: vm.a2 } : null;
+  if (cnt && o.counting && isFinite(o.acqTime) && o.acqTime > 0) {
+    cnt.a1 = Math.max(cnt.a1, 1 / o.acqTime);   // 광자 계수의 Poisson 바닥은 물리 하한
+    vm.a1 = cnt.a1;
+  }
+  const noiseBox = { a0: vm.a0, a1: vm.a1, a2: vm.a2, cnt, source: vm.source, excess: NaN };
+  const sigI = new Array(n), y = new Array(n), sigG = new Array(n), wgt = new Array(n);
+  const lamGBox = { v: 0 };
+  // 총 1회 관측 표준편차 (보고/부트스트랩용) — 성분 분리와 무관한 단일 법칙
+  const sigmaTotOf = (Ii) => {
+    const N = noiseBox;
+    return Math.sqrt(Math.max(N.a0 * N.a0 + N.a1 * Math.max(Ii, 0) + N.a2 * N.a2 * Ii * Ii, 1e-300));
+  };
+  // 실제 가중치에 쓰는 점별 표준오차: 계수 성분만 √nRep 로 줄이고, 비례 성분은 그대로 둔다.
+  const sigPointOf = (Ii, i) => {
+    const N = noiseBox;
+    if (!N.cnt) return Math.sqrt(Math.max(sigmaTotOf(Ii) * sigmaTotOf(Ii) / Math.max(nRepsArr[i], 1), 1e-300));
+    // setpoint 내부 성분(계수 통계 + 반복이 실제로 본 비례 산포)은 반복 평균으로 1/nRep 줄어들고,
+    // setpoint 간 초과 성분만 그대로 남는다. a2_cnt 를 비축소항에 넣으면 σ 가 과대평가되어
+    // χ²/dof 가 1 아래로 내려가고 AICc 절약 가드가 옳은 차수까지 눌러버린다.
+    const c0 = N.cnt.a0, c1 = N.cnt.a1, c2 = N.cnt.a2;
+    const vIn = (c0 * c0 + c1 * Math.max(Ii, 0) + c2 * c2 * Ii * Ii) * cAgg[i] * cAgg[i] / Math.max(nRepsArr[i], 1);
+    const vEx = isFinite(N.excess) ? N.excess * N.excess * Ii * Ii : 0;
+    return Math.sqrt(Math.max(vIn + vEx, 1e-300));
+  };
+  const applyNoise = () => {
+    lamGBox.v = Math.max(3 * noiseBox.a0, 1e-12 * Math.max(Math.abs(quantile(I, 0.9)), 1));
+    for (let i = 0; i < n; i++) {
+      sigI[i] = sigPointOf(I[i], i);
+      y[i] = glog10(I[i], lamGBox.v);
+      sigG[i] = Math.max(sigI[i] * dglog10(I[i], lamGBox.v), 1e-5);
+      wgt[i] = 1 / (sigG[i] * sigG[i]);
+    }
+  };
+  applyNoise();
 
   // ---- Layer A: P-spline in glog space (pilot; refit after outlier flags) ----
   let spline = fitPSpline(x, y, wgt, { monotone: o.monotone, lambdaFactor: o.lambdaFactor, fast: o.fast });
@@ -36426,7 +36535,9 @@ function analyze(branch, opts) {
   //  (3) 3-component law fit → noise SHAPE over I,
   //  (4) global scale calibration so median |studentized residual| = 0.6745
   //      (the law provides the shape; the data pins the scale).
-  if (vm.source === "difference-based") {
+  {
+    // v2.6: 반복 유무와 무관하게 항상 실행한다. 반복이 있으면 이 블록의 결과에서
+    // 계수 성분을 뺀 나머지가 setpoint 간 초과 성분이 된다.
     // λ0 for the pilot must sit on the ADDITIVE-NOISE scale. Negative
     // intensities (baseline-subtracted CCD data) are pure noise → their
     // robust scale estimates σ_add directly; else use the spread of the
@@ -36472,45 +36583,129 @@ function analyze(branch, opts) {
       });
       const c = clamp((median(studs) || 0.6745) / 0.6745, 0.2, 20);
       const a0n = vm2.a0 * c, a1n = vm2.a1 * c * c, a2n = vm2.a2 * c;
-      const sigmaOfI2 = (Ii) => Math.sqrt(Math.max(a0n * a0n + a1n * Math.max(Ii, 0) + a2n * a2n * Ii * Ii, 1e-300));
-      // sanity: refined sigma must be positive and finite over the data range
-      const ok = isFinite(sigmaOfI2(quantile(I, 0.1))) && sigmaOfI2(quantile(I, 0.9)) > 0;
-      if (ok) {
-        vm.a0 = a0n; vm.a1 = a1n; vm.a2 = a2n; vm.sigmaOfI = sigmaOfI2; vm.source = "pilot-residual(calibrated)";
-        const lamG2 = Math.max(3 * vm.a0, 1e-12 * Math.max(Math.abs(quantile(I, 0.9)), 1));
-        for (let i = 0; i < n; i++) {
-          sigI[i] = vm.sigmaOfI(I[i]) / Math.sqrt(nRepsArr[i]);
-          y[i] = glog10(I[i], lamG2);
-          sigG[i] = Math.max(sigI[i] * dglog10(I[i], lamG2), 1e-5);
-          wgt[i] = 1 / (sigG[i] * sigG[i]);
+      const varPilotOf = (Ii) => Math.max(a0n * a0n + a1n * Math.max(Ii, 0) + a2n * a2n * Ii * Ii, 1e-300);
+      const ok = isFinite(varPilotOf(quantile(I, 0.1))) && varPilotOf(quantile(I, 0.9)) > 0;
+      if (ok && !cnt) {
+        // 반복 없음 — 구 동작 그대로: 파일럿 법칙이 곧 총 노이즈 법칙
+        noiseBox.a0 = a0n; noiseBox.a1 = a1n; noiseBox.a2 = a2n;
+        noiseBox.source = "pilot-residual(calibrated)";
+        applyNoise();
+        spline = fitPSpline(x, y, wgt, { monotone: o.monotone, lambdaFactor: o.lambdaFactor, fast: o.fast });
+      } else if (ok && cnt) {
+        // 반복 있음 — 파일럿 잔차는 '보고된 I(반복 평균)'의 총 산포이므로
+        //   var_excess(I) = var_pilot(I) − σ_cnt²(I)·c_agg²/nRep
+        // 이 setpoint 간 초과 성분이다. 다만 두 가지를 반드시 막아야 한다:
+        //  (1) 총 이상치가 잔차를 부풀려 노이즈 모델에 흡수되는 것 → 상위 10% 잔차 절사,
+        //  (2) 추정 잡음 수준의 미미한 초과를 실재로 오인하는 것 → 증거 게이트(ρ ≥ 3).
+        // 게이트를 통과하지 못하면 초과항은 0 이고 순수 반복 법칙을 쓴다(구 동작과 동일).
+        const nRepTyp = Math.max(median(nRepsArr) || 1, 1);
+        const cTyp = median(cAgg) || 1;
+        const cut = quantile(recs.map((r) => Math.abs(r[2])), 0.90);
+        const clean = recs.filter((r) => Math.abs(r[2]) <= cut);
+        const nB = clamp(Math.floor(clean.length / 12), 4, 8);
+        const ratios = [], exRel = [];
+        for (let b3 = 0; b3 < nB; b3++) {
+          const seg = clean.slice(Math.floor(b3 * clean.length / nB), Math.floor((b3 + 1) * clean.length / nB));
+          if (seg.length < 4) continue;
+          const Ic = median(seg.map((r) => r[0]));
+          const sg = 1.4826 * median(seg.map((r) => Math.abs(r[1])));
+          if (!(isFinite(Ic) && Ic > 0 && isFinite(sg) && sg > 0)) continue;
+          const vP = sg * sg;
+          const vC = (cnt.a0 * cnt.a0 + cnt.a1 * Math.max(Ic, 0) + cnt.a2 * cnt.a2 * Ic * Ic) * cTyp * cTyp / nRepTyp;
+          ratios.push(vP / Math.max(vC, 1e-300));
+          exRel.push(Math.max(vP - vC, 0) / (Ic * Ic));
         }
-        lamGBox.v = lamG2;
+        // 초과항은 I 에 비례하므로 낮은 I 구간에서는 원리적으로 보이지 않는다.
+        // 따라서 증거는 상위 I 구간(bin 의 위쪽 절반)에서만 판정한다 — 전 구간 중앙값을
+        // 쓰면 암계수 구간이 증거를 희석해 실재하는 초과를 놓친다.
+        const half = Math.floor(ratios.length / 2);
+        const rHi = ratios.slice(half), eHi = exRel.slice(half);
+        const rhoMed = rHi.length ? median(rHi) : 0;
+        if (o.debugNoise) console.log("  [noise] nB=%d rho=%s exRel=%s rhoHi=%s", nB, ratios.map((v) => v.toFixed(2)).join(","), exRel.map((v) => Math.sqrt(v).toFixed(4)).join(","), rhoMed.toFixed(2));
+        // 상한 게이트: setpoint 간 드리프트가 25% 를 넘는다는 것은 물리적으로 비현실적이며,
+        // 그 정도 잔차는 노이즈가 아니라 (a) 총 이상치이거나 (b) 모델이 곡선을 못 따라가는 것이다.
+        // 그것을 σ 에 흡수시키면 이상치 처리와 차수 선택이 무력화된다 — 노이즈를 신호로 읽는 것의
+        // 정확한 반대 실수다. 그런 경우 초과항을 버리고 순수 반복 법칙으로 되돌아간다.
+        const EXCESS_MAX = 0.25;
+        const exRaw = (ratios.length >= 4 && rHi.length >= 2 && rhoMed >= 3) ? Math.sqrt(Math.max(median(eHi), 0)) : 0;
+        const a2Excess = exRaw > EXCESS_MAX ? 0 : exRaw;
+        if (exRaw > EXCESS_MAX) noiseBox.excessRejected = exRaw;
+        noiseBox.excess = a2Excess;
+        noiseBox.rho = rhoMed;
+        noiseBox.a0 = cnt.a0; noiseBox.a1 = cnt.a1;
+        noiseBox.a2 = Math.sqrt(cnt.a2 * cnt.a2 + a2Excess * a2Excess);
+        noiseBox.source = a2Excess > 0 ? "replicates+interset" : "replicates";
+        applyNoise();
         spline = fitPSpline(x, y, wgt, { monotone: o.monotone, lambdaFactor: o.lambdaFactor, fast: o.fast });
       }
     }
   }
+  vm.a0 = noiseBox.a0; vm.a1 = noiseBox.a1; vm.a2 = noiseBox.a2; vm.source = noiseBox.source;
   const lamGFinal = lamGBox.v;
   const xlo = x[0], xhi = x[n - 1];
+  // v2.6 (E4): 전이 폭 하한. 격자 간격보다 훨씬 좁은 w 는 물리적 의미가 없으므로
+  // 하한 자체는 낮추되(0.005) 격자 대비 게이트를 별도로 둔다.
+  const dxs = [];
+  for (let i = 1; i < n; i++) if (x[i] - x[i - 1] > 0) dxs.push(x[i] - x[i - 1]);
+  const medianDx = dxs.length ? median(dxs) : 0.01;
+  W_FLOOR.v = isFinite(o.wFloor) && o.wFloor > 0 ? o.wFloor : W_FLOOR_DEFAULT;
+  // v2.6 (E5): 점화 전선을 모델과 무관하게 데이터에서 직접 식별한다.
+  // 인접점 국소 기울기 (Δlog10 I / Δlog10 P) 의 최대값을 찾고, 그 절반을 넘는
+  // 연속 구간 ±2점을 "전이 전선"으로 본다. 파일럿 t1 에 의존하면 파일럿이
+  // 전이를 엉뚱한 곳에 놓았을 때 보호가 통째로 빗나간다.
+  const frontMask = new Array(n).fill(false);
+  {
+    const step = new Array(Math.max(n - 1, 0)).fill(-Infinity);
+    for (let i = 0; i + 1 < n; i++) {
+      const h = x[i + 1] - x[i];
+      if (h > 0 && I[i] > 0 && I[i + 1] > 0) step[i] = (Math.log10(I[i + 1]) - Math.log10(I[i])) / h;
+    }
+    let sBest = -Infinity, iBest = -1;
+    for (let i = 0; i < step.length; i++) if (step[i] > sBest) { sBest = step[i]; iBest = i; }
+    if (iBest >= 0 && sBest > 1) {
+      const thr = 0.5 * sBest;
+      let lo2 = iBest, hi2 = iBest;
+      while (lo2 - 1 >= 0 && step[lo2 - 1] > thr) lo2--;
+      while (hi2 + 1 < step.length && step[hi2 + 1] > thr) hi2++;
+      // 전이 구간은 급상승 구간 자체보다 넓다 — 양쪽으로 0.04 decade(최소 2점, 최대 n의 10%)를 덧댄다
+      const pad = clamp(Math.ceil(0.04 / Math.max(medianDx, 1e-6)), 2, Math.max(2, Math.floor(0.1 * n)));
+      for (let i = Math.max(lo2 - pad, 0); i <= Math.min(hi2 + 1 + pad, n - 1); i++) frontMask[i] = true;
+    }
+  }
   const grid = [];
   for (let i = 0; i < o.nGrid; i++) grid.push(xlo + (xhi - xlo) * i / (o.nGrid - 1));
 
   // ---- Layer B: nested hinge fits with global outlier handling ----
   const scaleB = Math.max(Math.abs(quantile(I, 0.2)), lamGFinal, 1e-9);
+  // v2.6 (E6): 암계수 사전값 — paTrace 가 있으면 거기서, 없으면 하위 10% 분위수
+  let darkPrior = NaN;
+  if (o.paTrace && o.paTrace.P && o.paTrace.P.length >= 5) {
+    try { darkPrior = paDarkOf(o.paTrace.P, o.paTrace.I, o.paTrace.W).D; } catch (e) { darkPrior = NaN; }
+  }
+  if (!(isFinite(darkPrior) && darkPrior > 0)) darkPrior = Math.max(quantile(I, 0.10), 0) || NaN;
   // pilot: most flexible order with redescending IRLS → global outlier flags.
   // (Only the flexible model may flag points: a rigid model must never be
   //  allowed to call real structure an "outlier".)
-  let pilotStarts = hingeStarts(o.maxOrder, x, I, spline, lamGFinal, scaleB);
+  let pilotStarts = hingeStarts(o.maxOrder, x, I, spline, lamGFinal, scaleB, darkPrior);
   if (o.fast) pilotStarts = pilotStarts.slice(0, 4);
   if (o.warmTheta && o.warmOrder === o.maxOrder) pilotStarts.unshift(o.warmTheta.slice());
   const pilot = fitHinge(o.maxOrder, x, I, sigG, lamGFinal, scaleB, pilotStarts, o.huberC, null);
   let mask = new Array(n).fill(true);
-  let outlierIdx = [];
+  let outlierIdx = [], frontScatter = [];
   if (pilot) {
+    // v2.6 (E5): 점화 전선 근방(t1 ± 3·max(w, 2Δx))의 점은 이상치가 아니라 측정 대상이다.
+    // 쌍안정 점멸로 산포가 크게 나오지만 제거하면 전이 자체를 버리게 된다.
+    const t1P = pilot.params ? pilot.params.t1 : NaN, wP = pilot.params ? pilot.params.w : NaN;
+    const halo = 3 * Math.max(isFinite(wP) ? wP : 0, 2 * medianDx);
+    // 데이터가 지목한 전선 ∪ 파일럿 t1 근방 — 둘 중 하나라도 걸리면 보호한다
+    const inFront = (i) => frontMask[i] || (isFinite(t1P) && Math.abs(x[i] - t1P) <= halo);
     const flagged = [];
     for (let i = 0; i < n; i++) if (pilot.irlsW[i] < 0.1) flagged.push([i, Math.abs(pilot.rawResid[i])]);
     flagged.sort((a, b) => b[1] - a[1]);
-    outlierIdx = flagged.slice(0, Math.max(1, Math.floor(0.1 * n))).map((f) => f[0]); // cap at 10%
-    if (flagged.length <= Math.floor(0.1 * n)) outlierIdx = flagged.map((f) => f[0]);
+    frontScatter = flagged.filter(([i]) => inFront(i)).map((f) => f[0]).sort((a, b) => a - b);
+    const cand = flagged.filter(([i]) => !inFront(i));
+    const cap = Math.max(1, Math.floor(0.1 * n));
+    outlierIdx = (cand.length <= Math.floor(0.1 * n) ? cand : cand.slice(0, cap)).map((f) => f[0]);
     for (const i of outlierIdx) mask[i] = false;
   }
   // refit spline without outliers (their weight → 0)
@@ -36521,7 +36716,7 @@ function analyze(branch, opts) {
   }
   const fits = {};
   for (let order = 0; order <= o.maxOrder; order++) {
-    let starts = hingeStarts(order, x, I, splineC, lamGFinal, scaleB);
+    let starts = hingeStarts(order, x, I, splineC, lamGFinal, scaleB, darkPrior);
     if (o.fast) starts = starts.slice(0, 4);
     if (pilot && order === o.maxOrder) starts.unshift(pilot.theta.slice());
     if (o.warmTheta && o.warmOrder === order) starts.unshift(o.warmTheta.slice());
@@ -36578,6 +36773,39 @@ function analyze(branch, opts) {
   const sMaxAtLeftEdge = hasRise && xAtMax <= xlo + edgeTol;
   const sMaxAtRightEdge = hasRise && xAtMax >= xhi - edgeTol;
   const thresholdOutOfRange = isFinite(thresholdP) && (Math.log10(thresholdP) < xlo || Math.log10(thresholdP) > xhi);
+
+  // ---- v2.6 (E4): 제약 경계 접촉 감지 ----
+  // 최적화 박스나 하한에 붙어서 나온 값은 데이터의 정보가 아니라 제약의 산물이다.
+  const boundHits = [];
+  const BTOL = 1e-3;
+  if (chosen >= 1 && isFinite(p.w) && p.w - W_FLOOR.v < BTOL)
+    boundHits.push({ param: "w", at: "floor", value: p.w, bound: W_FLOOR.v });
+  if (chosen === 2 && isFinite(p.v) && p.v - W_FLOOR.v < BTOL)
+    boundHits.push({ param: "v", at: "floor", value: p.v, bound: W_FLOOR.v });
+  if (chosen === 2 && isFinite(p.t2) && isFinite(p.t1) && (p.t2 - p.t1) - W_FLOOR.v < BTOL)
+    boundHits.push({ param: "t2-t1", at: "floor", value: p.t2 - p.t1, bound: W_FLOOR.v });
+  {
+    const names = chosen === 0 ? { 0: "B", 1: "c", 2: "k1" }
+      : chosen === 1 ? { 0: "B", 1: "c", 2: "k1", 3: "k2", 4: "t1", 5: "w" }
+      : { 0: "B", 1: "c", 2: "k1", 3: "k2", 4: "k3", 5: "t1", 6: "t2-t1", 7: "w", 8: "v" };
+    const already = new Set(boundHits.map((b) => b.param));
+    fit.theta.forEach((t, j) => {
+      const nm = names[j] || ("theta[" + j + "]");
+      // softplus 하한에 붙은 파라미터는 θ = −BOX 로도 나타난다 — 같은 사실을 두 번 세지 않는다
+      if (t < 0 && already.has(nm)) return;
+      // 하한 쪽 접촉(θ = −BOX)은 병리가 아니다: B→0(배경 없음), k→0(기울기 0) 은
+      // 모두 물리적으로 정상인 해다. 파라미터가 발산해 상한에 붙는 경우만 보고한다.
+      if (!(t > 0 && Math.abs(t - THETA_BOX) < 0.05)) return;
+      // 기울기 파라미터가 상한에 붙어도, 보고값 s_max 가 상한 근처가 아니면
+      // 그 상한은 보고값에 영향을 주지 않는다(전이가 t2 에서 잘려 실효 기울기가 작은 경우).
+      // "어떤 파라미터가 경계에 있는가"가 아니라 "경계가 보고값을 결정했는가"로 판정한다.
+      if (/^k[123]$/.test(nm) && !(sMax > 0.5 * THETA_BOX)) return;
+      boundHits.push({ param: nm, at: "box", value: t, bound: THETA_BOX });
+    });
+  }
+  // 격자보다 좁은 전이: 어떤 매끄러운 모델도 s_max 에 유한한 값을 줄 수 없다
+  const wSubGrid = chosen >= 1 && isFinite(p.w) && p.w < 0.5 * medianDx;
+  if (wSubGrid) boundHits.push({ param: "w", at: "sub-grid", value: p.w, bound: 0.5 * medianDx });
 
   // ---- diagnostics ----
   const maskedResid = fit.rawResid.filter((_, i) => mask[i]);
@@ -36661,20 +36889,26 @@ function analyze(branch, opts) {
   return {
     engine: "PrismFit", version: VERSION, options: o,
     data: { P, I, x, sigI, sigG, y, nReps: nRepsArr },
-    noise: { a0: vm.a0, a1: vm.a1, a2: vm.a2, source: vm.source, lamG: lamGFinal },
+    noise: { a0: vm.a0, a1: vm.a1, a2: vm.a2, source: vm.source, lamG: lamGFinal,
+      counting: noiseBox.cnt ? { a0: noiseBox.cnt.a0, a1: noiseBox.cnt.a1, a2: noiseBox.cnt.a2 } : null,
+      a2Excess: noiseBox.excess, excessRho: noiseBox.rho !== undefined ? noiseBox.rho : null, excessRejected: noiseBox.excessRejected !== undefined ? noiseBox.excessRejected : null, acqTime: isFinite(o.acqTime) ? o.acqTime : null,
+      poissonFloor: (o.counting && isFinite(o.acqTime) && o.acqTime > 0) ? 1 / o.acqTime : null },
     spline: { lambda: splineC.lambda, edf: splineC.edf, monotone: !!o.monotone },
     grid, sTot, sSig, modelCurve, splineCurve,
     fitsSummary: Object.fromEntries(Object.entries(fits).map(([k2, f]) => [k2, f ? { aicc: f.aicc, chi2: f.chi2, k: f.k } : null])),
     chosenOrder: chosen, params: p, theta: fit.theta, paramSE,
     paReport, paSource: jumpWins ? "jump" : "resolved", paGridLimited,
-    paJump, paDark,
+    paJump, paDark, darkPrior,
     paThreshold: jumpWins ? paJump.pth : (isFinite(thresholdP) ? thresholdP : sMaxAtP),
     sMax, sMaxAtP, sTotMax, sTotMaxAtP: Math.pow(10, xTotMax),
-    sMaxIsLowerBound: sMaxAtLeftEdge || sMaxAtRightEdge,
+    sMaxIsLowerBound: sMaxAtLeftEdge || sMaxAtRightEdge || boundHits.length > 0,
     sMaxEdge: sMaxAtLeftEdge ? "left" : (sMaxAtRightEdge ? "right" : null),
+    sMaxBoundReason: boundHits.length ? "constraint" : ((sMaxAtLeftEdge || sMaxAtRightEdge) ? "range-edge" : null),
+    boundHits, wFloor: W_FLOOR.v, medianDlogP: medianDx,
+    aggEffective: branch.aggEffective || "none", aggApplied: aggArr.slice(),
     thresholdOutOfRange,
     thresholdP, saturationP, background: p.B, slopeVaries,
-    diagnostics: { runsP: rt.p, runsZ: rt.z, chi2red, maxParamCorr: maxCorr, nUsed: nMask, nTotal: n, outliers: outlierIdx.slice(), huberDownweighted: fit.irlsW.filter((w, i) => mask[i] && w < 0.999).length },
+    diagnostics: { runsP: rt.p, runsZ: rt.z, chi2red, maxParamCorr: maxCorr, nUsed: nMask, nTotal: n, outliers: outlierIdx.slice(), frontScatter: frontScatter.slice(), huberDownweighted: fit.irlsW.filter((w, i) => mask[i] && w < 0.999).length },
     mask,
     agreement: agree,
     rawResid: fit.rawResid,
@@ -36819,6 +37053,9 @@ function evaluate(analysis, boot) {
   } else if (isFinite(d.maxParamCorr)) {
     ident = 100 * clamp(1 - Math.max(d.maxParamCorr - 0.95, 0) / 0.05, 0, 1) * 0.8;
   }
+  // v2.6 (E4): 제약 경계에 붙은 파라미터가 있으면 s_max 는 점추정이 아니다.
+  const nBound = (analysis.boundHits || []).length;
+  if (nBound > 0) ident = Math.min(ident, 100 * clamp(0.30 - 0.10 * (nBound - 1), 0, 1));
   // coverage
   const x = analysis.data.x;
   const decades = x[x.length - 1] - x[0];
@@ -36838,9 +37075,10 @@ function evaluate(analysis, boot) {
   const score = 0.40 * adequacy + 0.25 * ident + 0.20 * coverage + 0.15 * agreement;
   const band = score >= 85 ? "High" : score >= 65 ? "Moderate" : score >= 45 ? "Low" : "Poor";
   return {
-    score, band, reportable: score >= 60,
+    score, band, reportable: score >= 60 && nBound === 0,
     components: { adequacy, identifiability: ident, coverage, agreement },
-    detail: { runsP: pRuns, chi2red: c2, decades, ptsPerDec, pointsNearThreshold: nearTh, sMaxGapPct: g },
+    boundHits: analysis.boundHits || [],
+    detail: { runsP: pRuns, chi2red: c2, decades, ptsPerDec, pointsNearThreshold: nearTh, sMaxGapPct: g, nBoundHits: nBound },
   };
 }
 
@@ -36905,31 +37143,36 @@ function paHighState(P, I, W) {
   for (let i = 0; i < P.length; i++) {
     if (!isFinite(P[i]) || !isFinite(I[i]) || !isFinite(W[i])) continue;
     const k = W[i];
-    if (!groups.has(k)) groups.set(k, { Ps: [], Imax: -Infinity });
+    if (!groups.has(k)) groups.set(k, { Ps: [], Imax: -Infinity, arg: -1, n: 0 });
     const g = groups.get(k);
     g.Ps.push(P[i]);
-    if (I[i] > g.Imax) g.Imax = I[i];
+    g.n++;
+    if (I[i] > g.Imax) { g.Imax = I[i]; g.arg = i; }   // v2.6: 승자 원본 인덱스 추적
   }
   const rows = [];
-  for (const g of groups.values()) rows.push([median(g.Ps), g.Imax]);
+  for (const g of groups.values()) rows.push([median(g.Ps), g.Imax, g.arg, g.n]);
   rows.sort((a, b) => a[0] - b[0]);
-  return { Ps: rows.map((r) => r[0]), Ih: rows.map((r) => r[1]) };
+  return { Ps: rows.map((r) => r[0]), Ih: rows.map((r) => r[1]),
+           src: rows.map((r) => r[2]), nAgg: rows.map((r) => r[3]) };
 }
 /** Merge consecutive setpoints whose log-power gap < frac × median gap. */
-function paMergeClose(x, I, frac) {
-  if (!x.length) return { x: [], I: [] };
+function paMergeClose(x, I, frac, src, nAgg) {
+  if (!x.length) return { x: [], I: [], src: [], nAgg: [] };
   const dx = [];
   for (let i = 1; i < x.length; i++) if (x[i] - x[i - 1] > 0) dx.push(x[i] - x[i - 1]);
   const md = dx.length ? median(dx) : 1.0;
   const thr = frac * md;
-  const xs = [x[0]], Is = [I[0]];
+  const at = (a, i, d) => (a && a[i] !== undefined ? a[i] : d);
+  const xs = [x[0]], Is = [I[0]], ss = [at(src, 0, -1)], ns = [at(nAgg, 0, 1)];
   for (let i = 1; i < x.length; i++) {
-    if (x[i] - xs[xs.length - 1] < thr) {
-      Is[Is.length - 1] = Math.max(Is[Is.length - 1], I[i]);
-      xs[xs.length - 1] = 0.5 * (xs[xs.length - 1] + x[i]);
-    } else { xs.push(x[i]); Is.push(I[i]); }
+    const last = xs.length - 1;
+    if (x[i] - xs[last] < thr) {
+      ns[last] += at(nAgg, i, 1);
+      if (I[i] > Is[last]) { Is[last] = I[i]; ss[last] = at(src, i, -1); }  // 승자 갱신 시 출처도 갱신
+      xs[last] = 0.5 * (xs[last] + x[i]);
+    } else { xs.push(x[i]); Is.push(I[i]); ss.push(at(src, i, -1)); ns.push(at(nAgg, i, 1)); }
   }
-  return { x: xs, I: Is };
+  return { x: xs, I: Is, src: ss, nAgg: ns };
 }
 function paDarkAndGate(Ih) {
   const ns = Math.max(3, Math.floor(PA_CONST.DARK_FRAC * Ih.length));
@@ -37003,7 +37246,7 @@ function paDarkOf(P, I, W) {
  * to power max, down = suffix), take the high-state envelope. Returns a
  * branch object consumable by analyze() (no replicates: envelope points).
  */
-function paHighStateBranch(P, I, W, pass) {
+function paHighStateBranch(P, I, W, pass, opts) {
   const idxs = [];
   for (let i = 0; i < P.length; i++) if (isFinite(P[i]) && isFinite(I[i]) && isFinite(W[i])) idxs.push(i);
   if (!idxs.length) throw new Error("no finite points for high-state branch");
@@ -37013,14 +37256,24 @@ function paHighStateBranch(P, I, W, pass) {
   if (pass === "up") b = imax + 1;
   else if (pass === "down") a = imax + 1;
   if (pass === "down" && P.length - a < 8) { a = 0; b = imax + 1; } // fall back to up
-  const { Ps, Ih } = paHighState(P.slice(a, b), I.slice(a, b), W.slice(a, b));
-  const x0 = Ps.map((v) => Math.log10(Math.max(v, 1e-30)));
-  const m = paMergeClose(x0, Ih, PA_CONST.MERGE_FRAC);
+  const hs = paHighState(P.slice(a, b), I.slice(a, b), W.slice(a, b));
+  const x0 = hs.Ps.map((v) => Math.log10(Math.max(v, 1e-30)));
+  const m = paMergeClose(x0, hs.Ih, PA_CONST.MERGE_FRAC, hs.src, hs.nAgg);
   const Pm = m.x.map((v) => Math.pow(10, v));
+  // v2.6 (E1): 원시 반복을 살려 보낸다. 이것이 없으면 노이즈 법칙을 측정할 수 없고
+  // 엔진은 파일럿 잔차 폴백으로 떨어져 a1(계수 통계 성분)을 0으로 몰아버린다.
+  // src[j] 는 (a..b) 슬라이스 기준 인덱스이므로 +a 로 원본 좌표계로 되돌린다.
+  const Iraw = opts && opts.Iraw ? opts.Iraw : null;
+  const reps = Iraw ? m.src.map((j) => (j >= 0 && Iraw[j + a] ? Iraw[j + a].slice() : null)) : null;
+  const hasReps = !!(reps && reps.some((r) => r && r.length >= 2));
   return {
     powerAvg: Pm, intensityAvg: m.I,
     powerStd: Pm.map(() => 0), intensityStd: m.I.map(() => 0),
-    intensityReplicates: null,
+    intensityReplicates: hasReps ? reps : null,
+    aggApplied: m.nAgg.slice(),                       // 이 점이 몇 개 행의 max 인지
+    aggEffective: m.nAgg.some((v) => v > 1) ? "max-of-N" : "none",
+    acqTime: opts && isFinite(opts.acqTime) ? opts.acqTime : NaN,
+    counting: !!(opts && opts.counting),
   };
 }
 
@@ -38070,10 +38323,15 @@ function extractPATrace(file, type, bandMin, bandMax, det) {
     const P = readDataset(file, ps ? ((ps.power1 || ps.powerRaw).path) : `${base}/apd_counter_powers`);
     const I = readDataset(file, ps ? ((ps.sig1 || ps.sigRaw).path) : `${base}/apd_counter_apd_count_rates`);
     if (!P || !I) return null;
-    // (n, reps) 형식이면 반복 평균으로 1D 트레이스 구성
+    // (n, reps) 형식이면 반복 평균으로 1D 트레이스 구성.
+    // v2.6: 원시 반복(Iraw)과 dwell time(acqTime)을 함께 반환한다 — 노이즈 법칙은
+    // 집계 전 원시 반복에서만 측정 가능하고, 계수 통계의 Poisson 바닥은 1/acqTime 이다.
     const flat1D = (r) => r.shape.length === 1 ? Array.from(r.data, Number)
       : rows2D(r).map((row) => row.reduce((a, b) => a + b, 0) / row.length);
-    return { P: flat1D(P), I: flat1D(I), W };
+    const Iraw = I.shape.length === 2 ? rows2D(I).map((row) => Array.from(row, Number)) : null;
+    const acqR = readDataset(file, ps && ps.acq ? ps.acq.path : `${base}/apd_counter_acq_times`);
+    const acqTime = acqR && acqR.data.length ? Number(acqR.data[0]) : NaN;
+    return { P: flat1D(P), I: flat1D(I), W, Iraw, acqTime, counting: true };
   }
   // EMCCD: per-row band integral of the raw spectra (consistent with the viewer band)
   const P = readDataset(file, ps ? ((ps.power1 || ps.powerRaw).path) : `${base}/emccd_powers`);
@@ -38092,12 +38350,21 @@ function extractPATrace(file, type, bandMin, bandMax, det) {
   }
   const [n, reps, pix] = sp.shape;
   const I = new Array(n);
+  // v2.6: rep별 band 적분을 보존 (Iraw) — 평균으로 뭉개면 노이즈 법칙을 측정할 수 없다.
+  const Iraw = reps > 1 ? new Array(n) : null;
   for (let i = 0; i < n; i++) {
     let s2 = 0;
-    for (let r = 0; r < reps; r++) for (let p2 = i0; p2 < i1; p2++) s2 += Number(sp.data[(i * reps + r) * pix + p2]);
+    const row = Iraw ? new Array(reps) : null;
+    for (let r = 0; r < reps; r++) {
+      let sr = 0;
+      for (let p2 = i0; p2 < i1; p2++) sr += Number(sp.data[(i * reps + r) * pix + p2]);
+      if (row) row[r] = sr;
+      s2 += sr;
+    }
+    if (Iraw) Iraw[i] = row;
     I[i] = s2 / reps;
   }
-  return { P: Array.from(P.data, Number), I, W };
+  return { P: Array.from(P.data, Number), I, W, Iraw, acqTime: NaN, counting: false };
 }
 function extractPowerScanAPD(file, det) {
   const ps = det && det.ps;
@@ -38421,6 +38688,9 @@ const App = {
     bandMin: 480, bandMax: 680,
     xUnit: "W",            // "W" | "density" (mW/cm², needs calibration)
     fileSort: "name",      // 파일 목록 정렬: name(자연순) | added | type | size
+    // v2.6 뷰어 레이어 (기본: 데이터 + 피팅 곡선 + PA + I_th + 잔차만)
+    layers: { fit: true, pa: true, ith: true, resid: true, excluded: true,
+      envelope: false, spline: false, weights: false, bootband: false, norm: false },
   },
   calib: {
     pairs: [{ pm: null, end: null }, { pm: null, end: null }, { pm: null, end: null }], // PM↔endpoint 측정쌍 (1~3회)
@@ -38751,8 +39021,17 @@ function calibEffUmPerPx() {
   if (isFinite(c.umPerPx) && c.umPerPx > 0) return c.umPerPx; // legacy manual value
   return NaN;
 }
+/** 밀도 계산에 실제로 쓸 빔 면적 메트릭 — Ledger 보정 세션이 활성이고 그 세션에
+ * metrics(§4 항목2·4, Phase 8)가 있으면 그걸 우선 쓴다(다른 PC에서 이미 피팅해 둔 값도
+ * 그대로 쓸 수 있게 됨 — "완전 자동" 파워밀도 환산의 핵심). 없으면 이 PC에서 직접 연
+ * 빔 이미지의 로컬 피팅 결과(App.calib.metrics)로 되돌아간다(기존 동작 그대로). */
+function activeCalibMetrics() {
+  const c = App.calib;
+  if (c.sessionActive && c.session && c.session.metrics) return c.session.metrics;
+  return c.metrics;
+}
 function calibAreaCm2() {
-  const m = App.calib.metrics;
+  const m = activeCalibMetrics();
   if (!m) return NaN;
   const um2 = { peak: m.areaPeakUm2, e2avg: m.area1e2Um2, fwhm: m.areaFwhmUm2 }[App.calib.densityMode] || m.areaPeakUm2;
   return um2 * 1e-8;
@@ -38845,7 +39124,8 @@ function calibComputeMetrics() {
 function densityFactor() {
   if (!App.calib.enabled) return NaN;
   const { C } = calibCoefficient();
-  const frac = App.calib.metrics ? App.calib.metrics.powerFraction[App.calib.densityMode] : 1;
+  const m = activeCalibMetrics();
+  const frac = m ? m.powerFraction[App.calib.densityMode] : 1;
   const A = calibAreaCm2();
   if (!isFinite(C) || !isFinite(A) || A <= 0) return NaN;
   return C * frac * 1000 / A;
@@ -39204,6 +39484,12 @@ async function maybeApplyLedgerSession(rec) {
     renderCalibBadge(); return;
   }
   const d = result.doc;
+  // Phase 8: Ledger의 opt_calib 문서에 Prism이 내보낸 metrics(빔 면적 µm² 절대값 — 이미 유효
+  // 픽셀 스케일이 반영돼 있어 재계산 없이 그대로 쓸 수 있음, exportCalibSession() 참고)가
+  // 있으면 그대로 옮긴다. 필드 하나라도 숫자가 아니면(예: 사람이 실수로 다른 JSON을 가져온
+  // 경우) 통째로 무시 — 절반만 채워진 면적값으로 조용히 틀린 계산을 하는 것보다 안전하다.
+  const dm = d.metrics && typeof d.metrics === "object" ? d.metrics : null;
+  const metricsOk = dm && ["areaPeakUm2", "area1e2Um2", "areaFwhmUm2"].every((k) => isFinite(Number(dm[k])));
   c.session = {
     calibId, at: d.at || null, lambdaNm: isFinite(Number(d.lambdaNm)) ? Number(d.lambdaNm) : null,
     lens: d.lens || null, coefficient: isFinite(Number(d.coefficient)) ? Number(d.coefficient) : null,
@@ -39211,6 +39497,17 @@ async function maybeApplyLedgerSession(rec) {
     cameraPitch: isFinite(Number(d.cameraPitch)) ? Number(d.cameraPitch) : null,
     areaBasis: d.areaBasis || null, densityMode: d.densityMode || null,
     pathNote: d.pathNote || null, validUntil: d.validUntil || null,
+    metrics: metricsOk ? {
+      umPerPx: Number(dm.umPerPx), sigmaXum: Number(dm.sigmaXum), sigmaYum: Number(dm.sigmaYum),
+      thetaDeg: Number(dm.thetaDeg), d1e2Xum: Number(dm.d1e2Xum), d1e2Yum: Number(dm.d1e2Yum),
+      fwhmXum: Number(dm.fwhmXum), fwhmYum: Number(dm.fwhmYum),
+      areaPeakUm2: Number(dm.areaPeakUm2), area1e2Um2: Number(dm.area1e2Um2), areaFwhmUm2: Number(dm.areaFwhmUm2),
+      powerFraction: {
+        peak: isFinite(Number((dm.powerFraction || {}).peak)) ? Number(dm.powerFraction.peak) : 1.0,
+        e2avg: isFinite(Number((dm.powerFraction || {}).e2avg)) ? Number(dm.powerFraction.e2avg) : 0.8646647,
+        fwhm: isFinite(Number((dm.powerFraction || {}).fwhm)) ? Number(dm.powerFraction.fwhm) : 0.5,
+      },
+    } : null,
   };
   c.sessionActive = true; c.sessionError = null;
   if (c.session.cameraPitch) c.cameraPitch = c.session.cameraPitch;
@@ -39247,13 +39544,15 @@ function renderCalibBadge() {
     const s = c.session;
     const lensTxt = s.lens && typeof s.lens === "object"
       ? `${s.lens.maker || ""} ${s.lens.model || ""} ${isFinite(Number(s.lens.mag)) ? fmt(s.lens.mag, 4) + "×" : ""}`.trim() : "";
-    const areaReady = !!c.metrics;
+    const areaFromSession = !!s.metrics;
+    const areaReady = areaFromSession || !!c.metrics;
     el.style.display = "";
     el.className = "ledger-badge ok";
     el.title = "클릭하면 Ledger 보정 세션 연동을 해제합니다";
     el.innerHTML = `적용된 보정: ${esc(s.at ? String(s.at).slice(0, 10) : "")} · ${s.lambdaNm ? fmt(s.lambdaNm, 5) + " nm" : ""} ` +
       `${esc(lensTxt)} · C=${isFinite(s.coefficient) ? fmt(s.coefficient, 5) : "?"}` +
-      (areaReady ? "" : ` <span class="ledger-badge-warn">· 빔 면적 미측정 — 밀도 환산엔 이 PC에서 빔 이미지가 필요합니다</span>`);
+      (areaFromSession ? ` <span class="ledger-badge-ok2">· 빔 면적도 세션에서 자동 적용됨(완전 자동)</span>`
+        : areaReady ? "" : ` <span class="ledger-badge-warn">· 빔 면적 미측정 — 밀도 환산엔 이 PC에서 빔 이미지가 필요하거나, 이 세션에 Prism 보정 내보내기를 가져와야 합니다</span>`);
   } else if (c.sessionError) {
     el.style.display = ""; el.className = "ledger-badge err"; el.title = "";
     el.innerHTML = `Ledger 보정 조회 실패 — ${esc(c.sessionError)}`;
@@ -39369,7 +39668,7 @@ function openCalibModal() {
       <div class="flex" style="margin-top:8px;">
         <label class="flex small"><input id="cb-enable" type="checkbox" ${c.enabled ? "checked" : ""}> 보정 활성화 (Power scan 축/결과에 파워밀도 표시 — 범위에 맞는 단위 자동 선택)</label>
       </div></div>
-    <div class="flex"><span class="right"><button id="cb-close" class="primary">저장 후 닫기</button></span></div>
+    <div class="flex"><span class="right"><button id="cb-export-session" class="small" title="이 보정 세션(계수+측정쌍+빔 이미지 피팅 결과)을 JSON으로 내보내 INNO Ledger에 가져올 수 있게 합니다">보정 세션 내보내기 (Ledger용)</button> <button id="cb-close" class="primary">저장 후 닫기</button></span></div>
   </div>`;
   document.body.appendChild(back);
   const sortObjectives = (keep) => {
@@ -39742,8 +40041,45 @@ function openCalibModal() {
     }
     e.target.value = "";
   });
+  back.querySelector("#cb-export-session").addEventListener("click", () => { upd(); exportCalibSession(); });
   back.querySelector("#cb-close").addEventListener("click", () => { upd(); refreshLensUI = null; back.remove(); if (App.activeId) renderAll(); });
   refreshCalibUI();
+}
+/* PHASE 8 — 설계 확정본 §4 항목2·4 업그레이드: 이 PC에서 확보한 보정 세션(측정쌍·계수·
+ * 빔 이미지 피팅 결과)을 JSON으로 내보내 INNO Ledger의 보정 세션 CRUD에 "가져오기"할 수 있게
+ * 한다. App.calib 전체를 그대로 덤프하지 않고 이렇게 필드를 하나씩 골라 담는 이유는 Phase 7에서
+ * 발견한 자격정보 유출 버그(exportPowerJson이 App.calib를 통째로 내보내면서 ledger.apiKey/uid도
+ * 같이 나갈 뻔했던 것)를 애초에 재현하지 않기 위해서다 — App.calib.ledger/session은 이 함수가
+ * 아예 읽지 않는다. beam.preview(빔 이미지 히트맵 원본, 수백 KB~수 MB일 수 있음)는 밀도 계산에
+ * 필요 없으므로 제외한다 — 필요한 것은 이미 절대 µm 단위로 계산된 metrics뿐이다. */
+function exportCalibSession() {
+  const c = App.calib;
+  const cc = calibCoefficient();
+  if (!isFinite(cc.C) && !c.metrics) {
+    toast("내보낼 보정값이 없습니다 — 1단계 측정쌍이나 2단계 빔 이미지를 먼저 입력하세요", 3600);
+    return;
+  }
+  const o = c.objSel >= 0 && c.objectives ? c.objectives[c.objSel] : null;
+  const payload = {
+    kind: "inno_prism_beam_calib",
+    exportedAt: new Date().toISOString(),
+    lambdaNm: isFinite(Number(c.lambdaNm)) ? Number(c.lambdaNm) : null,
+    lens: o ? { maker: o.maker || "", model: o.model || "", mag: isFinite(Number(o.mag)) ? Number(o.mag) : null,
+      na: isFinite(Number(o.na)) ? Number(o.na) : null, medium: o.medium || "air" } : null,
+    pairs: (c.pairs || []).filter((q) => isFinite(q.pm) && q.pm > 0 && isFinite(q.end) && q.end > 0),
+    coefficient: isFinite(cc.C) ? cc.C : null,
+    cameraPitch: isFinite(Number(c.cameraPitch)) ? Number(c.cameraPitch) : null,
+    areaBasis: c.areaBasis, densityMode: c.densityMode,
+    beam: c.beam ? {
+      sx: c.beam.sx, sy: c.beam.sy, theta: c.beam.theta, binFactor: c.beam.binFactor || 1,
+      r2: c.beam.r2, nSat: c.beam.nSat, nNear: c.beam.nNear, nClip: c.beam.nClip,
+    } : null,
+    metrics: c.metrics || null,
+  };
+  downloadText(`inno_prism_beam_calib_${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), "application/json");
+  toast(c.metrics
+    ? "보정 세션을 내보냈습니다(계수+빔 면적 포함) — INNO Ledger의 보정 탭 \"가져오기\"로 불러오세요"
+    : "보정 세션을 내보냈습니다(계수만 — 빔 이미지를 아직 피팅하지 않음) — INNO Ledger의 보정 탭 \"가져오기\"로 불러오세요", 4500);
 }
 
 /* --------------------------- power scan view (PrismFit 2) ----------------- */
@@ -39780,7 +40116,8 @@ function branchForSettings(loaded, rec) {
     const tr = getPATrace(rec);
     if (tr) {
       try {
-        branch = PrismFit.paHighStateBranch(tr.P, tr.I, tr.W, name === "all" ? "all" : name);
+        branch = PrismFit.paHighStateBranch(tr.P, tr.I, tr.W, name === "all" ? "all" : name,
+          { Iraw: tr.Iraw || null, acqTime: tr.acqTime, counting: !!tr.counting });
         agg = "high";
       } catch (e) { /* fall back to mean */ }
     }
@@ -39789,7 +40126,7 @@ function branchForSettings(loaded, rec) {
 }
 function analysisKey() {
   const s = App.settings;
-  return ["a2", s.branch, s.aggMode || "high", s.monotone ? 1 : 0, s.lambdaFactor, s.bandMin, s.bandMax].join("|");
+  return ["a26", s.branch, s.aggMode || "high", s.monotone ? 1 : 0, s.lambdaFactor, s.bandMin, s.bandMax].join("|");
 }
 function currentAnalysis(rec) { return rec.cache[analysisKey()]; }
 
@@ -39827,11 +40164,21 @@ function renderPowerScan(rec) {
     <div id="chart-spec" class="chart chart-short"></div></div>` : ""}
   <div class="panel">
     <div class="flex"><h3 style="margin:0;">Log–Log Power Dependence <span id="fit-status" class="muted small"></span></h3>
-      <span class="right flex small">
-        <label class="flex small" title="반투명 윈도우의 양쪽 끝을 드래그해 범위 조절 — 윈도우 내 최좌·최우 점을 이은 코드 기울기 표시">
-          <input id="m-toggle" type="checkbox"> 수동 기울기 윈도우</label>
-        <span id="m-out" class="mono small"></span>
-      </span></div>
+      <span class="right flex small"><span id="m-out" class="mono small"></span></span></div>
+    <div class="chips" id="layer-chips">
+      <button class="chip" data-layer="fit" title="선택된 파라메트릭 모델 곡선">피팅 곡선</button>
+      <button class="chip" data-layer="pa" title="최대 기울기 지점의 접선 — 접선이 데이터의 급경사와 겹치면 잘 맞은 것">PA 위치</button>
+      <button class="chip" data-layer="ith" title="문턱 파워 I_th 와 포화 파워 P_sat 세로선">I_th 위치</button>
+      <button class="chip" data-layer="resid" title="아래쪽 잔차 패널 (dex) + ±1σ/±3σ 밴드">잔차 패널</button>
+      <button class="chip" data-layer="excluded" title="이상치로 제외된 점(X)과 전선 산포로 유지된 점(◇)">제외/전선점</button>
+      <span class="chip-sep"></span>
+      <button class="chip" data-layer="norm" title="세로축을 I/모델 비율로 — 3 decade 축에서 숨는 오차가 전부 드러난다">정규화 뷰</button>
+      <button class="chip" data-layer="weights" title="점 크기 ∝ 유효 가중치 — 곡선이 실제로 무엇에 맞춰졌는지">가중치 크기</button>
+      <button class="chip" data-layer="spline" title="비모수 P-spline 교차검증 곡선">P-spline</button>
+      <button class="chip" data-layer="envelope" title="고상태 max envelope (실제 집계가 일어난 파일에서만)">고상태 envelope</button>
+      <span class="chip-sep"></span>
+      <button class="chip" data-layer="manual" title="반투명 윈도우의 양쪽 끝을 드래그해 범위 조절 — 윈도우 내 최좌·최우 점을 이은 코드 기울기">수동 기울기</button>
+    </div>
     <div id="chart-power" class="chart" style="height:430px;"></div>
   </div>
   <div class="panel">
@@ -39890,22 +40237,47 @@ function renderPowerScan(rec) {
       renderPowerScan(rec);
     });
   }
-  // 수동 기울기 윈도우 토글
-  $("#m-toggle").checked = !!rec.cache.manualOn;
-  $("#m-toggle").addEventListener("change", () => {
-    rec.cache.manualOn = $("#m-toggle").checked;
-    if (rec.cache.manualOn && !rec.cache.manualRange) {
+  // ---- v2.6 레이어 칩 ----
+  const syncChips = () => {
+    const L = layers();
+    document.querySelectorAll("#layer-chips .chip").forEach((b) => {
+      const key = b.dataset.layer;
+      const on = key === "manual" ? !!rec.cache.manualOn : !!L[key];
+      b.classList.toggle("on", on);
+      if (key === "envelope") {
+        const a = currentAnalysis(rec);
+        b.style.display = (a && a.aggEffective === "max-of-N") ? "" : "none";
+      }
+    });
+  };
+  document.querySelectorAll("#layer-chips .chip").forEach((b) => {
+    b.addEventListener("click", () => {
+      const key = b.dataset.layer;
+      if (key === "manual") { toggleManual(rec); } else {
+        const L = layers();
+        L[key] = !L[key];
+        saveSettings();
+        refreshPowerView(rec);
+      }
+      syncChips();
+    });
+  });
+  rec.cache._syncChips = syncChips;
+  syncChips();
+  const toggleManual = (r) => {
+    r.cache.manualOn = !r.cache.manualOn;
+    if (r.cache.manualOn && !r.cache.manualRange) {
       // 기본 윈도우: x 범위 중앙 40%
       try {
-        const a = currentAnalysis(rec);
-        const xs = a ? a.data.P : branchForSettings(getLoaded(rec), rec).branch.powerAvg;
+        const a = currentAnalysis(r);
+        const xs = a ? a.data.P : branchForSettings(getLoaded(r), r).branch.powerAvg;
         const lo = Math.min(...xs), hi = Math.max(...xs);
         const llo = Math.log10(lo), lhi = Math.log10(hi);
-        rec.cache.manualRange = { lo: Math.pow(10, llo + 0.3 * (lhi - llo)), hi: Math.pow(10, llo + 0.7 * (lhi - llo)) };
-      } catch (e) { rec.cache.manualOn = false; }
+        r.cache.manualRange = { lo: Math.pow(10, llo + 0.3 * (lhi - llo)), hi: Math.pow(10, llo + 0.7 * (lhi - llo)) };
+      } catch (e) { r.cache.manualOn = false; }
     }
-    refreshPowerView(rec);
-  });
+    refreshPowerView(r);
+  };
   $("#c-diag").addEventListener("click", () => runDiagnosticsUI(rec));
   $("#ex-png").addEventListener("click", () => exportChartPng(rec, "#chart-power", "_powerfit"));
   $("#ex-slope-png").addEventListener("click", () => exportChartPng(rec, "#chart-slope", "_slope"));
@@ -39926,6 +40298,7 @@ async function runPowerAnalysis(rec, force) {
       drawPowerChart(rec, loaded, branches, rec.cache[key]);
       drawSlopeChart(rec, rec.cache[key]);
       renderFitResults(rec, rec.cache[key]);
+      if (rec.cache._syncChips) rec.cache._syncChips();
       return;
     }
     const pendingKey = "pending:" + key;
@@ -39951,6 +40324,7 @@ async function runPowerAnalysis(rec, force) {
     drawPowerChart(rec, loaded, branches, analysis);
     drawSlopeChart(rec, analysis);
     renderFitResults(rec, analysis);
+    if (rec.cache._syncChips) rec.cache._syncChips();
   } catch (e) {
     if (status) status.textContent = "";
     const fr = $("#fit-results");
@@ -40004,26 +40378,115 @@ function computeManualSlope(rec) {
   return { n: nn, L, R, chord, lsq };
 }
 
+/* ---------------------------------------------------------------------------
+ * v2.6 뷰어 (V1–V7)
+ * 기본 화면은 "데이터 + 피팅 곡선 + PA 위치 + I_th 위치 + 잔차" 다섯 가지뿐이다.
+ * 고상태 envelope / P-spline / 부트스트랩 밴드 / 가중치 표시는 칩으로 켤 때만 그린다.
+ * PA 는 기울기이므로 점이 아니라 접선 선분으로 그린다 — 접선이 데이터의 실제 급경사와
+ * 겹치는지가 눈으로 바로 보이는 피팅 검증이 된다.
+ * ------------------------------------------------------------------------- */
+const LAYER_DEFAULTS = {
+  fit: true, pa: true, ith: true, resid: true, excluded: true,
+  envelope: false, spline: false, weights: false, bootband: false, norm: false,
+};
+function layers() {
+  const L = Object.assign({}, LAYER_DEFAULTS, App.settings.layers || {});
+  App.settings.layers = L;
+  return L;
+}
+/** 모델 곡선의 정확한 값 (격자 보간이 아니라 파라미터에서 직접) */
+function modelAt(analysis, xv) {
+  try { return PrismFit.modelI(analysis.params, xv, analysis.chosenOrder); } catch (e) { return NaN; }
+}
+/** 사용점 기준 dex 잔차와 ±1σ 폭 */
+function residualsOf(analysis) {
+  const d = analysis.data, out = [];
+  for (let i = 0; i < d.x.length; i++) {
+    const m = modelAt(analysis, d.x[i]);
+    if (!(isFinite(m) && m > 0 && isFinite(d.I[i]))) continue;
+    const Ii = Math.max(d.I[i], 1e-300);
+    out.push({
+      i, P: d.P[i], x: d.x[i], I: d.I[i],
+      r: Math.log10(Ii) - Math.log10(m),
+      s: d.sigI[i] / (Math.LN10 * Math.max(Ii, 1e-300)),
+      used: analysis.mask ? !!analysis.mask[i] : true,
+      ratio: d.I[i] / m,
+    });
+  }
+  return out;
+}
+/** 연속 3점 이상 같은 부호로 2σ 초과 — 모델이 따라가지 못하는 구간 */
+function misfitRuns(res) {
+  const runs = [];
+  let cur = null;
+  for (const p of res) {
+    const bad = p.used && isFinite(p.s) && p.s > 0 && Math.abs(p.r) > 2 * p.s;
+    const sign = p.r > 0 ? 1 : -1;
+    if (bad && cur && cur.sign === sign) { cur.hi = p.x; cur.n++; }
+    else if (bad) { if (cur && cur.n >= 3) runs.push(cur); cur = { lo: p.x, hi: p.x, sign, n: 1 }; }
+    else { if (cur && cur.n >= 3) runs.push(cur); cur = null; }
+  }
+  if (cur && cur.n >= 3) runs.push(cur);
+  return runs;
+}
+
 function drawPowerChart(rec, loaded, branches, analysis) {
   const el = $("#chart-power");
   if (!el) return;
+  const L = layers();
   const k = xConv();
-  const traces = [];
+  const traces = [], shapes = [], annots = [];
   const up = branches.up, down = branches.down;
-  const mkData = (br, color, label) => ({
-    x: br.powerAvg.map((v) => v * k), y: br.intensityAvg,
-    error_y: { type: "data", array: br.intensityStd, visible: true, thickness: 1, width: 2, color: color + "88" },
-    mode: "markers", type: "scatter", name: label,
-    marker: { size: 6.5, color, symbol: "circle", line: { width: 1, color: "#1a1a19" } },
-    hovertemplate: "P=%{x:.4g}<br>I=%{y:.4g}<extra>" + label + "</extra>",
-  });
+  const res = analysis ? residualsOf(analysis) : [];
+  const showResid = !!(analysis && L.resid && res.length);
+  const norm = !!(analysis && L.norm);
+
+  // ---- 원본 데이터 (정규화 뷰에서는 I/모델 비율로) ----
+  const ratioOf = (Pv, Iv) => {
+    if (!analysis) return NaN;
+    const m = modelAt(analysis, Math.log10(Pv));
+    return isFinite(m) && m > 0 ? Iv / m : NaN;
+  };
+  const mkData = (br, color, label) => {
+    const xs = br.powerAvg.map((v) => v * k);
+    const ys = norm ? br.powerAvg.map((v, i) => ratioOf(v, br.intensityAvg[i])) : br.intensityAvg;
+    const t = {
+      x: xs, y: ys, mode: "markers", type: "scatter", name: label,
+      marker: { size: 6.5, color, symbol: "circle", line: { width: 1, color: "#1a1a19" } },
+      hovertemplate: norm ? "P=%{x:.4g}<br>I/모델=%{y:.3f}<extra>" + label + "</extra>"
+        : "P=%{x:.4g}<br>I=%{y:.4g}<extra>" + label + "</extra>",
+    };
+    if (!norm) t.error_y = { type: "data", array: br.intensityStd, visible: true, thickness: 1, width: 2, color: color + "88" };
+    return t;
+  };
   if (down) {
     traces.push(mkData(up, PALETTE.blue, "up scan"));
     traces.push(mkData(down, PALETTE.orange, "down scan"));
   } else {
     traces.push(mkData(branches.all, PALETTE.blue, "data"));
   }
-  if (analysis && analysis._aggUsed === "high") {
+
+  // ---- 가중치 크기: 이 곡선이 실제로 무엇에 맞춰졌는지 ----
+  if (analysis && L.weights) {
+    const d = analysis.data;
+    const w = d.sigG.map((sg, i) => (analysis.mask && !analysis.mask[i] ? 0 : 1 / (sg * sg)));
+    const pos = w.filter((v) => v > 0);
+    const lw = pos.length ? pos.map(Math.log) : [0];
+    const lo = Math.min(...lw), hi = Math.max(...lw), rng = Math.max(hi - lo, 1e-9);
+    traces.push({
+      x: d.P.map((v) => v * k), y: norm ? d.P.map((v, i) => ratioOf(v, d.I[i])) : d.I,
+      mode: "markers", type: "scatter", name: "유효 가중치 ∝ 크기",
+      marker: {
+        size: w.map((v) => (v > 0 ? 4 + 11 * (Math.log(v) - lo) / rng : 3)),
+        color: "rgba(57,135,229,0.30)", line: { width: 0 },
+      },
+      hovertemplate: "P=%{x:.4g}<br>상대 가중치=%{customdata:.3g}<extra>weight</extra>",
+      customdata: w.map((v) => v / Math.max(...w)),
+    });
+  }
+
+  // ---- 고상태 envelope: 실제로 집계가 일어났을 때만 (E7) ----
+  if (analysis && !norm && L.envelope && analysis._aggUsed === "high" && analysis.aggEffective === "max-of-N") {
     traces.push({
       x: analysis.data.P.map((v) => v * k), y: analysis.data.I,
       mode: "markers", type: "scatter", name: "고상태 envelope (피팅 데이터)",
@@ -40031,78 +40494,216 @@ function drawPowerChart(rec, loaded, branches, analysis) {
       hovertemplate: "P=%{x:.4g}<br>I(high)=%{y:.4g}<extra>envelope</extra>",
     });
   }
+
   if (analysis) {
     const Pgrid = analysis.grid.map((xv) => Math.pow(10, xv) * k);
-    traces.push({ x: Pgrid, y: analysis.modelCurve, mode: "lines", type: "scatter",
-      name: `모델 H${analysis.chosenOrder} (파라메트릭)`, line: { color: PALETTE.aqua, width: 2.4 },
-      hovertemplate: "P=%{x:.4g}<br>model=%{y:.4g}<extra>parametric</extra>" });
-    traces.push({ x: Pgrid, y: analysis.splineCurve, mode: "lines", type: "scatter",
-      name: "P-spline (비모수)", line: { color: PALETTE.violet, width: 1.4, dash: "dash" },
-      hovertemplate: "P=%{x:.4g}<br>spline=%{y:.4g}<extra>spline</extra>" });
-    // excluded outliers
-    const out = analysis.diagnostics.outliers || [];
-    if (out.length) {
+    // ---- 피팅 곡선 (차수는 이름이 아니라 결과 카드에서 설명한다) ----
+    if (L.fit) {
       traces.push({
+        x: Pgrid, y: norm ? analysis.grid.map(() => 1) : analysis.modelCurve,
+        mode: "lines", type: "scatter", name: norm ? "모델 (기준선)" : "피팅 곡선",
+        line: { color: PALETTE.aqua, width: 2.6, dash: norm ? "dot" : "solid" },
+        hovertemplate: norm ? "<extra></extra>" : "P=%{x:.4g}<br>모델=%{y:.4g}<extra>H" + analysis.chosenOrder + "</extra>",
+      });
+    }
+    // ---- P-spline: 켤 때만, 확실히 뒤로 ----
+    if (L.spline && !norm) {
+      const Imax = Math.max(...analysis.data.I);
+      const blown = analysis.splineCurve.map((v) => !(isFinite(v) && v < 10 * Imax));
+      traces.push({
+        x: Pgrid, y: analysis.splineCurve.map((v, i) => (blown[i] ? null : v)),
+        mode: "lines", type: "scatter", name: "P-spline (비모수)",
+        line: { color: "#6b6a62", width: 1.2, dash: "dot" },
+        hovertemplate: "P=%{x:.4g}<br>spline=%{y:.4g}<extra>spline</extra>",
+      });
+      if (blown.some(Boolean)) annots.push({
+        xref: "paper", yref: "paper", x: 0.99, y: 0.02, xanchor: "right",
+        text: "⚠ 스플라인 경계 발산 — 해당 구간 비표시", showarrow: false,
+        font: { size: 11, color: PALETTE.red }, bgcolor: "rgba(26,26,25,0.8)", borderpad: 3,
+      });
+    }
+    // ---- 제외점 / 전선 산포 ----
+    if (L.excluded && !norm) {
+      const out = analysis.diagnostics.outliers || [];
+      if (out.length) traces.push({
         x: out.map((i) => analysis.data.P[i] * k), y: out.map((i) => analysis.data.I[i]),
-        mode: "markers", type: "scatter", name: `제외된 outlier (${out.length})`,
-        marker: { size: 9, symbol: "x", color: PALETTE.red, line: { width: 1.5, color: PALETTE.red } },
-        hovertemplate: "P=%{x:.4g}<br>I=%{y:.4g}<extra>outlier 제외</extra>",
+        mode: "markers", type: "scatter", name: `제외 (${out.length})`,
+        marker: { size: 10, symbol: "x-thin", color: PALETTE.red, line: { width: 2, color: PALETTE.red } },
+        hovertemplate: "P=%{x:.4g}<br>I=%{y:.4g}<extra>이상치 제외</extra>",
+      });
+      const fs = analysis.diagnostics.frontScatter || [];
+      if (fs.length) traces.push({
+        x: fs.map((i) => analysis.data.P[i] * k), y: fs.map((i) => analysis.data.I[i]),
+        mode: "markers", type: "scatter", name: `전선 산포 (${fs.length}, 유지)`,
+        marker: { size: 9, symbol: "diamond-open", color: PALETTE.yellow, line: { width: 1.6, color: PALETTE.yellow } },
+        hovertemplate: "P=%{x:.4g}<br>I=%{y:.4g}<extra>쌍안정 산포 — 제외하지 않음</extra>",
       });
     }
   }
-  const shapes = [];
-  if (analysis) {
-    for (const [xv, col] of [[analysis.thresholdP, "#c3c2b7"], [analysis.saturationP, "#8b8a80"]]) {
-      if (isFinite(xv) && xv > 0) shapes.push({ type: "line", x0: xv * k, x1: xv * k, yref: "paper", y0: 0, y1: 1,
-        line: { color: col, width: 1, dash: "dashdot" } });
+
+  // ---- V3: I_th / P_sat 라벨 달린 세로선 ----
+  const kd = densityFactor(), du = activeDensityUnit();
+  const marker = (xv, label, color, note) => {
+    if (!(isFinite(xv) && xv > 0)) return;
+    shapes.push({ type: "line", x0: xv * k, x1: xv * k, xref: "x", yref: "paper", y0: 0, y1: 1,
+      line: { color, width: 1.8, dash: "dashdot" } });
+    const dens = isFinite(kd) && densityActive() ? `<br><span style="font-size:10.5px">${fmt(xv * kd / du.div, 3)} ${du.name}</span>` : "";
+    annots.push({
+      x: Math.log10(xv * k), xref: "x", yref: "paper", y: 1.0, yanchor: "bottom", xanchor: "center",
+      text: `<b>${label}</b> = ${fmt(xv, 3)} W${note ? " " + note : ""}${dens}`,
+      showarrow: false, font: { size: 12, color }, bgcolor: "rgba(26,26,25,0.85)", borderpad: 3,
+    });
+  };
+  if (analysis && L.ith) {
+    marker(analysis.thresholdP, "I_th", PALETTE.magenta, analysis.thresholdOutOfRange ? "<i>(외삽)</i>" : "");
+    marker(analysis.saturationP, "P_sat", "#8b8a80", "");
+  }
+
+  // ---- V2: PA 위치 — 접선 선분(분해 front) 또는 구간 음영(미분해 점프) ----
+  if (analysis && L.pa && !norm) {
+    const jump = analysis.paSource === "jump" && analysis.paJump;
+    if (jump) {
+      const lo = Math.log10(analysis.paJump.pth) - analysis.paJump.dlogP / 2;
+      const hi = Math.log10(analysis.paJump.pth) + analysis.paJump.dlogP / 2;
+      shapes.push({ type: "rect", xref: "x", yref: "paper", layer: "below",
+        x0: Math.pow(10, lo) * k, x1: Math.pow(10, hi) * k, y0: 0, y1: 1,
+        fillcolor: "rgba(201,133,0,0.18)", line: { color: PALETTE.yellow, width: 1 } });
+      annots.push({
+        x: Math.log10(analysis.paJump.pth * k), xref: "x", yref: "paper", y: 0.5, xanchor: "left",
+        text: `  <b>PA ≥ ${fmt(analysis.paReport, 4)}</b><br>  미분해 점프<br>  Δlog₁₀P = ${fmt(analysis.paJump.dlogP, 3)}`,
+        showarrow: false, align: "left", font: { size: 12, color: PALETTE.yellow },
+        bgcolor: "rgba(26,26,25,0.85)", borderpad: 4,
+      });
+    }
+    // 분해 front 접선 (점프가 이기면 회색 보조선)
+    if (isFinite(analysis.sMaxAtP) && isFinite(analysis.sMax)) {
+      const xs = Math.log10(analysis.sMaxAtP), Is = modelAt(analysis, xs);
+      if (isFinite(Is) && Is > 0) {
+        const xr = analysis.data.x, half = 0.10 * (xr[xr.length - 1] - xr[0]);
+        const col = jump ? "#8b8a80" : PALETTE.yellow;
+        shapes.push({ type: "line", xref: "x", yref: "y", layer: "above",
+          x0: Math.pow(10, xs - half) * k, y0: Is * Math.pow(10, -analysis.sMax * half),
+          x1: Math.pow(10, xs + half) * k, y1: Is * Math.pow(10, analysis.sMax * half),
+          line: { color: col, width: jump ? 2 : 3 } });
+        traces.push({
+          x: [analysis.sMaxAtP * k], y: [Is], mode: "markers", type: "scatter",
+          name: jump ? "분해 front (보조)" : "PA (최대 기울기)",
+          marker: { size: 13, symbol: "star", color: col, line: { width: 1.4, color: "#1a1a19" } },
+          hovertemplate: `s_max=${fmt(analysis.sMax, 4)}<br>P=%{x:.4g}<extra></extra>`,
+        });
+        if (!jump) annots.push({
+          x: Math.log10(analysis.sMaxAtP * k), y: Math.log10(Is), yshift: 30, xanchor: "center",
+          text: `PA = <b>${fmt(analysis.sMax, 4)}</b>${analysis.sMaxIsLowerBound ? " (하한)" : ""}`,
+          showarrow: false, font: { size: 13, color: PALETTE.yellow },
+          bgcolor: "rgba(26,26,25,0.85)", borderpad: 3,
+        });
+      }
     }
   }
-  // 수동 기울기: 드래그 가능한 반투명 윈도우 + 코드(chord) 오버레이
-  let manWinIdx = -1, manChordIdx = -1;
-  const manAnnotations = [];
-  if (rec.cache.manualOn && rec.cache.manualRange) {
+
+  // ---- V5: 미스핏 구간 하이라이트 ----
+  if (analysis && showResid) {
+    for (const r of misfitRuns(res)) {
+      const pad = 0.3 * (r.hi - r.lo) + 0.004;
+      shapes.push({ type: "rect", xref: "x", yref: "paper", layer: "below",
+        x0: Math.pow(10, r.lo - pad) * k, x1: Math.pow(10, r.hi + pad) * k, y0: 0, y1: 1,
+        fillcolor: "rgba(230,103,103,0.10)", line: { width: 0 } });
+      annots.push({
+        x: 0.5 * (r.lo + r.hi) + Math.log10(k), xref: "x", yref: "paper", y: 0.93, xanchor: "center",
+        text: `이 구간을 따라가지 못함 (${r.n}점, ${r.sign > 0 ? "모델이 낮음" : "모델이 높음"})`,
+        showarrow: false, font: { size: 10.5, color: PALETTE.red },
+        bgcolor: "rgba(26,26,25,0.8)", borderpad: 2,
+      });
+    }
+  }
+
+  // ---- V4: 잔차 패널 (같은 figure 의 2행 subplot) ----
+  if (showResid) {
+    const xs = res.map((p) => p.P * k);
+    const band = (mult, alpha) => {
+      traces.push({
+        x: [...xs, ...xs.slice().reverse()],
+        y: [...res.map((p) => mult * p.s), ...res.map((p) => -mult * p.s).reverse()],
+        fill: "toself", fillcolor: `rgba(195,194,183,${alpha})`, line: { width: 0 },
+        type: "scatter", yaxis: "y2", hoverinfo: "skip", showlegend: false,
+      });
+    };
+    band(3, 0.07); band(1, 0.11);
+    const used = res.filter((p) => p.used), excl = res.filter((p) => !p.used);
+    traces.push({
+      x: used.map((p) => p.P * k), y: used.map((p) => p.r), yaxis: "y2",
+      mode: "markers", type: "scatter", name: "잔차 (dex)", showlegend: false,
+      marker: { size: 5, color: PALETTE.blue },
+      hovertemplate: "P=%{x:.4g}<br>잔차=%{y:.3f} dex<extra></extra>",
+    });
+    if (excl.length) traces.push({
+      x: excl.map((p) => p.P * k), y: excl.map((p) => p.r), yaxis: "y2",
+      mode: "markers", type: "scatter", showlegend: false,
+      marker: { size: 8, symbol: "x-thin", color: PALETTE.red, line: { width: 1.6, color: PALETTE.red } },
+      hovertemplate: "P=%{x:.4g}<br>잔차=%{y:.3f} dex<extra>제외</extra>",
+    });
+    const rms = used.length ? Math.sqrt(used.reduce((s2, p) => s2 + p.r * p.r, 0) / used.length) : NaN;
+    annots.push({
+      xref: "paper", yref: "paper", x: 0.005, y: 0.255, xanchor: "left", yanchor: "top",
+      text: `잔차 rms = ${fmt(rms, 3)} dex · 밴드 = ±1σ / ±3σ (점별)`,
+      showarrow: false, font: { size: 10.5, color: "#8b8a80" },
+    });
+  }
+
+  // ---- 수동 기울기 윈도우 ----
+  let manWinIdx = -1;
+  if (rec.cache.manualOn && rec.cache.manualRange && !norm) {
     const mr = rec.cache.manualRange;
     manWinIdx = shapes.length;
-    shapes.push({
-      type: "rect", xref: "x", yref: "paper",
-      x0: mr.lo * k, x1: mr.hi * k, y0: 0, y1: 1,
-      fillcolor: "rgba(213,81,129,0.08)",
-      line: { color: "rgba(213,81,129,0.55)", width: 1.5 },
-    });
+    shapes.push({ type: "rect", xref: "x", yref: "paper", x0: mr.lo * k, x1: mr.hi * k, y0: 0, y1: 1,
+      fillcolor: "rgba(213,81,129,0.08)", line: { color: "rgba(213,81,129,0.55)", width: 1.5 } });
     const man = computeManualSlope(rec);
+    const mOut = $("#m-out");
     if (man && man.chord !== undefined) {
-      manChordIdx = shapes.length;
-      shapes.push({
-        type: "line", xref: "x", yref: "y", layer: "above",
+      shapes.push({ type: "line", xref: "x", yref: "y", layer: "above",
         x0: man.L[0] * k, y0: man.L[1], x1: man.R[0] * k, y1: man.R[1],
-        line: { color: PALETTE.magenta, width: 3 },
-      });
-      manAnnotations.push({
+        line: { color: PALETTE.magenta, width: 3 } });
+      el._manAnnIdx = annots.length;
+      annots.push({
         x: Math.log10(Math.sqrt(man.L[0] * man.R[0]) * k), xref: "x", yref: "paper", y: 0.015,
-        text: `s = <b>${fmt(man.chord, 4)}</b>`,
-        showarrow: false, font: { size: 12.5, color: "#f0a3c0" },
-        bgcolor: "rgba(26,26,25,0.75)", borderpad: 3,
+        text: `s = <b>${fmt(man.chord, 4)}</b>`, showarrow: false,
+        font: { size: 12.5, color: "#f0a3c0" }, bgcolor: "rgba(26,26,25,0.75)", borderpad: 3,
       });
-      const mOut = $("#m-out");
       if (mOut) mOut.innerHTML = `s = <b style="color:${PALETTE.magenta}">${fmt(man.chord, 5)}</b> · ${man.n}점 · LSQ ${fmt(man.lsq, 4)}`;
     } else {
-      const mOut = $("#m-out");
+      el._manAnnIdx = -1;
       if (mOut) mOut.innerHTML = `<span class="tag-Low">윈도우 내 점 부족</span>`;
     }
   } else {
+    el._manAnnIdx = -1;
     const mOut = $("#m-out");
     if (mOut) mOut.textContent = "";
   }
+
+  // ---- 축 구성 ----
   const ylab = rec.det.type === "power_apd" ? "APD count rate (Hz)" : `적분 강도 (${App.settings.bandMin}–${App.settings.bandMax} nm, a.u.)`;
-  newPlot(el, traces, {
-    xaxis: Object.assign(baseLayout().xaxis, { type: "log", title: { text: xUnitLabel() }, exponentformat: "power" }),
-    yaxis: Object.assign(baseLayout().yaxis, { type: "log", title: { text: ylab }, exponentformat: "power" }),
-    shapes, annotations: manAnnotations,
-  }).then(() => {
+  const base = baseLayout();
+  const yTop = showResid ? [0.36, 1] : [0, 1];
+  const layout = {
+    xaxis: Object.assign(base.xaxis, { type: "log", title: { text: xUnitLabel() }, exponentformat: "power", anchor: showResid ? "y2" : "y" }),
+    yaxis: Object.assign({}, base.yaxis, norm
+      ? { type: "linear", title: { text: "I / 모델" }, domain: yTop, range: [0.4, 1.8], zeroline: false }
+      : { type: "log", title: { text: ylab }, exponentformat: "power", domain: yTop }),
+    shapes, annotations: annots,
+    margin: { l: 66, r: 18, t: 46, b: 50 },
+  };
+  if (showResid) {
+    layout.yaxis2 = Object.assign({}, base.yaxis, {
+      domain: [0, 0.26], title: { text: "잔차 (dex)", font: { size: 11.5 } },
+      zeroline: true, zerolinecolor: "#5a5a52", zerolinewidth: 1.5,
+    });
+  }
+  el.style.height = (showResid ? 560 : 430) + "px";
+  newPlot(el, traces, layout).then(() => {
+    try { Plotly.Plots.resize(el); } catch (e) {}
     setupManualHandles(rec, el, manWinIdx >= 0);
   });
 }
-
 /* 수동 기울기 윈도우: 양쪽 끝 전용 드래그 핸들 (DOM 오버레이 — 두껍고 잡기 쉬움) */
 function setupManualHandles(rec, el, active) {
   el.style.position = "relative";
@@ -40197,8 +40798,11 @@ function liveUpdateManual(rec, el) {
       upd[`shapes[${cIdx}].x0`] = man.L[0] * kk; upd[`shapes[${cIdx}].y0`] = man.L[1];
       upd[`shapes[${cIdx}].x1`] = man.R[0] * kk; upd[`shapes[${cIdx}].y1`] = man.R[1];
     }
-    upd["annotations[0].x"] = Math.log10(Math.sqrt(man.L[0] * man.R[0]) * kk);
-    upd["annotations[0].text"] = `s = <b>${fmt(man.chord, 4)}</b>`;
+    const ai = el._manAnnIdx;
+    if (ai >= 0) {
+      upd[`annotations[${ai}].x`] = Math.log10(Math.sqrt(man.L[0] * man.R[0]) * kk);
+      upd[`annotations[${ai}].text`] = `s = <b>${fmt(man.chord, 4)}</b>`;
+    }
     if (mOut) mOut.innerHTML = `s = <b style="color:${PALETTE.magenta}">${fmt(man.chord, 5)}</b> · ${man.n}점 · LSQ ${fmt(man.lsq, 4)}`;
   } else if (mOut) {
     mOut.innerHTML = `<span class="tag-Low">윈도우 내 점 부족</span>`;
@@ -40267,7 +40871,20 @@ function renderFitResults(rec, analysis) {
   const thDens = isFinite(kd) && isFinite(a.thresholdP) ? `<div class="s" style="color:var(--accent)">= ${fmt(a.thresholdP * kd / du.div, 4)} ${du.name}</div>` : "";
   const satDens = isFinite(kd) && isFinite(a.saturationP) ? ` (= ${fmt(a.saturationP * kd / du.div, 4)} ${du.name})` : "";
   const jumpWins = a.paSource === "jump";
+  // v2.6 (V8): 제약 경계에 붙은 파라미터가 있으면 s_max 는 데이터가 아니라 제약의 산물이다.
+  const bh = a.boundHits || [];
+  const bhTxt = bh.map((b) => `${b.param}=${fmt(b.value, 4)} (${b.at === "floor" ? "하한" : b.at === "box" ? "박스 상한" : "격자 이하"})`).join(" · ");
+  const warnBound = bh.length ? `<div class="warnbar">⚠ <b>제약 접촉</b> — ${esc(bhTxt)}<br>
+    s_max 는 데이터가 아니라 제약이 결정한 값입니다. 점추정으로 보고하지 마십시오.
+    ${bh.some((b) => b.at === "sub-grid") ? `전이 폭이 파워 격자(Δlog₁₀P=${fmt(a.medianDlogP, 3)})보다 좁아 어떤 매끄러운 모델도 유한한 s_max 를 줄 수 없습니다.` : ""}</div>` : "";
+  const warnAgg = (analysis._aggUsed === "high" && a.aggEffective === "none")
+    ? `<div class="warnbar muted-warn">이 파일은 setpoint 당 측정 행이 1개여서 <b>고상태 max 집계가 실제로 일어나지 않았습니다</b> — 값은 반복 평균과 동일합니다.</div>` : "";
+  const nz = a.noise || {};
+  const noiseTxt = nz.counting
+    ? `계수 통계 a₁=${fmt(nz.counting.a1, 3)}${nz.poissonFloor ? ` (Poisson 바닥 1/τ=${fmt(nz.poissonFloor, 3)})` : ""} · setpoint 간 초과 a₂=${fmt(nz.a2Excess || 0, 3)}`
+    : `폴백 추정 (원시 반복 없음) a₂=${fmt(nz.a2, 3)}`;
   const cards = `
+  ${warnBound}${warnAgg}
   <div class="cards">
     <div class="card hero"><div class="k">보고 PA (논문 표준: max[분해 front, 점프])${a.paGridLimited ? ' <span class="tag-Low">grid-limited 하한</span>' : ""}</div>
       <div class="v">${a.paGridLimited ? "≥ " : ""}${fmt(a.paReport, 4)}</div>
@@ -40276,7 +40893,8 @@ function renderFitResults(rec, analysis) {
     <div class="card"><div class="k">분해 front s_max${a.sMaxIsLowerBound ? ' <span class="tag-Low">하한값</span>' : ""}</div>
       <div class="v">${fmt(a.sMax, 4)}${boot ? ciStr(boot.ci.sMax) : ""}</div>
       <div class="s">@ P=${fmt(a.sMaxAtP, 4)} W · 스플라인 교차검증 ${fmt(a.sTotMax, 3)}</div>
-      ${a.sMaxIsLowerBound ? `<div class="s tag-Low">기울기가 측정범위 ${a.sMaxEdge === "left" ? "왼쪽" : "오른쪽"} 끝에서 최대 — 실제 s_max는 범위 밖일 수 있음</div>` : ""}</div>
+      ${a.sMaxBoundReason === "range-edge" ? `<div class="s tag-Low">기울기가 측정범위 ${a.sMaxEdge === "left" ? "왼쪽" : "오른쪽"} 끝에서 최대 — 실제 s_max는 범위 밖일 수 있음</div>` : ""}
+      ${a.sMaxBoundReason === "constraint" ? `<div class="s tag-Low">제약 경계에 걸림 — 값이 아니라 하한으로 읽어야 함</div>` : ""}</div>
     <div class="card"><div class="k">임계 파워 (상승 전이 중심 t₁)</div>
       <div class="v">${isFinite(a.thresholdP) ? fmt(a.thresholdP, 4) : "해당 없음"}<span class="s">${isFinite(a.thresholdP) ? " W" : ""}</span>${boot && isFinite(a.thresholdP) ? ciStr(boot.ci.threshold) : ""}</div>
       ${a.thresholdOutOfRange ? '<div class="s tag-Low">측정범위 밖 — 외삽값</div>' : ""}${thDens}</div>
@@ -40285,7 +40903,8 @@ function renderFitResults(rec, analysis) {
       <div class="s">${isFinite(a.saturationP) ? "" : "측정범위 내에서 포화 전이 없음"}${satDens}</div></div>
     <div class="card"><div class="k">선택 모델 (중첩 AICc)</div><div class="v" style="font-size:14px;">H${a.chosenOrder}</div>
       <div class="s">${esc(orderLabel(a))}</div>
-      <div class="s">배경 B=${fmt(a.background, 3)}${boot ? ciStr(boot.ci.B, 3) : ""}</div></div>
+      <div class="s">배경 B=${fmt(a.background, 3)}${boot ? ciStr(boot.ci.B, 3) : ""}</div>
+      <div class="s muted">노이즈: ${esc(nz.source || "-")} · ${esc(noiseTxt)}</div></div>
     <div class="card"><div class="k">품질 지수</div><div class="v"><span class="tag-${qb}">${fmt(q.score, 3)}/100</span></div>
       <div class="s"><span class="tag-${qb}">${qb}</span> · ${q.reportable ? "보고 가능" : "보고 주의"}${boot ? "" : " · 진단 실행 시 확정"}</div>
       <div class="qbar"><div class="q-${qb}" style="width:${Math.round(q.score)}%"></div></div></div>
