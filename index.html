@@ -38695,7 +38695,7 @@ const App = {
   calib: {
     pairs: [{ pm: null, end: null }, { pm: null, end: null }, { pm: null, end: null }], // PM↔endpoint 측정쌍 (1~3회)
     cameraPitch: 6.45,            // 카메라 센서 픽셀 피치 (µm/px, ProgRes 기본)
-    objectives: [],               // 보유 objective 목록 [{maker, model, mag}]
+    objectives: [],               // 보유 objective 목록 [{maker, model, mag, medium, na, f, wd}]
     objSel: -1,                   // 선택된 objective 인덱스 (-1 = 직접 입력)
     objMag: null,                 // 현재 배율 (선택 시 자동 입력, 직접 수정 가능)
     umPerPx: null,                // (구버전 호환) 직접 입력 유효 픽셀 스케일
@@ -39048,6 +39048,7 @@ function lensInfoHtml(c) {
   const bits = [];
   if (isFinite(Number(o.na)) && o.na > 0) bits.push(`NA ${fmt(o.na, 3)}`);
   if (LENS_MEDIA[o.medium]) bits.push(LENS_MEDIA[o.medium]);
+  if (isFinite(Number(o.wd)) && Number(o.wd) > 0) bits.push(`WD = ${fmt(o.wd, 3)} mm`);
   const f = lensFocalMm(o);
   if (f) bits.push(`f = ${fmt(f.mm, 4)} mm` + (f.derived ? ` <span class="muted">(경통렌즈 ${f.tube} mm ÷ ${fmt(o.mag, 4)}× 자동계산)</span>` : ` <span class="muted">(기록값)</span>`));
   let diag = "";
@@ -39239,6 +39240,10 @@ function lensEntry(o) {
   if (LENS_MEDIA[med]) e.medium = med;              // 미지정 렌즈(구버전)는 필드 자체를 생략
   if (isFinite(Number(o.na)) && Number(o.na) > 0) e.na = Number(o.na);
   if (isFinite(Number(o.f)) && Number(o.f) > 0) e.f = Number(o.f);   // 수동 기록 초점거리(mm)
+  // 작동거리(WD, mm) — 초점거리와 달리 유도할 수 없는 순수 기록값이다. 배럴에 적힌
+  // 스펙을 그대로 넣는다. 시료·커버글라스·크라이오스탯 창 두께가 이 값을 넘으면
+  // 애초에 초점이 맺히지 않으므로, 측정 전 확인용으로 목록에 함께 남긴다.
+  if (isFinite(Number(o.wd)) && Number(o.wd) > 0) e.wd = Number(o.wd);
   return e;
 }
 /** 목록 표시용 라벨: "Olympus MPLFLN100X (100×, NA 1.30, Oil)" */
@@ -39246,6 +39251,7 @@ function lensLabel(o) {
   const ex = [];
   if (isFinite(Number(o.na)) && Number(o.na) > 0) ex.push(`NA ${fmt(o.na, 3)}`);
   if (LENS_MEDIA[o.medium]) ex.push(LENS_MEDIA[o.medium]);
+  if (isFinite(Number(o.wd)) && Number(o.wd) > 0) ex.push(`WD ${fmt(o.wd, 3)} mm`);
   return `${o.maker || ""} ${o.model || ""} (${fmt(o.mag, 4)}×${ex.length ? ", " + ex.join(", ") : ""})`;
 }
 /** 표시 목록 = 서버 정본 + (이 PC에서 아직 전송하지 못한 항목).
@@ -39621,6 +39627,7 @@ function openCalibModal() {
           <input id="cb-obj-mag" type="number" step="any" placeholder="배율" style="width:72px">
           <input id="cb-obj-na" type="number" step="any" min="0" placeholder="NA" style="width:70px" title="개구수 (Numerical Aperture) — 선택 입력">
           <input id="cb-obj-f" type="number" step="any" min="0" placeholder="f (mm)" style="width:78px" title="초점거리 — 비워두면 제조사 경통렌즈 기준으로 자동 계산됩니다">
+          <input id="cb-obj-wd" type="number" step="any" min="0" placeholder="WD (mm)" style="width:84px" title="작동거리 (Working Distance) — 렌즈 앞면에서 초점까지의 거리. 시료·커버글라스·창 두께가 이 값을 넘으면 초점이 맺히지 않습니다. 선택 입력">
           <select id="cb-obj-med" title="침지 매질" style="width:96px">
             <option value="air">Air</option>
             <option value="oil">Oil</option>
@@ -39804,12 +39811,18 @@ function openCalibModal() {
     const medium = back.querySelector("#cb-obj-med").value;
     const fRaw = back.querySelector("#cb-obj-f").value;
     const fMm = fRaw === "" ? null : Number(fRaw);
+    const wdRaw = back.querySelector("#cb-obj-wd").value;
+    const wdMm = wdRaw === "" ? null : Number(wdRaw);
     if (fMm !== null && !(isFinite(fMm) && fMm > 0)) { toast("초점거리는 0보다 큰 값이어야 합니다"); return; }
+    // WD 상한 50 mm — 시판 장초점 대물렌즈(저배율 Mitutoyo 계열)도 34 mm 안쪽이다.
+    // 그보다 크면 µm/mm 단위 혼동일 가능성이 높다.
+    if (wdMm !== null && !(isFinite(wdMm) && wdMm > 0 && wdMm <= 50)) { toast("작동거리는 0보다 크고 50 mm 이하여야 합니다 (단위: mm)"); return; }
     if (!(isFinite(mag) && mag > 0)) { toast("배율을 올바르게 입력하세요"); return; }
     if (na !== null && !(isFinite(na) && na > 0 && na < 2.0)) { toast("NA는 0보다 크고 2.0 미만이어야 합니다"); return; }
     if (na !== null && medium === "air" && na >= 1.0) { toast("Air 대물렌즈의 NA는 1.0 미만입니다 — 매질을 확인하세요"); return; }
     c.objectives = c.objectives || [];
     const entry = { maker, model, mag, medium, ...(na !== null ? { na } : {}), ...(fMm !== null ? { f: fMm } : {}),
+      ...(wdMm !== null ? { wd: wdMm } : {}),
       _key: lensKey({ maker, model, mag }) };
     if (c.objectives.some((o) => (o._key || lensKey(o)) === entry._key)) { toast("이미 목록에 있는 렌즈입니다"); return; }
     // 로컬 먼저 반영(오프라인에서도 즉시 사용) → 서버 전송
@@ -39819,7 +39832,7 @@ function openCalibModal() {
     back.querySelector("#cb-mag").value = mag;
     back.querySelector("#cb-obj-maker").value = ""; back.querySelector("#cb-obj-model").value = "";
     back.querySelector("#cb-obj-mag").value = ""; back.querySelector("#cb-obj-na").value = "";
-    back.querySelector("#cb-obj-f").value = "";
+    back.querySelector("#cb-obj-f").value = ""; back.querySelector("#cb-obj-wd").value = "";
     fillObjSelect(); upd();
     if (lensDbUrl()) {
       try { await lensPush(entry); delete entry._pending; saveCalib(); toast("공용 목록에 추가되어 연구실 전체에 공유됩니다"); }
