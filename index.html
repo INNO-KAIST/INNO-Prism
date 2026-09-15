@@ -293,7 +293,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.6.1</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.6.2</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -40594,7 +40594,8 @@ const App = {
     beam: null,                   // fitGaussian2D 결과 (+binFactor)
     metrics: null,                // beamMetrics 결과
     densityMode: "peak",          // peak | e2avg | fwhm
-    areaBasis: "gauss",           // gauss (1/e² Gaussian 피팅) | d4sigma (ISO 11146 회전 D4σ)
+    areaBasis: "d4sigma",         // d4sigma (ISO 11146 회전 D4σ · 기본) | gauss (1/e² Gaussian 피팅)
+    areaBasisUserSet: false,      // true면 사용자가 직접 고른 값 — 기본값 변경 시 덮어쓰지 않는다
     lensDbUrl: null,              // 공용 렌즈 목록 Firebase RTDB URL (빌드 내장값보다 우선)
     lambdaNm: 1064,               // 여기 파장 (회절 한계 대조용)
     enabled: false,
@@ -40887,6 +40888,14 @@ function viewTabLabel(rec) {
 }
 
 /* --------------------------- beam calibration ----------------------------- */
+/** 1단계 파워 측정쌍의 **표시·입력 단위는 µW**, **저장 단위는 W** 로 고정한다.
+ *  실측이 보통 µW~mW 대라 W 로 적으면 0.000622 처럼 앞자리 0 이 길어져 오타가 난다.
+ *  저장을 W 로 두는 이유: 계수 C = end/pm 은 무차원이라 단위에 무관하지만,
+ *  Ledger 로 내보내는 pairs 는 W 로 약속돼 있어 저장 단위를 바꾸면 연동이 깨진다. */
+const CALIB_W_PER_UW = 1e-6;
+const wToUw = (v) => (v == null || !isFinite(v) ? "" : Number((v / CALIB_W_PER_UW).toPrecision(12)));
+const uwToW = (v) => (v === "" || v == null || !isFinite(Number(v)) ? null : Number(v) * CALIB_W_PER_UW);
+
 /** 측정쌍 행 수의 하한·상한. 하한은 "항상 보이는 행 수"일 뿐 입력 의무가 아니다 —
  *  계산은 **실제로 채운 개수**로만 한다(빈 행은 없는 것과 같다). */
 const CALIB_PAIR_MIN = 3;
@@ -41015,10 +41024,27 @@ function beamBasisCompareHtml(c) {
   bits.push(`Gaussian 1/e² 지름: ${um(4 * b.sx)} × ${um(4 * b.sy)} (θ=${fmt(b.theta * 180 / Math.PI, 3)}°)` +
     ` · ISO D4σ: ${um(m.d4sMajor)} × ${um(m.d4sMinor)} (θ=${fmt(m.theta * 180 / Math.PI, 3)}°)`);
   if (isFinite(ratio)) {
-    const dev = Math.abs(ratio - 1);
-    const cls = dev > 0.15 ? "tag-Poor" : dev > 0.07 ? "tag-Low" : "tag-High";
-    const msg = dev > 0.15 ? "빔이 Gaussian에서 크게 벗어남 (날개/평정부) — ISO D4σ 기준 권장"
-      : dev > 0.07 ? "약한 비-Gaussian성" : "Gaussian과 잘 일치 (두 기준 등가)";
+    // 어느 기준이 참값에 가까운가는 **면적비가 정한다**. 합성 빔(가우시안 코어 + 넓은
+    // 받침, 받침 비율 0~40%, 8시드)에서 peak irradiance 환산면적의 참값 대조:
+    //   비 1.00 → Gaussian −0.1% / D4σ −0.6%      (동등)
+    //   비 1.11 → Gaussian −9.4% / D4σ +1.0%      (D4σ 우세)
+    //   비 1.28 → Gaussian −13.8% / D4σ +10.8%    (D4σ 우세, 경계)
+    //   비 1.40 → Gaussian −15.2% / D4σ +19.0%    (역전)
+    //   비 1.89 → Gaussian −18.2% / D4σ +54.8%    (Gaussian 우세)
+    //   비 2.92 → Gaussian −20.9% / D4σ +131%     (D4σ 발산)
+    // 2차 모멘트는 r² 가중이라 희미하고 넓은 받침이 지배한다 — 받침이 커질수록 D4σ 가
+    // 급격히 무너진다. 교차점은 비 ≈ 1.35. 이 수치들이 아래 문턱의 근거다.
+    const cls = ratio > 2 ? "tag-Poor" : ratio > 1.35 ? "tag-Low" : Math.abs(ratio - 1) > 0.07 ? "tag-Low" : "tag-High";
+    const msg = ratio > 2
+      ? "빔이 Gaussian에서 크게 벗어남 — <b>두 기준 모두 파워밀도를 신뢰할 수 없습니다</b>. " +
+        "환산식(A=2πσxσy)이 Gaussian 항등식이라 비-Gaussian 빔에서는 어느 쪽도 참 peak irradiance 가 아닙니다. " +
+        "정렬·초점을 먼저 확인하세요 (그래도 써야 한다면 이 구간에서는 Gaussian 피팅 쪽이 덜 틀립니다)"
+      : ratio > 1.35
+      ? "받침/날개가 뚜렷함 — <b>이 구간부터는 Gaussian 피팅이 더 정확합니다</b> (참값 대조 교차점 ≈ 1.35). " +
+        "2차 모멘트는 r² 가중이라 넓은 받침에 끌려갑니다"
+      : Math.abs(ratio - 1) > 0.07
+      ? "약한 비-Gaussian성 — 이 구간에서는 <b>ISO D4σ(기본)가 더 정확합니다</b> (비 1.11 에서 D4σ +1% vs Gaussian −9%)"
+      : "Gaussian과 잘 일치 (두 기준 등가 — 기본 D4σ 유지 권장)";
     bits.push(`면적비 D4σ/Gaussian = <b class="${cls}">${fmt(ratio, 4)}</b> — <span class="${cls}">${msg}</span>`);
   }
   if (isFinite(naive)) {
@@ -41506,6 +41532,9 @@ function loadCalib() {
     if (c && typeof c === "object") Object.assign(App.calib, c);
   } catch (e) {}
   normalizeCalibPairs(App.calib);
+  // 면적 기준 기본값이 gauss → d4sigma 로 바뀌었다. **직접 고른 값은 건드리지 않는다** —
+  // 옛 저장본에 남은 "gauss" 는 고른 것이 아니라 그때의 기본값일 뿐이므로 그것만 옮긴다.
+  if (!App.calib.areaBasisUserSet && App.calib.areaBasis === "gauss") App.calib.areaBasis = "d4sigma";
 }
 
 function openCalibModal() {
@@ -41519,8 +41548,8 @@ function openCalibModal() {
    *  숨긴 행의 값은 삭제 시점에 지우므로, 보이지 않는 값이 계산에 섞이지 않는다. */
   const pairRow = (i) => `<tr class="cb-pair-row" data-i="${i}"${i < c.pairRows ? "" : ' style="display:none"'}>
     <td>#${i + 1}</td>
-    <td><input class="cb-pm" data-i="${i}" type="number" step="any" value="${c.pairs[i] && c.pairs[i].pm != null ? c.pairs[i].pm : ""}" style="width:130px"></td>
-    <td><input class="cb-end" data-i="${i}" type="number" step="any" value="${c.pairs[i] && c.pairs[i].end != null ? c.pairs[i].end : ""}" style="width:130px"></td>
+    <td><input class="cb-pm" data-i="${i}" type="number" step="any" value="${c.pairs[i] ? wToUw(c.pairs[i].pm) : ""}" style="width:130px"></td>
+    <td><input class="cb-end" data-i="${i}" type="number" step="any" value="${c.pairs[i] ? wToUw(c.pairs[i].end) : ""}" style="width:130px"></td>
     <td class="mono small cb-ratio" data-i="${i}"></td></tr>`;
   back.innerHTML = `<div class="modal">
     <h2>빔 파워 보정 → 파워밀도 환산 <span class="muted small">(mW/cm² ~ MW/cm² 자동 단위)</span></h2>
@@ -41543,7 +41572,7 @@ function openCalibModal() {
       1행이면 그 비율을 그대로, 2행 이상이면 원점 통과 linear fit 기울기를 씁니다.
       ${CALIB_PAIR_MIN}행 이상 채우면 기울기의 <b>표준오차</b>까지 나옵니다.</div>
       <table class="res" style="max-width:520px;">
-        <tr><th></th><th>Powermeter 표시값 (W)</th><th>Endpoint 실측값 (W)</th><th>비율</th></tr>
+        <tr><th></th><th>Powermeter 표시값 (µW)</th><th>Endpoint 실측값 (µW)</th><th>비율</th></tr>
         ${pairRow(0)}${pairRow(1)}${pairRow(2)}${pairRow(3)}${pairRow(4)}
       </table>
       <div class="flex small" style="margin-top:6px;gap:8px;align-items:center;">
@@ -41606,8 +41635,8 @@ function openCalibModal() {
           <option value="e2avg">1/e² 면적 내 평균 (86.5% power)</option>
           <option value="fwhm">FWHM 면적 내 평균 (50% power)</option></select></label>
         <label class="ctl"><span>면적 기준 (빔 폭 정의)</span><select id="cb-basis">
-          <option value="gauss">회전 Gaussian 피팅 1/e² (기본)</option>
-          <option value="d4sigma">ISO 11146 회전 D4σ (2차 모멘트·모델 무가정)</option></select></label>
+          <option value="d4sigma">ISO 11146 회전 D4σ (2차 모멘트·모델 무가정) · 기본</option>
+          <option value="gauss">회전 Gaussian 피팅 1/e² (모델 가정)</option></select></label>
       </div>
       <div id="cb-beam-status" class="small muted" style="margin-top:6px;">${c.metrics ? "" : "이미지를 열면 자동으로 피팅됩니다."}</div>
       <div id="cb-beam-chart" class="chart" style="height:340px;display:${c.beam ? "" : "none"};"></div>
@@ -41643,7 +41672,7 @@ function openCalibModal() {
     for (let i = 0; i < c.pairRows; i++) {
       const pmEl = back.querySelector(`.cb-pm[data-i="${i}"]`), enEl = back.querySelector(`.cb-end[data-i="${i}"]`);
       if (!pmEl || !enEl) continue;
-      c.pairs[i] = { pm: pmEl.value === "" ? null : Number(pmEl.value), end: enEl.value === "" ? null : Number(enEl.value) };
+      c.pairs[i] = { pm: uwToW(pmEl.value), end: uwToW(enEl.value) };   // 입력 µW → 저장 W
       const r = c.pairs[i].pm > 0 && c.pairs[i].end > 0 ? c.pairs[i].end / c.pairs[i].pm : NaN;
       back.querySelector(`.cb-ratio[data-i="${i}"]`).textContent = isFinite(r) ? "×" + fmt(r, 5) : "";
     }
@@ -41651,7 +41680,7 @@ function openCalibModal() {
     c.objMag = back.querySelector("#cb-mag").value === "" ? null : Number(back.querySelector("#cb-mag").value);
     c.densityMode = back.querySelector("#cb-mode").value;
     const basisSel = back.querySelector("#cb-basis");
-    if (basisSel) c.areaBasis = basisSel.value;
+    if (basisSel && basisSel.value !== c.areaBasis) { c.areaBasis = basisSel.value; c.areaBasisUserSet = true; }
     c.enabled = back.querySelector("#cb-enable").checked;
     const lam = Number(back.querySelector("#cb-lambda").value);
     if (isFinite(lam) && lam > 0) c.lambdaNm = lam;
@@ -41686,7 +41715,7 @@ function openCalibModal() {
     if (infoEl) infoEl.innerHTML = lensInfoHtml(c);
     const lamEl = back.querySelector("#cb-lambda");
     if (lamEl && document.activeElement !== lamEl) lamEl.value = c.lambdaNm || "";
-    const basisName = c.areaBasis === "d4sigma" ? "ISO 11146 회전 D4σ" : "회전 Gaussian 1/e²";
+    const basisName = c.areaBasis === "gauss" ? "회전 Gaussian 1/e²" : "ISO 11146 회전 D4σ";
     back.querySelector("#cb-beam-out").innerHTML = m ? [
       `<b>[${basisName}]</b> 지름 (4σ): <b>${fmt(m.d1e2Xum, 4)} × ${fmt(m.d1e2Yum, 4)} µm</b> (θ=${fmt(m.thetaDeg, 3)}°)`,
       `FWHM: ${fmt(m.fwhmXum, 4)} × ${fmt(m.fwhmYum, 4)} µm · σ: ${fmt(m.sigmaXum, 4)} × ${fmt(m.sigmaYum, 4)} µm`,
@@ -41703,7 +41732,7 @@ function openCalibModal() {
         `예: PM 1 mW → <b>${fmtDensityAuto(0.001 * k, 5)}</b>`
       : `<span class="muted">계수(1단계)와 빔 면적(2단계)이 준비되면 환산식이 표시됩니다.</span>`;
     back.querySelector("#cb-mode").value = c.densityMode || "peak";
-    back.querySelector("#cb-basis").value = c.areaBasis || "gauss";
+    back.querySelector("#cb-basis").value = c.areaBasis || "d4sigma";
     if (c.beam) drawBeamChart();
   };
   const drawBeamChart = () => {
