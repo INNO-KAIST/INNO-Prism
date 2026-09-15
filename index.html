@@ -293,7 +293,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.6.0</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.6.1</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -40584,7 +40584,8 @@ const App = {
       envelope: false, spline: false, weights: false, bootband: false, norm: false },
   },
   calib: {
-    pairs: [{ pm: null, end: null }, { pm: null, end: null }, { pm: null, end: null }], // PM↔endpoint 측정쌍 (1~3회)
+    pairs: [{ pm: null, end: null }, { pm: null, end: null }, { pm: null, end: null }], // PM↔endpoint 측정쌍 (행 3~5개, 채운 만큼만 계산)
+    pairRows: 3,                  // 표에 띄울 측정쌍 행 수 (CALIB_PAIR_MIN~CALIB_PAIR_MAX)
     cameraPitch: 6.45,            // 카메라 센서 픽셀 피치 (µm/px, ProgRes 기본)
     objectives: [],               // 보유 objective 목록 [{maker, model, mag, medium, na, f, wd}]
     objSel: -1,                   // 선택된 objective 인덱스 (-1 = 직접 입력)
@@ -40886,8 +40887,36 @@ function viewTabLabel(rec) {
 }
 
 /* --------------------------- beam calibration ----------------------------- */
-/** C = P_sample / P_PM  from 1–3 (PM, endpoint) pairs.
- *  1 pair → plain ratio; 2–3 pairs → through-origin weighted LSQ slope. */
+/** 측정쌍 행 수의 하한·상한. 하한은 "항상 보이는 행 수"일 뿐 입력 의무가 아니다 —
+ *  계산은 **실제로 채운 개수**로만 한다(빈 행은 없는 것과 같다). */
+const CALIB_PAIR_MIN = 3;
+const CALIB_PAIR_MAX = 5;
+
+/** pairs 배열과 pairRows 를 항상 유효한 상태로 맞춘다.
+ *  - 구버전 저장본(행 3개 고정)이나 손상된 값이 들어와도 여기서 수습한다.
+ *  - pairRows 가 없으면 **채워진 마지막 행 위치**에서 되살린다 — 5행을 쓰던 사람이
+ *    다시 열었을 때 5행이 그대로 보여야 하기 때문이다. */
+function normalizeCalibPairs(c) {
+  if (!Array.isArray(c.pairs)) c.pairs = [];
+  c.pairs = c.pairs.slice(0, CALIB_PAIR_MAX).map((q) => ({
+    pm: q && isFinite(q.pm) ? Number(q.pm) : null,
+    end: q && isFinite(q.end) ? Number(q.end) : null,
+  }));
+  let lastFilled = 0;
+  c.pairs.forEach((q, i) => { if (q.pm != null || q.end != null) lastFilled = i + 1; });
+  let rows = Number(c.pairRows);
+  if (!isFinite(rows)) rows = lastFilled;          // 구버전 저장본: 데이터에서 복원
+  rows = Math.max(CALIB_PAIR_MIN, Math.min(CALIB_PAIR_MAX, Math.round(rows) || 0));
+  rows = Math.max(rows, lastFilled);               // 채워진 행이 숨겨지는 일은 없어야 한다
+  c.pairRows = rows;
+  while (c.pairs.length < rows) c.pairs.push({ pm: null, end: null });
+  c.pairs.length = rows;
+  return c;
+}
+
+/** C = P_sample / P_PM  from 1–CALIB_PAIR_MAX (PM, endpoint) pairs.
+ *  1 pair → plain ratio; 2+ pairs → through-origin LSQ slope.
+ *  3+ pairs → 잔차로 기울기 표준오차까지 낸다(원점 통과이므로 dof = n−1). */
 function calibCoefficient() {
   const c0 = App.calib;
   if (c0.sessionActive && c0.session && isFinite(c0.session.coefficient)) {
@@ -40904,7 +40933,15 @@ function calibCoefficient() {
     C = sxy / sxx;
   }
   const spreadPct = ratios.length > 1 ? 100 * (Math.max(...ratios) - Math.min(...ratios)) / C : NaN;
-  return { C, nPairs: pairs.length, ratios, spreadPct };
+  // 기울기 표준오차 — 점이 3개 이상일 때만 낸다. n=2 는 dof=1 이라 수치는 나오지만
+  // 읽을 값이 못 된다(잔차 하나로 산포를 추정하는 셈). 내지 않는 편이 정직하다.
+  let seC = NaN;
+  if (pairs.length >= 3) {
+    let ss = 0, sxx2 = 0;
+    for (const q of pairs) { const r = q.end - C * q.pm; ss += r * r; sxx2 += q.pm * q.pm; }
+    seC = Math.sqrt(ss / (pairs.length - 1) / sxx2);
+  }
+  return { C, nPairs: pairs.length, ratios, spreadPct, seC };
 }
 /** 유효 픽셀 크기 (µm/px) = 카메라 피치 / objective 배율. 구버전 직접입력 fallback. */
 function calibEffUmPerPx() {
@@ -41468,15 +41505,19 @@ function loadCalib() {
     const c = JSON.parse(localStorage.getItem("innoPrismCalib2") || "null");
     if (c && typeof c === "object") Object.assign(App.calib, c);
   } catch (e) {}
-  if (!Array.isArray(App.calib.pairs)) App.calib.pairs = [{ pm: null, end: null }, { pm: null, end: null }, { pm: null, end: null }];
+  normalizeCalibPairs(App.calib);
 }
 
 function openCalibModal() {
   const c = App.calib;
-  if (!Array.isArray(c.pairs)) c.pairs = [{ pm: null, end: null }, { pm: null, end: null }, { pm: null, end: null }];
+  normalizeCalibPairs(c);
   const back = document.createElement("div");
   back.className = "modal-back";
-  const pairRow = (i) => `<tr>
+  /** 행은 **항상 CALIB_PAIR_MAX 개를 그려 두고** 현재 행 수 밖은 숨긴다.
+   *  행을 추가/삭제할 때마다 표를 다시 만들면 입력 리스너를 매번 다시 걸어야 하고,
+   *  그 재바인딩이 빠지는 것이 이런 UI 에서 가장 흔한 결함이다. 숨기기는 그 위험이 없다.
+   *  숨긴 행의 값은 삭제 시점에 지우므로, 보이지 않는 값이 계산에 섞이지 않는다. */
+  const pairRow = (i) => `<tr class="cb-pair-row" data-i="${i}"${i < c.pairRows ? "" : ' style="display:none"'}>
     <td>#${i + 1}</td>
     <td><input class="cb-pm" data-i="${i}" type="number" step="any" value="${c.pairs[i] && c.pairs[i].pm != null ? c.pairs[i].pm : ""}" style="width:130px"></td>
     <td><input class="cb-end" data-i="${i}" type="number" step="any" value="${c.pairs[i] && c.pairs[i].end != null ? c.pairs[i].end : ""}" style="width:130px"></td>
@@ -41497,12 +41538,19 @@ function openCalibModal() {
       <div id="lg-status" class="small" style="margin-top:6px;"></div>
     </details>
     <div class="panel"><h3>1단계 · 파워 보정 (Powermeter ↔ 시료 위치 실측)</h3>
-      <div class="small muted" style="margin-bottom:6px;">같은 조건에서 powermeter 표시값과 시료 직전(endpoint)에서 실측한 값을 1~3회 입력하세요.
-      1회 입력 시 그 비율을 그대로, 2~3회 입력 시 원점 통과 linear fit 기울기를 적용합니다.</div>
+      <div class="small muted" style="margin-bottom:6px;">같은 조건에서 powermeter 표시값과 시료 직전(endpoint)에서 실측한 값을 입력하세요.
+      기본 ${CALIB_PAIR_MIN}행이며 <b>최대 ${CALIB_PAIR_MAX}행</b>까지 늘릴 수 있습니다 — <b>채운 행 수에 맞춰 계산합니다</b>(빈 행은 무시).
+      1행이면 그 비율을 그대로, 2행 이상이면 원점 통과 linear fit 기울기를 씁니다.
+      ${CALIB_PAIR_MIN}행 이상 채우면 기울기의 <b>표준오차</b>까지 나옵니다.</div>
       <table class="res" style="max-width:520px;">
         <tr><th></th><th>Powermeter 표시값 (W)</th><th>Endpoint 실측값 (W)</th><th>비율</th></tr>
-        ${pairRow(0)}${pairRow(1)}${pairRow(2)}
+        ${pairRow(0)}${pairRow(1)}${pairRow(2)}${pairRow(3)}${pairRow(4)}
       </table>
+      <div class="flex small" style="margin-top:6px;gap:8px;align-items:center;">
+        <button id="cb-pair-add" class="small" title="측정쌍 행을 하나 늘립니다 (최대 ${CALIB_PAIR_MAX}행)">행 추가 +</button>
+        <button id="cb-pair-del" class="small" title="마지막 행을 지웁니다 (최소 ${CALIB_PAIR_MIN}행). 그 행에 입력값이 있으면 함께 지워집니다">행 삭제 −</button>
+        <span id="cb-pair-count" class="muted small"></span>
+      </div>
       <div id="cb-coef" class="small mono" style="margin-top:6px;"></div></div>
     <div class="panel"><h3>2단계 · ProgRes 빔 이미지 → 유효 면적 (회전 타원 2D Gaussian + 배경, 포화픽셀 제외)</h3>
       <div class="flex small" style="gap:12px;">
@@ -41589,8 +41637,12 @@ function openCalibModal() {
     sel.value = String(c.objSel != null ? c.objSel : -1);
   };
   const upd = () => {
-    for (let i = 0; i < 3; i++) {
+    // 보이는 행만 읽는다 — c.pairs 의 길이 자체가 현재 행 수가 되므로,
+    // 숨은 행의 잔재가 계수에 섞일 여지가 없다.
+    c.pairs.length = c.pairRows;
+    for (let i = 0; i < c.pairRows; i++) {
       const pmEl = back.querySelector(`.cb-pm[data-i="${i}"]`), enEl = back.querySelector(`.cb-end[data-i="${i}"]`);
+      if (!pmEl || !enEl) continue;
       c.pairs[i] = { pm: pmEl.value === "" ? null : Number(pmEl.value), end: enEl.value === "" ? null : Number(enEl.value) };
       const r = c.pairs[i].pm > 0 && c.pairs[i].end > 0 ? c.pairs[i].end / c.pairs[i].pm : NaN;
       back.querySelector(`.cb-ratio[data-i="${i}"]`).textContent = isFinite(r) ? "×" + fmt(r, 5) : "";
@@ -41616,8 +41668,19 @@ function openCalibModal() {
       ? `계수 C = <b>${fmt(cc.C, 6)}</b> <span class="muted small">(Ledger 보정 세션에서 자동 적용됨 — 아래 측정쌍 입력은 지금 무시됩니다. 직접 입력하려면 상단 배지를 눌러 세션을 해제하세요)</span>`
       : cc.nPairs
       ? `계수 C = P<sub>시료</sub>/P<sub>PM</sub> = <b>${fmt(cc.C, 6)}</b> (${cc.nPairs}회 ${cc.nPairs > 1 ? "linear fit" : "단일 비율"})` +
-        (isFinite(cc.spreadPct) ? ` · 회차 간 편차 ${fmt(cc.spreadPct, 3)}%` : "")
+        (isFinite(cc.spreadPct) ? ` · 회차 간 편차 ${fmt(cc.spreadPct, 3)}%` : "") +
+        (isFinite(cc.seC) && cc.seC > 0
+          ? ` · 기울기 표준오차 ±${fmt(cc.seC, 3)} (${fmt(100 * cc.seC / Math.abs(cc.C), 3)}%)`
+          : cc.nPairs === 2 ? ` <span class="muted">· 표준오차는 ${CALIB_PAIR_MIN}회부터 (2회는 dof=1 이라 의미 없음)</span>` : "")
       : `<span class="muted">측정쌍을 입력하세요.</span>`;
+    const cntEl = back.querySelector("#cb-pair-count");
+    if (cntEl) {
+      const filled = (c.pairs || []).filter((q) => isFinite(q.pm) && q.pm > 0 && isFinite(q.end) && q.end > 0).length;
+      cntEl.textContent = `행 ${c.pairRows}개 (최소 ${CALIB_PAIR_MIN} · 최대 ${CALIB_PAIR_MAX}) · 채운 측정쌍 ${filled}개`;
+    }
+    const addBtn = back.querySelector("#cb-pair-add"), delBtn = back.querySelector("#cb-pair-del");
+    if (addBtn) addBtn.disabled = c.pairRows >= CALIB_PAIR_MAX;
+    if (delBtn) delBtn.disabled = c.pairRows <= CALIB_PAIR_MIN;
     const m = c.metrics;
     const infoEl = back.querySelector("#cb-lens-info");
     if (infoEl) infoEl.innerHTML = lensInfoHtml(c);
@@ -41687,6 +41750,35 @@ function openCalibModal() {
       legend: { orientation: "h", y: 1.08, x: 0, bgcolor: "rgba(0,0,0,0)", font: { size: 11 } },
     });
   };
+  /** 행 수 조절. 표시/숨김만 바꾸고 표를 다시 만들지 않으므로 리스너는 그대로 유효하다. */
+  const setPairRows = (next) => {
+    const rows = Math.max(CALIB_PAIR_MIN, Math.min(CALIB_PAIR_MAX, next));
+    if (rows === c.pairRows) return;
+    if (rows < c.pairRows) {
+      // 지워지는 행의 입력값을 실제로 비운다 — 보이지 않는 값이 남아 나중에
+      // 행을 다시 늘렸을 때 되살아나면, 사용자가 지운 줄 아는 값이 계수에 들어간다.
+      let hadValue = false;
+      for (let i = rows; i < c.pairRows; i++) {
+        const pmEl = back.querySelector(`.cb-pm[data-i="${i}"]`), enEl = back.querySelector(`.cb-end[data-i="${i}"]`);
+        if (pmEl && pmEl.value !== "") hadValue = true;
+        if (enEl && enEl.value !== "") hadValue = true;
+        if (pmEl) pmEl.value = "";
+        if (enEl) enEl.value = "";
+        const rEl = back.querySelector(`.cb-ratio[data-i="${i}"]`);
+        if (rEl) rEl.textContent = "";
+        c.pairs[i] = { pm: null, end: null };
+      }
+      if (hadValue) toast(`#${rows + 1}${c.pairRows > rows + 1 ? `~#${c.pairRows}` : ""} 행의 입력값도 함께 지웠습니다`, 3000);
+    }
+    c.pairRows = rows;
+    back.querySelectorAll(".cb-pair-row").forEach((tr) => {
+      tr.style.display = Number(tr.dataset.i) < rows ? "" : "none";
+    });
+    upd();
+  };
+  const addBtnEl = back.querySelector("#cb-pair-add"), delBtnEl = back.querySelector("#cb-pair-del");
+  if (addBtnEl) addBtnEl.addEventListener("click", () => setPairRows(c.pairRows + 1));
+  if (delBtnEl) delBtnEl.addEventListener("click", () => setPairRows(c.pairRows - 1));
   back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda").forEach((el) => el.addEventListener("change", upd));
   fillObjSelect();
   back.querySelector("#cb-obj").addEventListener("change", () => {
