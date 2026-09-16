@@ -293,7 +293,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.12.0</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.12.1</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -37783,12 +37783,13 @@ function analyze(branch, opts) {
       location: sLowerBound && isFinite(sLowerBound.pLo) && isFinite(sLowerBound.pHi)
         ? Math.sqrt(sLowerBound.pLo * sLowerBound.pHi) : NaN,
       locationKind: "secant", locationObservable: true,
+      bracketsTransition: false,   // 아래 앵커가 이미 점등 — 전이 내부
       ok: isFinite(lbSlope) },
     { name: "jump", kind: "bound", value: jumpSlope, basis: "jump",
       dlogP: paJump ? paJump.dlogP : null,
       location: paJump ? paJump.pth : NaN, locationKind: "ignition", locationObservable: true,
-      ok: !!paJump && isFinite(jumpSlope),
-      why: "아래쪽 앵커가 암구간에 있어 암잡음을 그대로 물려받는다" },
+      bracketsTransition: true,    // 암 → 점등 을 감싼다 (PA 차수의 정의)
+      ok: !!paJump && isFinite(jumpSlope) },
     { name: "local-fit", kind: o.localFitHeadline === true ? "point" : "diagnostic",
       value: localFit ? localFit.sMax : NaN, basis: "local", prefer: 2,
       location: localFit ? localFit.sMaxAtP : NaN, locationKind: "local", locationObservable: true,
@@ -37801,12 +37802,44 @@ function analyze(branch, opts) {
       locationObservable: sMaxObservable.observable !== false,
       ok: !sMaxLowerBound && sMaxObservable.observable !== false,
       why: sMaxObservable.observable === false ? sMaxObservable.why
-        : (sMaxLowerBound ? `제약·가장자리에 걸림(${sMaxBoundReason || "constraint"}) — 점추정으로 읽을 수 없다` : null) },
+        : (sMaxLowerBound ? `제약·가장자리에 걸림(${boundHits.length ? "constraint" : (secantExceeds ? "secant" : "range-edge")}) — 점추정으로 읽을 수 없다` : null) },
     { name: "spline-total", kind: "diagnostic", value: sTotMax, location: Math.pow(10, xTotMax),
       why: "총기울기(신호+암)라 항상 신호기울기 이하 — 교차검증용" },
   ];
+  /* v3.12.1 — 결정 앵커가 **점멸 점**이면 그 숫자가 얼마나 무른지 같이 낸다.
+   * 반복측정의 최솟값/평균/최댓값을 앵커로 두었을 때의 기울기 범위를 보고한다.
+   * 값을 바꾸지는 않는다 — 보고값의 불확실도를 숨기지 않는 것이 목적이다. */
+  let anchorSensitivity = null;
+  try {
+    const trP = o.paTrace && o.paTrace.P, trI = o.paTrace && o.paTrace.I, trR = o.paTrace && o.paTrace.Iraw;
+    if (paJump && trP && trI && trR && isFinite(paJump.pth)) {
+      let iHi = -1, bestD = Infinity;
+      for (let i = 1; i < trP.length; i++) {
+        const mid = Math.sqrt(trP[i] * trP[i - 1]);
+        const dd = Math.abs(Math.log10(mid / paJump.pth));
+        if (dd < bestD && trI[i] > trI[i - 1]) { bestD = dd; iHi = i; }
+      }
+      if (iHi > 0 && Array.isArray(trR[iHi]) && trR[iHi].length >= 3) {
+        const reps = trR[iHi].filter(isFinite).slice().sort((a2, b2) => a2 - b2);
+        const mu = reps.reduce((a2, b2) => a2 + b2, 0) / reps.length;
+        const sd = Math.sqrt(reps.reduce((a2, v) => a2 + (v - mu) * (v - mu), 0) / reps.length);
+        const cv = mu > 0 ? sd / mu : NaN;
+        const D0 = trI[iHi - 1], h = Math.log10(trP[iHi] / trP[iHi - 1]);
+        const sl = (v) => (v > 0 && D0 > 0 && h > 0) ? Math.log10(v / D0) / h : NaN;
+        anchorSensitivity = {
+          iAnchor: iHi, P: trP[iHi], reps, cv,
+          blinking: isFinite(cv) && cv > 0.35,
+          slopeAtMin: sl(reps[0]), slopeAtMean: sl(mu), slopeAtMax: sl(reps[reps.length - 1]),
+        };
+      }
+    }
+  } catch (e) { anchorSensitivity = null; }
   const paSelect = selectPA(estimators, {});
   if (paJump) paJump.supersededByBound = !!(paSelect.source === "secant" && isFinite(jumpSlope) && jumpSlope < lbSlope);
+  paSelect.anchorSensitivity = anchorSensitivity;
+  if (anchorSensitivity && anchorSensitivity.blinking && isFinite(anchorSensitivity.slopeAtMin) && isFinite(anchorSensitivity.slopeAtMax))
+    paSelect.notes.unshift(`결정 앵커가 점멸 점(CV ${(100 * anchorSensitivity.cv).toFixed(0)}%) — 그 점을 반복 최솟값/최댓값으로 두면 기울기가 `
+      + `${anchorSensitivity.slopeAtMin.toFixed(1)} ~ ${anchorSensitivity.slopeAtMax.toFixed(1)} 로 움직인다. 보고값의 자릿수를 신뢰하지 말 것`);
   let paReport = paSelect.value, paReportDlogP = paSelect.dlogP, paReportBasis = paSelect.basis || "parametric";
   let paSource;
   if (paSelect.source === "jump") paSource = "jump";
@@ -38043,7 +38076,7 @@ function analyze(branch, opts) {
       poissonFloor: (o.counting && isFinite(o.acqTime) && o.acqTime > 0) ? 1 / o.acqTime : null },
     spline: { lambda: splineC.lambda, edf: splineC.edf, monotone: !!o.monotone },
     grid, sTot, sSig, modelCurve, splineCurve,
-    sMaxObservable, sMaxObs, sMaxObsAtP, paSelect,
+    sMaxObservable, sMaxObs, sMaxObsAtP, paSelect, anchorSensitivity,
     fitsSummary: Object.fromEntries(Object.entries(fits).map(([k2, f]) => [k2, f ? { aicc: f.aicc, chi2: f.chi2, k: f.k } : null])),
     chosenOrder: chosen, params: p, theta: fit.theta, paramSE,
     paReport, paSource, paGridLimited, paReportDlogP, paReportBasis,
@@ -40069,10 +40102,32 @@ function selectPA(est, ctx) {
     if (e.ok === false) { rejected.push({ name: e.name, value: e.value, why: e.why || "사용 조건 미충족" }); continue; }
     keep.push(e);
   }
+  /* 하한끼리의 선택 — v3.12.1 정정.
+   * 처음엔 "둘 다 하한이니 큰 쪽이 더 강한 진술" 로 두었는데 **틀렸다**. 그 규칙은
+   * 두 하한이 똑같이 잘 정의되어 있을 때만 성립하고, 점화 근처의 확률적 스위칭이
+   * 바로 그 전제를 깬다. WJ-0075c 에서 두 추정기가 **같은 점멸 점**(CV 76%)을
+   * 앵커로 쓰는데, 그 점을 최솟값/평균/최댓값 중 무엇으로 두느냐에 따라
+   *     jump   29.0 → 102.8 → 147.1
+   *     secant 180.6 → 116.5 →  78.0
+   * 으로 **순서가 뒤집힌다**. 크기 비교는 동전 던지기였다.
+   *
+   * 그래서 크기가 아니라 **구간이 무엇을 감싸는가** 로 고른다:
+   *   · jump   구간 = 암 → 점등 — 물리적 전이를 **감싼다**
+   *   · secant 구간 = 부분점등 → 완전점등 — 전이 **내부**이고, 아래 앵커가
+   *     부분 점화 상태들의 평균이라 시스템이 실제로 존재한 적 없는 상태다.
+   * 전이를 감싸는 구간이 PA 차수의 정의에 맞으므로 jump 를 우선한다. */
   const bounds = keep.filter((e) => e.kind === "bound");
+  const brackets = bounds.filter((e) => e.bracketsTransition);
   let best = null;
-  for (const e of bounds) if (!best || e.value > best.value) best = e;
-  for (const e of bounds) if (e !== best) rejected.push({ name: e.name, value: e.value, why: `더 강한 하한(${best.name} = ${best.value.toFixed(3)})에 밀림` });
+  if (brackets.length) { for (const e of brackets) if (!best || e.value > best.value) best = e; }
+  else { for (const e of bounds) if (!best || e.value > best.value) best = e; }
+  for (const e of bounds) {
+    if (e === best) continue;
+    rejected.push({ name: e.name, value: e.value,
+      why: (best && best.bracketsTransition && !e.bracketsTransition)
+        ? `구간이 전이 내부(부분점등→완전점등)라 PA 차수의 정의에 맞지 않음 — 전이를 감싸는 ${best.name}=${best.value.toFixed(3)} 채택`
+        : `더 강한 하한(${best.name} = ${best.value.toFixed(3)})에 밀림` });
+  }
   const bound = best;
   // 점추정은 "하한과 모순되지 않을 때만" 살아남는다 — 하한이 더 강한 진술이기 때문.
   const points = [];
@@ -42183,10 +42238,15 @@ function paSelectHtml(a) {
   const rows = (S.rejected || []).slice().sort((u, v) => (v.value || 0) - (u.value || 0))
     .map((q) => `<tr><td>${esc(q.name)}</td><td class="num">${isFinite(q.value) ? fmt(q.value, 4) : "—"}</td><td>${esc(q.why || "")}</td></tr>`).join("");
   const notes = (S.notes || []).map((n) => `<div class="s" style="color:var(--s7)">⚠ ${esc(n)}</div>`).join("");
+  const AS = S.anchorSensitivity;
+  const sens = (AS && AS.blinking && isFinite(AS.slopeAtMin) && isFinite(AS.slopeAtMax))
+    ? `<div class="s" style="color:var(--s7)">점멸 앵커 민감도 — 반복 [${AS.reps.join(", ")}] (CV ${fmt(100 * AS.cv, 3)}%):`
+      + ` 최솟값 ${fmt(AS.slopeAtMin, 4)} · 평균 <b>${fmt(AS.slopeAtMean, 4)}</b> · 최댓값 ${fmt(AS.slopeAtMax, 4)}`
+      + ` <span class="muted">— 이 폭이 보고값의 실질 불확실도입니다</span></div>` : "";
   return `<div class="s" style="margin-top:6px">PA 중재: <b>${fmt(S.value, 4)}</b>`
     + ` <span class="muted">(${S.kind === "bound" ? "하한" : S.kind === "point" ? "점추정" : "없음"} · 출처 ${esc(S.source || "-")}`
     + ` · 위치 P=${fmt(S.location, 4)} ${esc(S.locationKind || "")})</span></div>`
-    + notes
+    + notes + sens
     + (rows ? `<table class="mini" style="margin-top:4px"><thead><tr><th>기각된 추정기</th><th class="num">값</th><th>사유</th></tr></thead><tbody>${rows}</tbody></table>` : "");
 }
 function integrityHtml(q, imgW) {
