@@ -293,7 +293,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.11.1</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.12.0</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -37544,6 +37544,18 @@ function analyze(branch, opts) {
   const thresholdP = chosen >= 1 && p.k2 > p.k1 + 0.2 ? Math.pow(10, p.t1) : NaN;
   const saturationP = chosen === 2 && p.k2 > p.k3 + 0.2 ? Math.pow(10, p.t2) : (chosen === 1 && p.k2 < p.k1 - 0.2 ? Math.pow(10, p.t1) : NaN);
   const sMaxAtP = Math.pow(10, xAtMax);
+  /* ------------------------------------------------------------------ v3.12
+   * **관측 가능성 게이트.**  이 모델은 I = B + 10^h(x) 이고 sSig = dh/dx 는
+   * *숨은 신호 성분* 10^h 의 기울기다. 암구간에서는 10^h ≪ 잡음 이므로 관측된
+   * 곡선은 B 에서 평평하고, 데이터가 말하는 것은 "10^h 가 잡음보다 작다"는
+   * **부등식**뿐이다. 그 구간의 k1 은 식별되지 않는다 — 충분히 작기만 하면
+   * 어떤 값이든 똑같이 잘 맞는다. 그런데 dh/dx = k1 은 그 평평한 구간 전체에서
+   * 일정하므로 argmax 가 **맨 왼쪽 점**을 집고, 그 결과 "최대 PA 위치" 가
+   * 베이스라인 시작점에 찍힌다. (WJ-0075c: 보고 위치에서 모델 신호 성분이
+   * 8×10⁻⁸ counts — 암레벨 122 counts 의 10⁻⁹ 배였다.)
+   * 그래서 보고 위치에서 모델 신호가 검출 게이트를 넘는지 함께 낸다. */
+  const sigAtMax = modelI(p, xAtMax, chosen) - (isFinite(p.B) ? p.B : 0);
+  const sMaxObservable = { signal: sigAtMax, gate: NaN, observable: true, why: null };
   // edge-censoring: slope still rising (or falling) at the boundary of the
   // measured range → sMax is only a bound; threshold outside measured range.
   const edgeTol = 0.02 * (xhi - xlo);
@@ -37609,6 +37621,26 @@ function analyze(branch, opts) {
   let ignition = null, thresholdBracket = null, thresholdSource = "model", thresholdPModel = thresholdP;
   let thresholdUsed = thresholdP;
   try { ignition = ignitionBracket(x, I, {}); } catch (e) { ignition = null; }
+  /* v3.12 — 검출 게이트가 정해진 뒤에 관측 가능성을 판정한다. */
+  let sMaxObs = NaN, sMaxObsAtP = NaN;
+  {
+    const gate = ignition && isFinite(ignition.gate) ? ignition.gate
+      : (darkInfo && isFinite(darkInfo.D) && isFinite(darkInfo.sd) ? darkInfo.D + 5 * darkInfo.sd : NaN);
+    const Bv = isFinite(p.B) ? p.B : 0;
+    sMaxObservable.gate = gate;
+    if (isFinite(gate)) {
+      sMaxObservable.observable = (sMaxObservable.signal + Bv) >= gate;
+      if (!sMaxObservable.observable)
+        sMaxObservable.why = "보고 위치에서 모델 신호 성분이 검출 한계 아래 — 이 기울기는 외삽이며 데이터가 식별하지 못한다";
+      // 관측 가능 구간(모델이 게이트를 넘는 곳)으로 한정한 최대 신호기울기
+      let best = -Infinity, bestX = NaN;
+      for (let i = 0; i < grid.length; i++) {
+        if (modelI(p, grid[i], chosen) < gate) continue;
+        if (sSig[i] > best) { best = sSig[i]; bestX = grid[i]; }
+      }
+      if (isFinite(best) && best > -Infinity) { sMaxObs = best; sMaxObsAtP = Math.pow(10, bestX); }
+    }
+  }
   // ---- v3.8: 국소 점화 적합 ----
   let localFit = null;
   if (!o.internal && o.localFit !== false && !o.fast) {
@@ -37718,7 +37750,6 @@ function analyze(branch, opts) {
   // 이전 판에서는 "제약에 걸렸으면 s_max 는 lower bound"이라고 보았는데, 합성에서 그 s_max 가
   // 참값을 1.10배 **넘는** 칸이 나왔다(w=0.03, 상승구간 5점). 제약 접촉은 값이 못 미더움을
   // 뜻할 뿐 아래쪽 보증이 아니다 — 그래서 "unresolved" 를 따로 둔다.
-  let paReport, paSource, paReportDlogP = null, paReportBasis = "parametric";
   // v3.8 — 국소 적합이 **식별 가능**할 때만 point estimate로 쓴다.
   // 식별 조건: ν 가 상자에 붙지 않았고, transition width가 lower bound가 아니며, ν 자유/고정 해가 2배 안.
   // 그리고 model-free lower bound와 모순되면(lower bound보다 작으면) 쓰지 않는다 — lower bound가 더 강한 진술이다.
@@ -37735,13 +37766,55 @@ function analyze(branch, opts) {
   // 자동 선택(개형을 보고 기본값을 바꾸는 것)은 판별자를 찾지 못해 보류했다 —
   // ν̂ 상자·모양비·"전이 안 점 개수" 셋 다 0.30배 실패 칸을 좋은 칸과 갈라내지 못했다
   // (전이 안 점 개수: 좋은 칸 1개 vs 실패 칸 2개 — 문턱이 존재하지 않는다).
-  const useLocalHeadline = o.localFitHeadline === true && localAgreesWithBound && localFit.sMax > sMax;
-  if (localFit) localFit.usedForReport = !!useLocalHeadline;
-  if (jumpWins) { paReport = paJump.slope; paSource = "jump"; paReportDlogP = paJump.dlogP; paReportBasis = "jump"; }
-  else if (useLocalHeadline) { paReport = localFit.sMax; paSource = "local-fit"; paReportBasis = "local"; }
-  else if (lbSlope > sMax) { paReport = lbSlope; paSource = "lower-bound"; paReportDlogP = sLowerBound.dlogP; paReportBasis = "secant"; }
-  else if (sMaxLowerBound) { paReport = sMax; paSource = "unresolved"; paReportBasis = "parametric"; }
-  else { paReport = sMax; paSource = "resolved"; }
+  /* v3.12 — jump 와 secant lower bound 는 **둘 다 하한**이다. 따라서 더 큰 쪽이
+   * 더 강한 진술이고, 작은 쪽을 먼저 집을 이유가 없다. 게다가 비대칭이 있다:
+   *   · secant 는 두 앵커가 모두 게이트 위이고 Z=3 잡음 여유를 뺀 **엄밀한** 하한이다.
+   *   · jump 는 아래쪽 앵커가 정의상 암구간(footBand)에 있어 rise 가 암잡음을
+   *     그대로 물려받는다 — 같은 데이터에서 암점이 130 대신 110 으로 읽혔으면
+   *     102.9 가 아니라 111.6 이 나온다(WJ-0075c 실측).
+   * 그래서 jump 가 secant 보다 작으면 secant 를 쓴다. */
+  /* ---- v3.12: 중재를 selectPA() 한 곳으로 ---- */
+  const jumpSlope = paJump && isFinite(paJump.slope) ? paJump.slope : -Infinity;
+  // occupancy·slopeProfile·bistable 은 이 지점보다 **뒤**에서 계산되므로
+  // 중재에는 늦게 합류시킨다 (아래 paSelectLateJoin).
+  const estimators = [
+    { name: "secant", kind: "bound", value: lbSlope, basis: "secant",
+      dlogP: sLowerBound ? sLowerBound.dlogP : null,
+      location: sLowerBound && isFinite(sLowerBound.pLo) && isFinite(sLowerBound.pHi)
+        ? Math.sqrt(sLowerBound.pLo * sLowerBound.pHi) : NaN,
+      locationKind: "secant", locationObservable: true,
+      ok: isFinite(lbSlope) },
+    { name: "jump", kind: "bound", value: jumpSlope, basis: "jump",
+      dlogP: paJump ? paJump.dlogP : null,
+      location: paJump ? paJump.pth : NaN, locationKind: "ignition", locationObservable: true,
+      ok: !!paJump && isFinite(jumpSlope),
+      why: "아래쪽 앵커가 암구간에 있어 암잡음을 그대로 물려받는다" },
+    { name: "local-fit", kind: o.localFitHeadline === true ? "point" : "diagnostic",
+      value: localFit ? localFit.sMax : NaN, basis: "local", prefer: 2,
+      location: localFit ? localFit.sMaxAtP : NaN, locationKind: "local", locationObservable: true,
+      ok: !!(localFit && localFit.usable && localAgreesWithBound),
+      why: o.localFitHeadline === true ? (localFit && localFit.why) || "식별 조건 미충족"
+        : "기본 비활성 — 족 간 검증에서 남은 실패(비대칭 협전이 0.30배 과소, erf 꼬리) 때문" },
+    { name: "parametric", kind: sMaxLowerBound ? "diagnostic" : "point", value: sMax,
+      basis: "parametric", prefer: 1,
+      location: sMaxAtP, locationKind: "model",
+      locationObservable: sMaxObservable.observable !== false,
+      ok: !sMaxLowerBound && sMaxObservable.observable !== false,
+      why: sMaxObservable.observable === false ? sMaxObservable.why
+        : (sMaxLowerBound ? `제약·가장자리에 걸림(${sMaxBoundReason || "constraint"}) — 점추정으로 읽을 수 없다` : null) },
+    { name: "spline-total", kind: "diagnostic", value: sTotMax, location: Math.pow(10, xTotMax),
+      why: "총기울기(신호+암)라 항상 신호기울기 이하 — 교차검증용" },
+  ];
+  const paSelect = selectPA(estimators, {});
+  if (paJump) paJump.supersededByBound = !!(paSelect.source === "secant" && isFinite(jumpSlope) && jumpSlope < lbSlope);
+  let paReport = paSelect.value, paReportDlogP = paSelect.dlogP, paReportBasis = paSelect.basis || "parametric";
+  let paSource;
+  if (paSelect.source === "jump") paSource = "jump";
+  else if (paSelect.source === "secant") paSource = "lower-bound";
+  else if (paSelect.source === "local-fit") paSource = "local-fit";
+  else if (paSelect.kind === "point") paSource = "resolved";
+  else { paSource = "unresolved"; paReport = sMax; paReportBasis = "parametric"; }
+  if (localFit) localFit.usedForReport = paSelect.source === "local-fit";
 
   // ---- v2.8 (P1): 고정-기울기 프로파일 우도 ----
   // 점프가 이기는(=전선이 분해되지 않은) 경우, 파라메트릭 s_max 는 "데이터가 지지하는 값"이
@@ -37938,6 +38011,23 @@ function analyze(branch, opts) {
     };
   }
 
+  /* v3.12 — 늦게 계산되는 층을 중재 결과에 합류시킨다. 이 셋은 전부 진단용이지만
+   * "왜 헤드라인이 아닌가" 를 기록으로 남겨야 사용자가 26배 흩어진 숫자들을 보고
+   * 혼란스러워하지 않는다. blinking 은 값이 아니라 **주의**로 붙는다. */
+  {
+    const blinkAtIgnition = !!(occupancy && Array.isArray(occupancy.blinkIdx) && ignition && ignition.usable
+      && occupancy.blinkIdx.some((i) => i >= ignition.iDark - 1 && i <= ignition.iLit + 2));
+    if (blinkAtIgnition)
+      paSelect.notes.unshift("점화 구간의 반복측정이 과분산 — 확률적 스위칭(blinking). 그 점의 평균은 재현되지 않는다");
+    paSelect.blinkAtIgnition = blinkAtIgnition;
+    if (slopeProfile && isFinite(slopeProfile.floor))
+      paSelect.rejected.push({ name: "profile-floor", value: slopeProfile.floor,
+        why: "프로파일 우도 floor 는 희소표본 칸에서 참값을 최대 14배 넘겼다(v2.8 검증) — 진단용" });
+    if (bistable && bistable.params && isFinite(bistable.params.nH))
+      paSelect.rejected.push({ name: "bistable-nHigh", value: bistable.params.nH,
+        why: "쌍안정 족의 고상태 지수 — 다른 모델족의 값이라 직접 비교 대상 아님" });
+  }
+
   const modelCurve = grid.map((xv) => modelI(p, xv, chosen));
   const splineCurve = grid.map((xv) => {
     const yv = splineC.fitAt(xv);
@@ -37953,6 +38043,7 @@ function analyze(branch, opts) {
       poissonFloor: (o.counting && isFinite(o.acqTime) && o.acqTime > 0) ? 1 / o.acqTime : null },
     spline: { lambda: splineC.lambda, edf: splineC.edf, monotone: !!o.monotone },
     grid, sTot, sSig, modelCurve, splineCurve,
+    sMaxObservable, sMaxObs, sMaxObsAtP, paSelect,
     fitsSummary: Object.fromEntries(Object.entries(fits).map(([k2, f]) => [k2, f ? { aicc: f.aicc, chi2: f.chi2, k: f.k } : null])),
     chosenOrder: chosen, params: p, theta: fit.theta, paramSE,
     paReport, paSource, paGridLimited, paReportDlogP, paReportBasis,
@@ -39951,6 +40042,68 @@ function paJumpCandidates(P, I, W, depth) {
   }
   return [[P, I, W]];
 }
+/* ============================================================================
+ * v3.12 — PA 보고값 **중재(arbitration)** 를 한 곳에 모은다.
+ *
+ * 문제의 기원: 같은 양(PA)을 재는 추정기가 일곱 개로 늘었는데(파라메트릭 s_max,
+ * 스플라인 s_tot, jump, secant 하한, 국소 S-curve, 프로파일 우도 floor,
+ * bistable n_high — WJ-0075c 에서 21.9 ~ 580.6, 26배 범위), 그들 사이의 선택은
+ * 손으로 짠 if/else 체인이었고 차트는 그 체인이 **이미 기각한** 추정기에서
+ * 마커 위치를 가져왔다. 그래서 "최대 PA 위치" 가 베이스라인 시작점에 찍혔다.
+ *
+ * 규칙을 코드 한 곳에 명시하고, 차트·카드·CSV 가 **이 결과만** 읽게 한다.
+ * 그러면 "그림과 카드가 서로 다른 것을 가리킴" 은 구조적으로 불가능해진다.
+ *
+ * 각 추정기는 스스로 무엇인지 선언한다:
+ *   kind "bound"      — 참값이 이 값 **이상**이다 (부등식). 여럿이면 max 가 최선.
+ *   kind "point"      — 점추정. 하한과 모순되면(하한보다 작으면) 탈락.
+ *   kind "diagnostic" — 헤드라인 후보가 아니다. 이유와 함께 남긴다.
+ * 그리고 자기 **위치**와 그 위치가 관측 가능한지도 같이 선언한다.
+ * ========================================================================= */
+function selectPA(est, ctx) {
+  const cand = est.filter((e) => e && isFinite(e.value));
+  const rejected = [];
+  const keep = [];
+  for (const e of cand) {
+    if (e.kind === "diagnostic") { rejected.push({ name: e.name, value: e.value, why: e.why || "진단용 — 헤드라인 후보 아님" }); continue; }
+    if (e.ok === false) { rejected.push({ name: e.name, value: e.value, why: e.why || "사용 조건 미충족" }); continue; }
+    keep.push(e);
+  }
+  const bounds = keep.filter((e) => e.kind === "bound");
+  let best = null;
+  for (const e of bounds) if (!best || e.value > best.value) best = e;
+  for (const e of bounds) if (e !== best) rejected.push({ name: e.name, value: e.value, why: `더 강한 하한(${best.name} = ${best.value.toFixed(3)})에 밀림` });
+  const bound = best;
+  // 점추정은 "하한과 모순되지 않을 때만" 살아남는다 — 하한이 더 강한 진술이기 때문.
+  const points = [];
+  for (const e of keep.filter((q) => q.kind === "point")) {
+    if (bound && e.value < bound.value - 1e-9) {
+      rejected.push({ name: e.name, value: e.value, why: `검증된 하한(${bound.value.toFixed(3)})보다 작아 모순 — 하한이 더 강한 진술` });
+      continue;
+    }
+    points.push(e);
+  }
+  let winner = null, kind = "none";
+  if (points.length) {
+    winner = points.reduce((a, b) => (b.prefer || 0) > (a.prefer || 0) ? b : a);
+    kind = "point";
+    for (const e of points) if (e !== winner) rejected.push({ name: e.name, value: e.value, why: "우선순위 낮음" });
+  } else if (bound) { winner = bound; kind = "bound"; }
+  const notes = [];
+  if (ctx && ctx.blinkAtIgnition) notes.push("점화 구간의 반복측정이 과분산 — 확률적 스위칭(blinking). 그 점의 평균은 재현되지 않는다");
+  if (kind === "bound") notes.push("하한이다 — 상한은 없다. 전이가 표본 간격보다 좁으면 참값은 이 값 이상 어디든 가능하다");
+  if (!cand.length) notes.push("사용 가능한 추정기가 없다");
+  return {
+    value: winner ? winner.value : NaN,
+    kind, source: winner ? winner.name : null, basis: winner ? (winner.basis || null) : null,
+    dlogP: winner && isFinite(winner.dlogP) ? winner.dlogP : null,
+    location: winner && isFinite(winner.location) ? winner.location : NaN,
+    locationKind: winner ? (winner.locationKind || null) : null,
+    locationObservable: winner ? (winner.locationObservable !== false) : false,
+    rejected, notes,
+  };
+}
+
 function paJumpOnTrace(Pb, Ib, Wb) {
   const { Ps, Ih } = paHighState(Pb, Ib, Wb);
   if (Ps.length < 5) return null;
@@ -40645,7 +40798,7 @@ return {
   // internals exposed for tests
   glog10, estimateVarianceModel, makeSplineBasis, fitPSpline, fitHinge, unpackH, modelI, slopeOf, hingeStarts,
   runsTest, makeRng, lm, median, mad, quantile, tangentThreshold, deSearch, profileSlopeFloor,
-  secantSlopeLowerBound, ignitionBracket, darkFloor, localIgnitionFit,
+  secantSlopeLowerBound, ignitionBracket, darkFloor, localIgnitionFit, selectPA,
   robustFitCore, unpackBS, bistableI, bistableSlope, bsHighSlope, bsOcc, bsHalfX, bsWidth1090, bistableStarts, fitBistable, bistableAnalyze, synthBistable, synthSweep, BS_W_FLOOR,
   poolHighExponent,
   occupancyFromReplicates, chi2SF, bhThreshold, crossBranchOccupancy,
@@ -42003,6 +42156,39 @@ function lensInfoHtml(c) {
  *    enclosed power 가 모두 무의미해진다 — 이건 나중에 나눠서 고칠 수 있는 오차가 아니다.
  *  배수를 µm/px 보정에 쓰라고 권고하는 것은 **선형성이 확인된 경우로 한정**한다
  *  (비선형 영상에서는 리샘플 커널과 톤커브가 얽혀 L 이 최대 ~35% 과대평가되기 때문). */
+/** v3.12 — 보고값이 나온 **그 자리**를 돌려준다.
+ *  이전에는 paSource 와 무관하게 언제나 모델의 sMaxAtP 에 별을 찍었다. 그런데
+ *  sMaxAtP 는 모델의 *숨은 신호 성분* 기울기의 argmax 이고, 암구간에서 그 기울기는
+ *  상수(k1)라서 argmax 가 **맨 왼쪽 점**을 집는다. 결과적으로 "최대 PA 위치" 가
+ *  베이스라인 시작점에 찍혔다(WJ-0075c). 보고 경로마다 자기 위치를 쓰게 한다. */
+function paMarkerX(a) {
+  // v3.12 — 중재 결과(paSelect)가 유일한 출처. 차트가 카드와 다른 것을 가리킬 수 없다.
+  if (a.paSelect && isFinite(a.paSelect.location)) return a.paSelect.location;
+  if (a.paSource === "jump" && a.paJump && isFinite(a.paJump.pth)) return a.paJump.pth;   // 구버전 결과 호환
+  if (a.paSource === "lower-bound" && a.sLowerBound && isFinite(a.sLowerBound.pLo) && isFinite(a.sLowerBound.pHi))
+    return Math.sqrt(a.sLowerBound.pLo * a.sLowerBound.pHi);
+  if (a.paSource === "local-fit" && a.localFit && isFinite(a.localFit.sMaxAtP)) return a.localFit.sMaxAtP;
+  return a.sMaxAtP;
+}
+/** 모델 접선을 그려도 되는가 — 그 자리에서 모델 신호가 검출 한계 위인가. */
+function paTangentDrawable(a) {
+  if (a.paSelect && a.paSelect.locationObservable === false) return false;
+  return !(a.sMaxObservable && a.sMaxObservable.observable === false);
+}
+/** v3.12 — 중재에서 기각된 추정기와 그 사유. 26배로 흩어진 숫자들을 숨기지 않고
+ *  "왜 이것이 헤드라인이 아닌가" 를 그대로 보여준다. */
+function paSelectHtml(a) {
+  const S = a.paSelect;
+  if (!S) return "";
+  const rows = (S.rejected || []).slice().sort((u, v) => (v.value || 0) - (u.value || 0))
+    .map((q) => `<tr><td>${esc(q.name)}</td><td class="num">${isFinite(q.value) ? fmt(q.value, 4) : "—"}</td><td>${esc(q.why || "")}</td></tr>`).join("");
+  const notes = (S.notes || []).map((n) => `<div class="s" style="color:var(--s7)">⚠ ${esc(n)}</div>`).join("");
+  return `<div class="s" style="margin-top:6px">PA 중재: <b>${fmt(S.value, 4)}</b>`
+    + ` <span class="muted">(${S.kind === "bound" ? "하한" : S.kind === "point" ? "점추정" : "없음"} · 출처 ${esc(S.source || "-")}`
+    + ` · 위치 P=${fmt(S.location, 4)} ${esc(S.locationKind || "")})</span></div>`
+    + notes
+    + (rows ? `<table class="mini" style="margin-top:4px"><thead><tr><th>기각된 추정기</th><th class="num">값</th><th>사유</th></tr></thead><tbody>${rows}</tbody></table>` : "");
+}
 function integrityHtml(q, imgW) {
   if (!q) return "";
   if (q.error) return ` · <span class="tag-Low">무결성 검사 실패: ${esc(q.error)}</span>`;
@@ -43903,8 +44089,31 @@ function drawPowerChart(rec, loaded, branches, analysis) {
         bgcolor: "rgba(26,26,25,0.85)", borderpad: 4,
       });
     }
+    // v3.12 — 모델 s_max 위치가 **관측 불가 구간**이면 접선도 별도 그리지 않는다.
+    // 8×10⁻⁸ counts 짜리 성분의 기울기를 "PA 위치" 로 찍는 것은 오해만 만든다.
+    if (!paTangentDrawable(analysis)) {
+      const mx = paMarkerX(analysis);
+      if (isFinite(mx)) {
+        const Im = modelAt(analysis, Math.log10(mx));
+        traces.push({
+          x: [mx * k], y: [isFinite(Im) && Im > 0 ? Im : analysis.background || 1],
+          mode: "markers", type: "scatter", name: "PA (점화 위치)",
+          marker: { size: 14, symbol: "star", color: PALETTE.yellow, line: { width: 1.4, color: "#1a1a19" } },
+          hovertemplate: `PA ≥ ${fmt(analysis.paReport, 4)}<br>P=%{x:.4g}<extra></extra>`,
+        });
+      }
+      annots.push({
+        x: Math.log10((isFinite(mx) ? mx : analysis.sMaxAtP) * k), xref: "x", yref: "paper", y: 0.06,
+        xanchor: "center",
+        text: `<b>모델 접선 생략</b><br><span style="font-size:10.5px">모델 s_max(${fmt(analysis.sMax, 3)})가 잡힌 자리는`
+          + ` 신호가 검출 한계 아래<br>(${fmt(analysis.sMaxObservable.signal, 3)} counts vs 게이트 ${fmt(analysis.sMaxObservable.gate, 4)})`
+          + ` — 외삽이라 표시하지 않음</span>`,
+        showarrow: false, align: "center", font: { size: 11.5, color: "#c9a227" },
+        bgcolor: "rgba(26,26,25,0.88)", borderpad: 4,
+      });
+    }
     // 분해 front 접선 (점프가 이기면 회색 보조선)
-    if (isFinite(analysis.sMaxAtP) && isFinite(analysis.sMax)) {
+    if (paTangentDrawable(analysis) && isFinite(analysis.sMaxAtP) && isFinite(analysis.sMax)) {
       const xs = Math.log10(analysis.sMaxAtP), Is = modelAt(analysis, xs);
       if (isFinite(Is) && Is > 0) {
         const xr = analysis.data.x, half = 0.10 * (xr[xr.length - 1] - xr[0]);
@@ -43923,9 +44132,10 @@ function drawPowerChart(rec, loaded, branches, analysis) {
         // 보고값은 paReport 이므로, 둘이 다르면 그 사실을 라벨에 적는다.
         if (!jump) {
           const rep = analysis.paReport, ge = analysis.paSource === "lower-bound";
+          const mkX = paMarkerX(analysis);
           const differs = isFinite(rep) && Math.abs(rep - analysis.sMax) / Math.max(analysis.sMax, 1e-12) > 1e-6;
           annots.push({
-            x: Math.log10(analysis.sMaxAtP * k), y: Math.log10(Is), yshift: 30, xanchor: "center",
+            x: Math.log10((isFinite(mkX) ? mkX : analysis.sMaxAtP) * k), y: Math.log10(Is), yshift: 30, xanchor: "center",
             text: `PA ${ge ? "≥" : "="} <b>${fmt(rep, 4)}</b>`
               + (analysis.paSource === "unresolved" ? " <i>(unidentified)</i>" : "")
               + (differs ? `<br><span style="font-size:10.5px">접선은 모델 s_max=${fmt(analysis.sMax, 3)}</span>` : ""),
@@ -44436,7 +44646,8 @@ function renderFitResults(rec, analysis) {
       ${jumpWins ? `<div class="s muted">파라메트릭 s_max = ${fmt(a.sMax, 4)} — <b>보고값 아님</b>. 전선이 한 파워 스텝 안에서 끝나
         (Δlog₁₀P=${fmt(a.paJump.dlogP, 3)} ≤ 격자 ${fmt(a.medianDlogP, 3)}) 매끄러운 모델의 최대 기울기는 transition width 제약이 정하는 값입니다.
         bistable 점화는 이론적으로 불연속에 가까울 수 있으므로, 이 상황에서 옳은 보고는 point estimate가 아니라 위의 lower bound입니다.</div>` : ""}
-      ${a.paGridLimited ? `<div class="s tag-Low">한 파워 스텝 안에서 dark→signal 점화 — 실제 PA는 이 값 이상. 더 촘촘한 파워 간격으로 재측정 시 분해 가능</div>` : ""}</div>
+      ${a.paGridLimited ? `<div class="s tag-Low">한 파워 스텝 안에서 dark→signal 점화 — 실제 PA는 이 값 이상. 더 촘촘한 파워 간격으로 재측정 시 분해 가능</div>` : ""}
+      ${paSelectHtml(a)}</div>
     <div class="card"><div class="k">분해 front s_max${
       a.sMaxBoundReason === "secant" ? ' <span class="tag-Poor">refuted</span>'
       : a.sMaxBoundReason === "constraint" ? ' <span class="tag-Poor">unidentified</span>'
