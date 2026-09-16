@@ -293,7 +293,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.6.2</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.11.0</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -35618,6 +35618,58 @@ function fitBeam(img, opts) {
     // non-Gaussianity: D4σ area vs fitted 1/e² area (1.0 = perfectly Gaussian)
     fit.d4sAreaRatio = (fit.moments.sigmaMajor * fit.moments.sigmaMinor) / (fit.sx * fit.sy);
   }
+  // ---- v3.9: curve of growth — core 밖에 빛이 얼마나 있는가 ----
+  // 파워밀도는 I0 = P / A_peak 로 계산되는데, 이 식은 **측정한 P 전부가 core 에
+  // 들어간다**고 가정한다. core 밖에 halo 가 있으면 그만큼 과대평가된다.
+  //
+  // 순진하게 "배경 위 양수 픽셀의 합"을 쓰면 안 된다 — 잡음의 양수 쪽만 세는
+  // rectification 때문에 빈 프레임에서도 거대한 가짜 플럭스가 나온다(순수 Gaussian
+  // 에서 core 비율 7.5% 로 측정됨). 그래서 **부호를 살려서** 원형 조리개로 적분하고,
+  // 배경은 바깥 annulus 에서 다시 잡는다. 잡음은 상쇄되고 halo 만 남는다.
+  //
+  // 주의: 이미지가 산란면을 결상한 것이면 halo 는 결상경로 artifact 일 수 있다.
+  // 값만 내고 자동 보정하지 않는다 — 판단은 호출자가 한다.
+  if (fit.success && isFinite(fit.A) && fit.sx > 0 && fit.sy > 0) {
+    const sg = Math.sqrt(fit.sx * fit.sy);
+    const cx = fit.x0, cy = fit.y0;
+    const D = spl.data;
+    const rMaxFit = Math.min(cx, cy, w - 1 - cx, h - 1 - cy);   // 프레임에 갇히지 않는 최대 반경
+    const rOut = Math.min(rMaxFit, 14 * sg);
+    // 배경: rOut 바깥 annulus (없으면 프레임 테두리)
+    const ring = [];
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const v = D[y * w + x];
+      if (!isFinite(v)) continue;
+      const dx = x - cx, dy = y - cy, r = Math.sqrt(dx * dx + dy * dy);
+      if (r > rOut && r <= 1.35 * rOut) ring.push(v);
+    }
+    const bg = ring.length >= 30 ? nanmedian(ring) : (isFinite(fit.B) ? fit.B : 0);
+    const coreFlux = 2 * Math.PI * fit.A * fit.sx * fit.sy;   // 적합 Gaussian 의 해석적 적분
+    const growth = [];
+    for (const kR of [1, 2, 3, 4, 6, 8, 10, 14]) {
+      const R = kR * sg;
+      if (R > rMaxFit) break;
+      let sum = 0, npx = 0;
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const v = D[y * w + x];
+        if (!isFinite(v)) continue;
+        const dx = x - cx, dy = y - cy;
+        if (dx * dx + dy * dy > R * R) continue;
+        sum += v - bg; npx++;                                  // **부호 유지** — 잡음 상쇄
+      }
+      growth.push({ kSigma: kR, R, flux: sum, nPx: npx,
+                    ratio: coreFlux > 0 ? sum / coreFlux : NaN });
+    }
+    fit.growth = growth;
+    fit.coreFlux = coreFlux;
+    fit.growthBg = bg;
+    // halo 지표: 가장 바깥 조리개의 포함 플럭스 / core 플럭스.
+    // 순수 Gaussian 이면 ≈ 1.00 (3σ 안에 98.9%, 그 밖은 무시 가능).
+    const last = growth.length ? growth[growth.length - 1] : null;
+    fit.enclosedRatio = last ? last.ratio : NaN;
+    fit.coreFrac = last && isFinite(last.ratio) && last.ratio > 0 ? 1 / last.ratio : NaN;
+    fit.growthRadiusSigma = last ? last.kSigma : NaN;
+  }
   fit.nStreakCols = stk.nCols; fit.nStreakRows = stk.nRows;
   fit.streakColAmp = stk.colAmp; fit.streakRowAmp = stk.rowAmp;
   fit.maskedData = spl.data; // full-frame, streak-corrected + ghosts masked (preview)
@@ -35809,6 +35861,423 @@ function beamMetrics(fit, umPerPx) {
   };
 }
 
+/* ============================================================================
+ * INNO Prism — 업로드 이미지 무결성 검사 (image QA)
+ *
+ * 목적: 빔 보정에 쓰이는 이미지가 "카메라 원본 1:1 · 선형 ADU" 라는 전제를
+ *       만족하는지 검사한다. 두 검사 모두 **빔의 모양에 의존하지 않고**
+ *       노이즈 통계만 쓰므로 특정 데이터에 매몰되지 않는다.
+ *
+ *  A. 업스케일 검출 (upscale / resampling)
+ *     화면 캡쳐는 표시 배율만큼 보간되어 저장된다. 원래 독립이던 픽셀 노이즈가
+ *     N px 에 걸쳐 상관되므로, 배경 노이즈의 variogram 으로 상관길이 L 을 재면
+ *     L ≈ 표시 배율이 된다. µm/px 가 L 배 틀리므로 면적은 L² 배 틀린다.
+ *
+ *  B. 비선형성 검출 (gamma / auto-contrast / tone mapping)
+ *     선형 검출기의 잡음은  Var(I) = g·I + σ_read²  — 신호에 대해 **아핀**이고
+ *     기울기 g > 0 이다. 따라서 밝기에 따라 분산이 *감소*하는 영상은 어떤 선형
+ *     검출기로도 만들어질 수 없다. 화면 캡쳐에 씌워진 감마(y = I^{1/γ})는 정확히
+ *     그 감소를 만든다(멱법칙으로 보면 기울기 β = 2 − γ). 이 판정은 기울기의
+ *     **부호**만 쓰므로, 업스케일이 분산을 상수배 줄이는 것에 영향받지 않는다.
+ *
+ *     검출 한계(합성 격자 22셀로 확인, 임의 문턱 없음):
+ *       · γ ≳ 2.0 : 확정 검출          · 1 < γ ≲ 1.6 : read noise 지배와
+ *       구분 불가 → 판정 보류 또는 미탐. 이 한계를 숨기지 않고 보고한다.
+ *
+ *  두 검사 모두 판정 근거가 부족하면 "판정 불가"를 반환한다 — 억지로 값을
+ *  내놓지 않는 것이 이 모듈의 계약이다.
+ *
+ *  알려진 한계: bilinear 리샘플과 강한 톤커브가 겹치면 L 이 ~35% 과대평가된다.
+ *  그래서 L 을 µm/px 보정에 쓰라는 **권고는 선형성이 확인된 경우로 한정**한다.
+ * ========================================================================== */
+
+const UPSCALE_DMAX = 14;      // variogram 최대 lag
+const UPSCALE_WARN = 1.25;    // L 이 이 값을 넘으면 원본이 아님
+const SEG_MIN = 40;           // 배경 구간 최소 길이 (px)
+const LIN_MIN_DECADES = 0.8;  // 신호 동적범위 최소 (dec)
+const LIN_R2_MIN = 0.85;      // 아핀 모델(Var = a + b·m) 적합 하한
+const LIN_VAR_RATIO_MIN = 2;  // 분산이 이 배수 이상 변해야 기울기 부호를 신뢰할 수 있다
+const LIN_SIGMA_MIN = 0.45;   // σ̂ 가 이보다 작으면 8bit 양자화 지배 → 폐기
+const QUANT_VAR = 1 / 12;     // 8-bit 양자화 분산 바닥
+
+function qMedian(a) {
+  if (!a.length) return NaN;
+  const b = Float64Array.from(a).sort();
+  const n = b.length, h = n >> 1;
+  return n % 2 ? b[h] : 0.5 * (b[h - 1] + b[h]);
+}
+function qPercentile(a, p) {
+  if (!a.length) return NaN;
+  const b = Float64Array.from(a).sort();
+  const i = Math.min(b.length - 1, Math.max(0, Math.round((b.length - 1) * p)));
+  return b[i];
+}
+
+/* ---------------------------------------------------------------- A. 업스케일 */
+/** 한 방향(행 또는 열)에 대해 배경 구간의 variogram γ(d)=½E[(x_i−x_{i+d})²] 누적 */
+function accumVariogram(getLine, getMask, nLines, lineLen, dmax, acc, cnt, stride) {
+  const st = Math.max(1, stride | 0);
+  for (let L = 0; L < nLines; L += st) {
+    const v = getLine(L), mk = getMask(L);
+    let s = 0;
+    while (s < lineLen) {
+      if (!mk[s]) { s++; continue; }
+      let e = s;
+      while (e < lineLen && mk[e]) e++;
+      if (e - s >= SEG_MIN) {
+        // 구간 내 최소자승 직선 제거 — 배경 기울기가 γ(d) 의 tail 을 부풀리는 것을 막는다
+        const n = e - s;
+        let sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (let i = s; i < e; i++) { const t = i - s; sx += t; sy += v[i]; sxx += t * t; sxy += t * v[i]; }
+        const den = n * sxx - sx * sx;
+        const sl = Math.abs(den) > 1e-12 ? (n * sxy - sx * sy) / den : 0;
+        const ic = (sy - sl * sx) / n;
+        const r = new Float64Array(n);
+        for (let i = s; i < e; i++) r[i - s] = v[i] - (ic + sl * (i - s));
+        /* 2차 차분 γ₂(d) = E[(x_{i−d} − 2x_i + x_{i+d})²]/6.
+         * 1차 차분은 국소 기울기만 지우지만 2차 차분은 곡률까지 지우므로,
+         * 배경에 남은 빔 날개(매끄러운 곡면)가 tail 을 부풀리는 것을 크게 억제한다. */
+        for (let d = 1; d <= dmax; d++) {
+          for (let i = d; i + d < n; i++) {
+            const t = r[i - d] - 2 * r[i] + r[i + d];
+            acc[d] += t * t; cnt[d]++;
+          }
+        }
+      }
+      s = e;
+    }
+  }
+}
+
+/** 배경 노이즈 상관길이 L 추정. gray 는 Float64Array(w*h), NaN 은 마스크. */
+function estimateUpscale(gray, w, h) {
+  const fin = [];
+  for (let i = 0; i < gray.length; i++) if (isFinite(gray[i])) fin.push(gray[i]);
+  if (fin.length < 5000) return { ok: false, reason: "유효 픽셀 부족" };
+  /* 배경 선택은 **흐린 영상** 위에서 한다. 원본에서 분위수로 자르면 균일한 배경이
+   * 문턱을 가로질러 얼룩덜룩해져 연속 구간이 끊기고, 문턱을 느슨하게 하면 빔 날개가
+   * 섞여 그 매끄러운 구조가 variogram 의 tail 을 부풀려 L 을 과대평가한다.
+   * 흐린 영상의 median + 5σ 는 잡음에 흔들리지 않으면서 빔 발자국만 정확히 뺀다. */
+  const Sb = qBoxBlur(gray, w, h, 4);
+  const sf = [];
+  for (let i = 0; i < Sb.length; i++) if (isFinite(Sb[i])) sf.push(Sb[i]);
+  if (sf.length < 5000) return { ok: false, reason: "유효 픽셀 부족" };
+  const smed = qMedian(sf);
+  const smad = qMedian(sf.map(v => Math.abs(v - smed))) * 1.4826;
+  const bgHi = smed + 5 * Math.max(smad, 0.15);
+  const bgMask = new Uint8Array(gray.length);
+  for (let i = 0; i < gray.length; i++)
+    bgMask[i] = (isFinite(gray[i]) && isFinite(Sb[i]) && Sb[i] <= bgHi && gray[i] < 250) ? 1 : 0;
+
+  const dmax = UPSCALE_DMAX;
+  const mk = () => ({ a: new Float64Array(dmax + 1), c: new Float64Array(dmax + 1) });
+  const X = mk(), Y = mk();
+  const rowBuf = new Float64Array(w), rowMk = new Uint8Array(w);
+  const colBuf = new Float64Array(h), colMk = new Uint8Array(h);
+  accumVariogram(
+    (r) => { for (let x = 0; x < w; x++) rowBuf[x] = gray[r * w + x]; return rowBuf; },
+    (r) => { for (let x = 0; x < w; x++) rowMk[x] = bgMask[r * w + x]; return rowMk; },
+    h, w, dmax, X.a, X.c, Math.max(1, Math.floor(h / 400)));
+  accumVariogram(
+    (c) => { for (let y = 0; y < h; y++) colBuf[y] = gray[y * w + c]; return colBuf; },
+    (c) => { for (let y = 0; y < h; y++) colMk[y] = bgMask[y * w + c]; return colMk; },
+    w, h, dmax, Y.a, Y.c, Math.max(1, Math.floor(w / 400)));
+
+  /* ρ(d) ≈ max(0, 1 − d/U) — nearest·bilinear 모두 이 삼각형에 잘 맞는다.
+   * 이른 절단(threshold crossing) 대신 U 를 직접 적합해 잡음에 강건하게 만든다. */
+  const lenOf = (A) => {
+    const g = new Array(dmax + 1).fill(NaN);
+    for (let d = 1; d <= dmax; d++) if (A.c[d] > 200) g[d] = A.a[d] / A.c[d] / 6;
+    const tail = [];
+    for (let d = dmax - 4; d <= dmax; d++) if (isFinite(g[d])) tail.push(g[d]);
+    if (tail.length < 3) return { L: NaN, rho: g };
+    const gInf = qMedian(tail);
+    if (!(gInf > 0)) return { L: NaN, rho: g };
+    /* 정규화 γ₂(d)/σ². 상관 ρ 를 가진 잡음에서
+     *   γ₂(d)/σ² = 1 − (4/3)ρ(d) + (1/3)ρ(2d),   ρ(d) ≈ max(0, 1 − d/U)
+     * 이 값을 U 에 대해 직접 적합한다 (d ≥ U 에서 1 로 수렴). */
+    const q = new Array(dmax + 1).fill(NaN);
+    for (let d = 1; d <= dmax; d++) if (isFinite(g[d])) q[d] = g[d] / gInf;
+    const T = (d, U) => Math.max(0, 1 - d / U);
+    const model = (d, U) => 1 - (4 / 3) * T(d, U) + (1 / 3) * T(2 * d, U);
+    let best = 1, bestE = Infinity;
+    for (let U = 1; U <= 8.0001; U += 0.02) {
+      let e = 0, n = 0;
+      for (let d = 1; d <= dmax; d++) {
+        if (!isFinite(q[d])) continue;
+        const r = q[d] - model(d, U); e += r * r; n++;
+      }
+      if (n >= 4 && e / n < bestE) { bestE = e / n; best = U; }
+    }
+    // 보고용 ρ(d) 는 삼각모형 기준으로 환산
+    const rho = new Array(dmax + 1).fill(NaN);
+    for (let d = 1; d <= dmax; d++) if (isFinite(q[d])) rho[d] = T(d, best);
+    return { L: best, rho, q, rmse: Math.sqrt(bestE) };
+  };
+  const rx = lenOf(X), ry = lenOf(Y);
+  if (!isFinite(rx.L) || !isFinite(ry.L)) return { ok: false, reason: "배경 구간 부족" };
+  const L = Math.sqrt(rx.L * ry.L);
+  return {
+    ok: true, L, Lx: rx.L, Ly: ry.L, rhoX: rx.rho, rhoY: ry.rho,
+    rmseX: rx.rmse, rmseY: ry.rmse, qX: rx.q, qY: ry.q,
+    bgMask,
+    upscaled: L >= UPSCALE_WARN,
+    factor: L >= UPSCALE_WARN ? Math.round(L) : 1,
+    anisotropic: Math.abs(rx.L - ry.L) / L > 0.35
+  };
+}
+
+/* ---------------------------------------------------- A′. 블록 압축 검출 */
+/* JPEG 는 8×8 DCT 블록 단위로 양자화하므로 블록 경계에서 픽셀 차이가 커지고
+ * 블록 내부는 평활해진다. 이 8 px 주기가 있으면 잡음 상관이 인위적으로 늘어나
+ * **업스케일 검출기가 오탐**한다(합성 대조군에서 무손실 L=1.00 → JPEG q85 L=2.19).
+ * 따라서 블록 압축이 보이면 업스케일 배수를 보고하지 않고 판정을 보류한다.
+ * 선형성 검사는 같은 대조군에서 JPEG 에 영향받지 않았으므로 그대로 유효하다. */
+const BLOCK_N = 8;
+const BLOCK_WARN = 1.5;       // max/median 비가 이보다 크면 블록 경계 존재
+
+function estimateBlocking(gray, w, h, bgMask) {
+  const accX = new Float64Array(BLOCK_N), cntX = new Float64Array(BLOCK_N);
+  const accY = new Float64Array(BLOCK_N), cntY = new Float64Array(BLOCK_N);
+  for (let y = 0; y < h; y++) for (let x = 0; x + 1 < w; x++) {
+    const i = y * w + x;
+    if (!bgMask[i] || !bgMask[i + 1]) continue;
+    const ph = x % BLOCK_N;                       // x → x+1 경계의 위상
+    accX[ph] += Math.abs(gray[i + 1] - gray[i]); cntX[ph]++;
+  }
+  for (let y = 0; y + 1 < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (!bgMask[i] || !bgMask[i + w]) continue;
+    const ph = y % BLOCK_N;
+    accY[ph] += Math.abs(gray[i + w] - gray[i]); cntY[ph]++;
+  }
+  const prof = (acc, cnt) => {
+    const v = [];
+    for (let k = 0; k < BLOCK_N; k++) { if (cnt[k] < 500) return null; v.push(acc[k] / cnt[k]); }
+    return v;
+  };
+  const px = prof(accX, cntX), py = prof(accY, cntY);
+  if (!px || !py) return { ok: false, reason: "배경 표본 부족" };
+  const ratio = (v) => {
+    const med = qMedian(v), mx = Math.max(...v);
+    return med > 0 ? mx / med : NaN;
+  };
+  const rx = ratio(px), ry = ratio(py);
+  const rr = Math.max(isFinite(rx) ? rx : 0, isFinite(ry) ? ry : 0);
+  /* JPEG 은 8 위상 중 **하나**만 솟는다. N× 업스케일(N|8)도 8 주기를 만들지만
+   * 솟는 위상이 8/N 개(2× → 4개, 4× → 2개)이므로 개수로 구분한다.
+   * 8× 최근접 업스케일만은 원리적으로 구분되지 않는다 — 그 경우 L≈8 이 함께 나온다. */
+  const nHigh = (v) => {
+    const med = qMedian(v), mx = Math.max(...v), mid = 0.5 * (med + mx);
+    return v.filter((t) => t > mid).length;
+  };
+  const nx = nHigh(px), ny = nHigh(py);
+  const single = (nx === 1 && ny === 1);
+  return {
+    ok: true, profX: px, profY: py, ratioX: rx, ratioY: ry, ratio: rr,
+    nHighX: nx, nHighY: ny, singlePhase: single,
+    phaseX: px.indexOf(Math.max(...px)), phaseY: py.indexOf(Math.max(...py)),
+    blocked: rr >= BLOCK_WARN && single,
+  };
+}
+
+/* -------------------------------------------------------------- B. 선형성 */
+/* 4차 차분 커널 [1,-4,6,-4,1] 은 3차 이하 다항식(국소 평면·곡률·기울기 변화)을
+ * 소거하므로 빔 자체의 매끄러운 구조를 노이즈로 오인하지 않는다.
+ * Var(d4) = 70σ².  정수 픽셀값에서는 median|d4| 이 정수로 계단화되어 어두운 쪽
+ * (σ ≲ 1 DN)에서 심하게 편향되므로, **상위 10% 를 절사한 제곱평균**을 쓴다.
+ *   Z~N(0,1) 에서 E[Z² | |Z| ≤ z_{0.95}] = 0.62302  →  E[d4²|절사] = 43.611 σ²   */
+const D4_TRIM_MS = 43.6114;
+function sigmaFromD4(arr) {
+  if (arr.length < 40) return NaN;
+  const b = Float64Array.from(arr).sort();
+  const cut = b[Math.min(b.length - 1, Math.floor(b.length * 0.90))];
+  let s = 0, n = 0;
+  for (let i = 0; i < b.length; i++) { if (b[i] > cut) break; s += b[i] * b[i]; n++; }
+  return n >= 20 ? Math.sqrt(s / n / D4_TRIM_MS) : NaN;
+}
+const LIN_BIN_MIN = 120;      // 빈당 최소 픽셀
+const LIN_STRUCT_MAX = 1.5;   // σ̂(2D)/σ̂(D) 가 이보다 크면 구조 오염으로 폐기
+
+function qBoxBlur(gray, w, h, r) {
+  const t = new Float64Array(w * h), o = new Float64Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, c = 0;
+    for (let i = -r; i <= r; i++) { const xx = x + i; if (xx < 0 || xx >= w) continue;
+      const v = gray[y * w + xx]; if (isFinite(v)) { s += v; c++; } }
+    t[y * w + x] = c ? s / c : NaN;
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, c = 0;
+    for (let j = -r; j <= r; j++) { const yy = y + j; if (yy < 0 || yy >= h) continue;
+      const v = t[yy * w + x]; if (isFinite(v)) { s += v; c++; } }
+    o[y * w + x] = c ? s / c : NaN;
+  }
+  return o;
+}
+
+/** 각 픽셀에서 lag D 4차 차분의 절대값을 수집 (수평·수직 모두). NaN/포화 제외. */
+function collectD4(gray, w, h, D, S, black, bins, loM, hiM, NB) {
+  const push = (bi, v) => { if (bi >= 0 && bi < NB) bins[bi].push(v); };
+  const lg = Math.log(hiM / loM);
+  const idx = (m) => (m <= 0 ? -1 : Math.floor(NB * Math.log(m / loM) / lg));
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const m = S[y * w + x] - black;
+    const bi = idx(m); if (bi < 0 || bi >= NB) continue;
+    if (x - 2 * D >= 0 && x + 2 * D < w) {
+      const a = gray[y*w+x-2*D], b = gray[y*w+x-D], c = gray[y*w+x],
+            d = gray[y*w+x+D],   e = gray[y*w+x+2*D];
+      if (isFinite(a)&&isFinite(b)&&isFinite(c)&&isFinite(d)&&isFinite(e) &&
+          a<250&&b<250&&c<250&&d<250&&e<250)
+        push(bi, Math.abs(a - 4*b + 6*c - 4*d + e));
+    }
+    if (y - 2 * D >= 0 && y + 2 * D < h) {
+      const a = gray[(y-2*D)*w+x], b = gray[(y-D)*w+x], c = gray[y*w+x],
+            d = gray[(y+D)*w+x],   e = gray[(y+2*D)*w+x];
+      if (isFinite(a)&&isFinite(b)&&isFinite(c)&&isFinite(d)&&isFinite(e) &&
+          a<250&&b<250&&c<250&&d<250&&e<250)
+        push(bi, Math.abs(a - 4*b + 6*c - 4*d + e));
+    }
+  }
+}
+
+function estimateLinearity(gray, w, h, upscaleL) {
+  const D = Math.max(1, Math.round(isFinite(upscaleL) ? upscaleL : 1));
+  const fin = [];
+  for (let i = 0; i < gray.length; i++) if (isFinite(gray[i]) && gray[i] < 250) fin.push(gray[i]);
+  if (fin.length < 5000) return { ok: false, reason: "유효 픽셀 부족" };
+  const black = qPercentile(fin, 0.25);
+  const S = qBoxBlur(gray, w, h, D);
+
+  const sig = [];
+  for (let i = 0; i < S.length; i++) { const m = S[i] - black; if (m > 0.5 && isFinite(m)) sig.push(m); }
+  if (sig.length < 600) return { ok: false, reason: "신호 픽셀 부족" };
+  const loM = Math.max(0.5, qPercentile(sig, 0.10)), hiM = qPercentile(sig, 0.999);
+  const dec = Math.log10(hiM / loM);
+  if (!(dec >= LIN_MIN_DECADES)) return { ok: false, reason: `신호 동적범위 부족 (${dec.toFixed(2)} dec < ${LIN_MIN_DECADES})`, decades: dec };
+
+  const NB = 8;
+  const b1 = [], b2 = [];
+  for (let i = 0; i < NB; i++) { b1.push([]); b2.push([]); }
+  collectD4(gray, w, h, D,     S, black, b1, loM, hiM, NB);
+  collectD4(gray, w, h, 2 * D, S, black, b2, loM, hiM, NB);
+
+  const pts = [];
+  for (let i = 0; i < NB; i++) {
+    if (b1[i].length < LIN_BIN_MIN || b2[i].length < LIN_BIN_MIN) continue;
+    const s1 = sigmaFromD4(b1[i]), s2 = sigmaFromD4(b2[i]);
+    if (!isFinite(s1) || !isFinite(s2)) continue;
+    if (!(s1 > 0)) continue;
+    if (s2 / s1 > LIN_STRUCT_MAX) continue;            // 매끄러운 구조 오염 → 폐기
+    if (s1 < LIN_SIGMA_MIN) continue;                  // 양자화 바닥 지배 → 폐기
+    const v = s1 * s1 - QUANT_VAR;
+    if (!(v > 0)) continue;
+    const m = loM * Math.pow(hiM / loM, (i + 0.5) / NB);
+    pts.push({ m, v, n: b1[i].length });
+  }
+  if (pts.length < 4) return { ok: false, reason: `유효 밝기 빈 부족 (${pts.length}) — 구조 오염 또는 표본 부족` };
+
+  /* 선형 검출기의 물리 모델은 멱법칙이 아니라 **아핀**이다:
+   *     Var(I) = g·I + σ_read²  =  (g·black + σ_read²) + g·m,   m = I − black
+   * 어두운 쪽에서 분산이 평평해지는 것은 비선형이 아니라 배경 광자잡음·read noise
+   * 때문이므로, 멱법칙 기울기 β 로 판정하면 선형 영상도 β<1 로 나와 오탐이 난다.
+   * 따라서 a + b·m 을 상대잔차 가중 최소자승으로 적합하고 b 의 **부호**로 판정한다.
+   *   b < 0  : 분산이 밝기에 따라 감소 → 어떤 선형 검출기로도 불가능 → 비선형 확정
+   *   b > 0 이고 적합이 좋고 분산 변동이 충분 → 선형과 정합
+   *   그 외   : read noise 지배 등으로 구분 불가 → 판정 보류                      */
+  const vMin = Math.min(...pts.map(p => p.v)), vMax = Math.max(...pts.map(p => p.v));
+  const varRatio = vMax / Math.max(vMin, 1e-12);
+  let Sw = 0, Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+  for (const p of pts) {
+    const wt = p.n / (p.v * p.v);            // 상대잔차 가중 (분산 추정의 상대오차는 일정)
+    Sw += wt; Sx += wt * p.m; Sy += wt * p.v; Sxx += wt * p.m * p.m; Sxy += wt * p.m * p.v;
+  }
+  const den = Sw * Sxx - Sx * Sx;
+  if (!(Math.abs(den) > 1e-18)) return { ok: false, reason: "회귀 불능" };
+  const b = (Sw * Sxy - Sx * Sy) / den;
+  const a = (Sy - b * Sx) / Sw;
+  let ssr = 0, sst = 0, wsum = 0, vbar = 0;
+  for (const p of pts) { const wt = p.n / (p.v * p.v); wsum += wt; vbar += wt * p.v; }
+  vbar /= wsum;
+  for (const p of pts) {
+    const wt = p.n / (p.v * p.v);
+    ssr += wt * Math.pow(p.v - (a + b * p.m), 2);
+    sst += wt * Math.pow(p.v - vbar, 2);
+  }
+  const r2 = sst > 0 ? 1 - ssr / sst : NaN;
+  // b 의 표준오차 (가중 LS)
+  const seB = Math.sqrt(Math.max(0, (ssr / Math.max(1, pts.length - 2)) * Sw / den));
+  // 참고용 멱법칙 기울기 (해석 보조 — 판정에는 쓰지 않는다)
+  let Lw = 0, Lx = 0, Ly = 0, Lxx = 0, Lxy = 0;
+  for (const p of pts) { const wt = Math.log10(p.n), X = Math.log10(p.m), Y = Math.log10(p.v);
+    Lw += wt; Lx += wt * X; Ly += wt * Y; Lxx += wt * X * X; Lxy += wt * X * Y; }
+  const lden = Lw * Lxx - Lx * Lx;
+  const beta = Math.abs(lden) > 1e-12 ? (Lw * Lxy - Lx * Ly) / lden : NaN;
+  let lss = 0; const la = (Ly - beta * Lx) / Lw;
+  for (const p of pts) { const r = Math.log10(p.v) - (la + beta * Math.log10(p.m)); lss += Math.log10(p.n) * r * r; }
+  const seBeta = Math.sqrt(Math.max(0, (lss / Math.max(1, pts.length - 2)) * Lw / lden));
+
+  const decreasing = b + 2 * seB < 0;
+  const increasing = b - 2 * seB > 0;
+  /* Var = a + b·m 에서 a ≥ 0 이면 d logVar/d logm = b·m/(a+b·m) ≤ 1 이다.
+   * 따라서 β 가 1 을 유의하게 넘으면 a < 0 을 요구하는 셈이고, 이는 신호 0 에서
+   * 분산이 음수라는 뜻이므로 어떤 선형 검출기로도 불가능하다 → 비선형 확정. */
+  const superLinear = isFinite(beta) && isFinite(seBeta) && (beta - 2 * seBeta > 1);
+  const verdict = (decreasing || superLinear) ? "nonlinear"
+    : (increasing && r2 >= LIN_R2_MIN && varRatio >= LIN_VAR_RATIO_MIN) ? "linear"
+    : "indeterminate";
+  const why = verdict !== "indeterminate" ? null
+    : !increasing ? "분산이 밝기에 거의 무관 — read noise 지배와 완만한 톤커브를 구분할 수 없음"
+    : varRatio < LIN_VAR_RATIO_MIN ? `분산 변동 부족 (${varRatio.toFixed(2)}배)`
+    : `아핀 모델 적합 불량 (R²=${r2.toFixed(3)}) — 톤커브 의심`;
+  return { ok: true, _pts: pts, a, b, seB, r2, beta, seBeta, superLinear, bins: pts.length, decades: dec, varRatio, D,
+    verdict, linear: verdict === "linear", indeterminateWhy: why };
+}
+
+/* ------------------------------------------------------------------ 종합 */
+/** 종합 판정.
+ *  중요: 업스케일 배수를 µm/px 보정에 쓰라고 **권고하는 것**은 선형성이 확인된
+ *  경우로 한정한다. 비선형(톤커브) 영상에서는 리샘플 커널과 톤커브의 상호작용으로
+ *  L 이 최대 ~35% 과대평가될 수 있음이 합성 격자에서 확인되었기 때문이다
+ *  (bilinear + γ≥2.2 조합). 그 경우 권고는 "원본 TIFF 재촬영" 하나뿐이다. */
+function imageIntegrity(gray, w, h) {
+  const up = estimateUpscale(gray, w, h);
+  const blk = up.ok && up.bgMask ? estimateBlocking(gray, w, h, up.bgMask) : { ok: false, reason: "배경 마스크 없음" };
+  if (up.ok) delete up.bgMask;
+  /* 블록 압축이 보이면 업스케일 배수는 신뢰할 수 없다 — 판정 보류로 낮춘다. */
+  if (blk.ok && blk.blocked && up.ok) { up.confoundedByBlocking = true; up.upscaled = false; up.factor = null; }
+  const lin = estimateLinearity(gray, w, h, up.ok ? up.L : 1);
+  const issues = [];
+  if (blk.ok && blk.blocked)
+    issues.push({ kind: "block-compression", severity: "high", ratio: blk.ratio,
+      why: "8 px 주기 블록 경계 — JPEG 등 블록 압축. 업스케일 판정 불가" });
+  if (up.ok && up.upscaled)
+    issues.push({ kind: "upscale", severity: "high", L: up.L, factor: up.factor });
+  else if (!up.ok)
+    issues.push({ kind: "upscale-unverified", severity: "medium", why: up.reason });
+  if (lin.ok && lin.verdict === "nonlinear")
+    issues.push({ kind: "nonlinear", severity: "high", b: lin.b, r2: lin.r2, beta: lin.beta });
+  else if (!lin.ok || lin.verdict === "indeterminate")
+    issues.push({ kind: "linearity-unverified", severity: "medium",
+      why: lin.ok ? lin.indeterminateWhy : lin.reason, beta: lin.ok ? lin.beta : NaN });
+  const blocked = blk.ok && blk.blocked;
+  const linearOK = lin.ok && lin.verdict === "linear";
+  const scaleSuggestion = (up.ok && up.upscaled && linearOK && !blocked)
+    ? { divideUmPerPxBy: up.factor, areaFactor: up.factor * up.factor }
+    : null;
+  return {
+    upscale: up, linearity: lin, blocking: blk, issues,
+    clean: issues.length === 0,
+    scaleSuggestion,
+    scaleAdvisoryOnly: up.ok && up.upscaled && !linearOK,
+    action: blocked
+      ? "무손실 원본 필요 — 이 파일은 블록 압축(JPEG 계열)되어 업스케일 판정이 불가능하다"
+      : (up.ok && up.upscaled) || (lin.ok && lin.verdict === "nonlinear")
+      ? "재촬영 권장 — 카메라 원본(1:1, 선형 TIFF)"
+      : (issues.length ? "주의 — 아래 항목 확인" : null)
+  };
+}
+
 /* ------------------------------- exports ---------------------------------- */
 return {
   VERSION: "2.0-core",
@@ -35821,6 +36290,8 @@ return {
   // beam profile
   fitGaussian2D, beamMetrics, isolateMainBlob, splitTouchingBlobs, removeStreaks, fitBeam,
   momentsD4Sigma,
+  // v3.10: 업로드 이미지 무결성 (업스케일·선형성)
+  imageIntegrity, estimateUpscale, estimateLinearity, estimateBlocking,
 };
 });
 
@@ -35882,7 +36353,7 @@ return {
   else root.PrismFit = api;
 })(typeof self !== "undefined" ? self : this, function () {
 
-const VERSION = "2.0.0";
+const VERSION = "2.2.0";
 const LN10 = Math.log(10);
 
 /* ------------------------------ small utils ------------------------------- */
@@ -36027,7 +36498,7 @@ function estimateVarianceModel(x, I, reps) {
   // v2.6: 반복 분산은 자유도가 (nRep−1) 뿐이라 개별 추정이 매우 시끄럽고,
   // log-분산 최소제곱이 전체 스케일을 크게 빗나갈 수 있다(합성 검증에서 4.5배 관측).
   // 법칙은 '모양'만 제공하고 전체 스케일은 데이터가 다시 못박게 한다 —
-  // 파일럿 잔차 경로가 이미 쓰는 것과 같은 보정이다.
+  // 파일럿 residual 경로가 이미 쓰는 것과 같은 보정이다.
   // 보정 기준: median(χ²_ν/ν) (ν = nRep−1). ν≤0 이거나 점이 적으면 보정하지 않는다.
   if (source === "replicates" && pts.length >= 6) {
     const nu = Math.max(median(reps.map((r) => Math.max(finite(r || []).length, 1))) - 1, 1);
@@ -36270,23 +36741,23 @@ function fitPSpline(x, y, w, opts) {
    B handled separately: uB with B=softplus(uB) (scaled). Full θ = [uB, ...].
 */
 const H_NPARAMS = { 0: 3, 1: 6, 2: 9 };
-/* v2.6 (E4): 전이 폭 w 의 하한. 0.02 는 실측 점화 전선(0.01 dec 급)보다 3–4배 넓어
-   s_max 를 데이터가 아니라 제약이 결정하게 만들었다. 하한을 낮추는 대신
+/* v2.6 (E4): transition width w 의 lower bound. 0.02 는 실측 점화 전선(0.01 dec 급)보다 3–4배 넓어
+   s_max 를 데이터가 아니라 제약이 결정하게 만들었다. lower bound를 낮추는 대신
    analyze() 에서 "격자보다 좁은 전이" 게이트와 boundHits 경고를 함께 낸다. */
 const W_FLOOR_DEFAULT = 0.005;
 const W_FLOOR = { v: W_FLOOR_DEFAULT };
 const THETA_BOX = 60;
-/** 차수별 θ 인덱스 중 '기울기'(softplus 인자)인 것들 — 프로파일 우도에서 상한을 거는 대상.
+/** 차수별 θ 인덱스 중 '기울기'(softplus 인자)인 것들 — 프로파일 우도에서 upper bound를 거는 대상.
  *  H2 의 기울기 함수 s(x) = k1(1−σ1) + k2(σ1−σ2) + k3σ2 는 σ1 ≥ σ2 이므로
  *  k1·k2·k3 의 볼록결합이다. 따라서 세 값을 모두 X 로 제한하면 s_max ≤ X 가 보장된다 —
  *  이것이 "s_max ≤ X 인 모델 전체"에 대한 제약 최대우도를 구할 수 있는 근거다. */
 const SLOPE_IDX = { 0: [2], 1: [2, 3], 2: [2, 3, 4] };
-/** 프로파일 우도에서만 허용하는 기울기 파라미터 상한(θ 공간). 본 적합의 상자는 THETA_BOX 그대로. */
+/** 프로파일 우도에서만 허용하는 기울기 파라미터 upper bound(θ 공간). 본 적합의 상자는 THETA_BOX 그대로. */
 const SLOPE_BOX_MAX = 2000;
-/** 프로파일을 평가할 s_max 상한 격자와, 기준 χ² 를 얻는 '사실상 무제약' 상한. */
+/** 프로파일을 평가할 s_max upper bound 격자와, 기준 χ² 를 얻는 '사실상 무제약' upper bound. */
 const PROFILE_CAPS = [2, 4, 8, 15, 30, 60, 120, 250, 500];
 const PROFILE_REF_CAP = 1200;
-/** χ² 1 자유도 95% 임계값 — 제약 우도비 검정(Δχ² > 3.84 → 해당 상한 기각). */
+/** χ² 1 자유도 95% 임계값 — 제약 우도비 검정(Δχ² > 3.84 → 해당 upper bound 기각). */
 const DCHI2_95 = 3.84;
 function unpackH(order, th, scaleB) {
   const WF = W_FLOOR.v;
@@ -36339,7 +36810,7 @@ function modelI(p, x, order) { return p.B + Math.pow(10, clamp(hOf(p, x, order),
  *  2) 완전 결정론 — makeRng(고정 시드)만 쓴다. 시드가 결과를 바꾸면 재현성 기준
  *     ①(시드를 바꿔도 s_max 가 재현되는가)을 스스로 위반하게 된다.
  *  3) 초기 집단에 기존 hingeStarts 를 심는다 — 좋은 출발점을 버리지 않으면서
- *     그 분지(basin) 밖을 탐색한다.
+ *     그 branch(basin) 밖을 탐색한다.
  *
  * DE/rand/1/bin, F=0.7, CR=0.9. 평가 1회는 O(n)이므로 popsize×maxiter 예산이
  * 곧 비용이다. 부트스트랩은 draw 마다 analyze()를 다시 돌리므로(냉시작 원칙)
@@ -36386,7 +36857,7 @@ function deSearch(costFn, lo, hi, seeds, opts) {
 /**
  * v2.9 — 모델족과 무관한 강건 적합 코어.
  *
- * 왜 뽑아내는가: v2.9 에서 쌍안정 모델족이 추가되는데 IRLS·다중시작·전역탐색·후보비교는
+ * 왜 뽑아내는가: v2.9 에서 bistable 모델족이 추가되는데 IRLS·다중시작·전역탐색·후보비교는
  * 모델과 무관한 절차다. 복제하면 두 족이 서로 다른 방식으로 최소화되어 AICc 비교가
  * 무의미해진다 — 비교가 성립하려면 **같은 기준으로 최소화된 χ²** 여야 한다.
  * 그래서 코어를 하나로 두고 족마다 `predict(θ) → μ 배열` 과 상자만 바꿔 넣는다.
@@ -36398,17 +36869,17 @@ function deSearch(costFn, lo, hi, seeds, opts) {
 function robustFitCore(o) {
   const { n, lo, hi, starts, predict, I, sigG, lamG, huberC, useMask, globalOpts, allowGlobal } = o;
   const TUKEY_C = 4.685;
-  /** v3.0 — 선택적 추가 잔차 블록(관측된 점유율 등). **최적화 목적함수에 포함**되고
+  /** v3.0 — 선택적 추가 residual 블록(관측된 occupancy 등). **최적화 목적함수에 포함**되고
    *  DE·후보비교도 같은 양을 쓴다 — 최소화하는 것과 비교하는 것이 다르면 차수/후보 선택이
    *  뒤틀린다(v2.7 G1 에서 실측한 실패). 보고용 χ²(AICc 가 소비하는 값)는 호출자가
-   *  평균 잔차만으로 따로 계산한다. 없으면 이 함수는 이전과 완전히 동일하게 동작한다. */
+   *  평균 residual만으로 따로 계산한다. 없으면 이 함수는 이전과 완전히 동일하게 동작한다. */
   const extraResid = typeof o.extraResid === "function" ? o.extraResid : null;
   const extraOf = (th) => {
     if (!extraResid) return null;
     const e = extraResid(th);
     return e && e.length ? e : null;
   };
-  /** 표준화 잔차 (IRLS 가중 이전) */
+  /** 표준화 residual (IRLS 가중 이전) */
   const rawOf = (th) => {
     const mu = predict(th);
     const r = new Array(n);
@@ -36500,7 +36971,7 @@ function fitHinge(order, x, I, sigG, lamG, scaleB, starts, huberC, mask, globalO
   const useMask = mask || new Array(n).fill(true);
   const np = H_NPARAMS[order];
   const lo = new Array(np).fill(-THETA_BOX), hi = new Array(np).fill(THETA_BOX);
-  // 프로파일 우도용: 기울기 파라미터에만 상한을 걸어 s_max ≤ slopeCap 인 부분공간으로 제한.
+  // 프로파일 우도용: 기울기 파라미터에만 upper bound를 걸어 s_max ≤ slopeCap 인 부분공간으로 제한.
   // slopeCap 이 기본 상자(THETA_BOX)보다 크면 기울기 방향으로만 상자를 넓힌다 — 프로파일의
   // 기준 χ²(사실상 무제약 MLE)를 얻으려면 필요하다. 본 적합 경로는 slopeCap 을 주지 않으므로
   // 영향받지 않는다(본 적합에서 상자를 넓히면 branch 마다 결과가 엇갈리는 것을 실측했다).
@@ -36584,8 +37055,8 @@ function hingeStarts(order, x, I, spline, lamG, scaleB, darkPrior, nearStep) {
   }
   // v2.8 — '계단 근방' 시작점 가족 (프로파일 우도 전용, nearStep=true 일 때만).
   // 기존 시작점은 전부 스플라인 기울기에서 유도되는데 스플라인은 격자보다 예리해질 수 없어
-  // k₂ 후보가 데이터 분해능에 갇힌다. 상한을 높게 열어도 시작점이 그 영역에 없으면 못 찾는다.
-  // 그래서 실측에서 가장 가파른 '한 스텝'을 찾아 그 위치에 폭이 하한인 전이를 심는다.
+  // k₂ 후보가 데이터 분해능에 갇힌다. upper bound를 높게 열어도 시작점이 그 영역에 없으면 못 찾는다.
+  // 그래서 실측에서 가장 가파른 '한 스텝'을 찾아 그 위치에 폭이 lower bound인 전이를 심는다.
   // 본 적합 경로에는 넣지 않는다 — 넣었을 때 branch 마다 결과가 엇갈리는 것을 실측했다.
   if (nearStep && order >= 1) {
     let stepBest = -Infinity, xStep = NaN;
@@ -36619,7 +37090,7 @@ function hingeStarts(order, x, I, spline, lamG, scaleB, darkPrior, nearStep) {
  *
  * 무엇을 하는가: "s_max ≤ X" 라는 제약 아래에서의 최대우도 적합을 여러 X 에 대해 구하고,
  * 사실상 무제약인 기준 적합과의 Δχ² 를 낸다. Δχ²(X) > 3.84 이면 "s_max ≤ X" 가 95% 로
- * 기각된다 — 즉 s_max 의 **모델 기반 하한**이 된다.
+ * 기각된다 — 즉 s_max 의 **모델 기반 lower bound**이 된다.
  *
  * 왜 이렇게 구현하는가 (이전 시도가 실패한 두 이유를 각각 고친다):
  *  (1) k₂ 를 한 점에 고정(lo==hi)하면 남은 파라미터가 그 고정값을 보상하지 못해
@@ -36628,16 +37099,16 @@ function hingeStarts(order, x, I, spline, lamG, scaleB, darkPrior, nearStep) {
  *      따라서 세 값을 모두 X 로 제한하는 것은 정확히 "s_max ≤ X" 인 부분공간이다.
  *      그 안에서의 최적해가 곧 제약 MLE 다.
  *  (2) 기준 χ² 를 엔진의 기본 적합에서 가져오면, 기본 적합 자체가 이미 얕은 해에 갇혀 있어
- *      아무것도 기각되지 않는다. 기준은 **상한을 크게 연 적합**에서 따로 구해야 한다.
- *      그리고 상한만 열어서는 부족하다 — 시작점이 전부 스플라인 기울기에서 나오므로
+ *      아무것도 기각되지 않는다. 기준은 **upper bound를 크게 연 적합**에서 따로 구해야 한다.
+ *      그리고 upper bound만 열어서는 부족하다 — 시작점이 전부 스플라인 기울기에서 나오므로
  *      격자보다 예리한 영역에 후보가 없다. 그래서 nearStep 시작점 가족을 함께 쓴다.
  *
- * 단조성 강제: 상한이 큰 부분공간은 작은 부분공간을 포함하므로 χ²(X) 는 X 에 대해
+ * 단조성 강제: upper bound가 큰 부분공간은 작은 부분공간을 포함하므로 χ²(X) 는 X 에 대해
  * 비증가여야 한다. 최적화가 큰 X 에서 실패하면 이 성질이 깨지는데, 작은 X 의 해는 큰 X 에서도
  * 실행가능하므로 상향 누적최솟값으로 덮어쓴다(보수적이며 항상 타당).
  *
  * 반환: { caps:[{cap, chi2, chi2Eff, dChi2, sMax}], ref, chi2Ref, floor, ... }
- *       floor = Δχ² > 임계값인 가장 큰 상한 = "적어도 이만큼은 가파르다"는 하한.
+ *       floor = Δχ² > 임계값인 가장 큰 upper bound = "적어도 이만큼은 가파르다"는 lower bound.
  */
 function profileSlopeFloor(order, x, I, sigG, lamG, scaleB, huberC, mask, globalOpts, spline, darkPrior, opts) {
   const op = opts || {};
@@ -36675,18 +37146,18 @@ function profileSlopeFloor(order, x, I, sigG, lamG, scaleB, huberC, mask, global
   const censored = floorIdx === rows.length - 1;
   return {
     order, caps: rows, ref, refCap, chi2Ref, dChi2Crit: dcrit, floor,
-    // 격자의 맨 위까지 기각되면 하한은 '적어도 그 값' 이상이라는 뜻(검열된 하한)
+    // 격자의 맨 위까지 기각되면 lower bound는 '적어도 그 값' 이상이라는 뜻(검열된 lower bound)
     floorCensored: censored,
     rejectedNone: floorIdx < 0,
     gridTop: rows[rows.length - 1].cap,
-    // 기각이 멈춘 바로 위 칸 — 하한의 격자 분해능을 그대로 드러낸다(참값은 이 사이에 있다)
+    // 기각이 멈춘 바로 위 칸 — lower bound의 격자 분해능을 그대로 드러낸다(참값은 이 사이에 있다)
     floorNext: floorIdx >= 0 && floorIdx + 1 < rows.length ? rows[floorIdx + 1].cap : NaN,
     /** 세 가지 판정 —
      *  "supported": 격자 최저값도 기각되지 않음 → 얕은 s_max 를 우도가 지지한다.
-     *  "bounded"  : 어떤 상한에서 기각이 멈춤 → s_max 의 유한한 하한이 존재하고 그 위는 허용된다.
+     *  "bounded"  : 어떤 upper bound에서 기각이 멈춤 → s_max 의 유한한 lower bound가 존재하고 그 위는 허용된다.
      *  "unbounded": 격자 끝까지 전부 기각 → 우도가 s_max 를 위로 전혀 제한하지 못한다.
      *               이것이 '전선이 분해되지 않았다'의 우도적 정의이며, 이때 파라메트릭 s_max 는
-     *               점추정이 아니다(폭 하한·격자가 정한 값일 뿐). 보고는 모델무관 점프 하한으로. */
+     *               point estimate가 아니다(width floor·격자가 정한 값일 뿐). 보고는 model-free 점프 lower bound로. */
     verdict: floorIdx < 0 ? "supported" : (censored ? "unbounded" : "bounded"),
     nUsed: useMask.reduce((a, m) => a + (m ? 1 : 0), 0),
   };
@@ -36696,7 +37167,7 @@ function profileSlopeFloor(order, x, I, sigG, lamG, scaleB, huberC, mask, global
  * v2.7 (T1) — 접선-교점 문턱 (tangent-intersection threshold).
  *
  * 정의: 최대기울기 지점의 접선과 저출력 baseline 직선의 교점.
- * t₁(시그모이드 중심)과 달리 **전이 폭 파라미터화에 의존하지 않고**, 곡선만 있으면
+ * t₁(시그모이드 중심)과 달리 **transition width 파라미터화에 의존하지 않고**, 곡선만 있으면
  * 계산된다 — 그래서 파라메트릭 층이 실패해도 비모수 스플라인에 그대로 적용된다.
  * 실측(WJ-0075c): 파라메트릭이 H0 로 파탄나 t₁ = NaN 인 down branch 에서도
  * 스플라인 기준으로 I_th = 1.78 mW 를 냈다(up 2.76 mW, 차이는 실제 히스테리시스).
@@ -36777,7 +37248,7 @@ function analyze(branch, opts) {
   // v2.6 (E2): 노이즈는 2성분이다.
   //   σ²(I) = [a0² + a1·I]   계수 통계 — 원시 반복에서 측정, Poisson 바닥 a1 ≥ 1/τ,
   //                            반복 평균으로 1/nRep 만큼 줄어든다
-  //         + (a2·I)²        setpoint 간 초과(드리프트/점멸) — 파일럿 잔차에서 측정,
+  //         + (a2·I)²        setpoint 간 초과(드리프트/점멸) — 파일럿 residual에서 측정,
   //                            반복을 늘려도 줄지 않는다
   // 어느 한쪽만 쓰면 반드시 틀린다: 반복만 쓰면 밝은 구간 가중이 5배 과대(χ²/dof 폭주),
   // 파일럿만 쓰면 암계수 구간 상대오차가 과소평가되어 정보량 0인 점들이 피팅을 지배한다.
@@ -36792,7 +37263,7 @@ function analyze(branch, opts) {
   // 계수 통계 성분 (원시 반복이 있을 때만 분리 가능)
   const cnt = vm.source === "replicates" ? { a0: vm.a0, a1: vm.a1, a2: vm.a2 } : null;
   if (cnt && o.counting && isFinite(o.acqTime) && o.acqTime > 0) {
-    cnt.a1 = Math.max(cnt.a1, 1 / o.acqTime);   // 광자 계수의 Poisson 바닥은 물리 하한
+    cnt.a1 = Math.max(cnt.a1, 1 / o.acqTime);   // 광자 계수의 Poisson 바닥은 물리 lower bound
     vm.a1 = cnt.a1;
   }
   const noiseBox = { a0: vm.a0, a1: vm.a1, a2: vm.a2, cnt, source: vm.source, excess: NaN };
@@ -36807,7 +37278,7 @@ function analyze(branch, opts) {
   const sigPointOf = (Ii, i) => {
     const N = noiseBox;
     if (!N.cnt) return Math.sqrt(Math.max(sigmaTotOf(Ii) * sigmaTotOf(Ii) / Math.max(nRepsArr[i], 1), 1e-300));
-    // setpoint 내부 성분(계수 통계 + 반복이 실제로 본 비례 산포)은 반복 평균으로 1/nRep 줄어들고,
+    // setpoint 내부 성분(계수 통계 + 반복이 실제로 본 비례 spread)은 반복 평균으로 1/nRep 줄어들고,
     // setpoint 간 초과 성분만 그대로 남는다. a2_cnt 를 비축소항에 넣으면 σ 가 과대평가되어
     // χ²/dof 가 1 아래로 내려가고 AICc 절약 가드가 옳은 차수까지 눌러버린다.
     const c0 = N.cnt.a0, c1 = N.cnt.a1, c2 = N.cnt.a2;
@@ -36893,10 +37364,10 @@ function analyze(branch, opts) {
         applyNoise();
         spline = fitPSpline(x, y, wgt, { monotone: o.monotone, lambdaFactor: o.lambdaFactor, fast: o.fast });
       } else if (ok && cnt) {
-        // 반복 있음 — 파일럿 잔차는 '보고된 I(반복 평균)'의 총 산포이므로
+        // 반복 있음 — 파일럿 residual는 '보고된 I(반복 평균)'의 총 spread이므로
         //   var_excess(I) = var_pilot(I) − σ_cnt²(I)·c_agg²/nRep
         // 이 setpoint 간 초과 성분이다. 다만 두 가지를 반드시 막아야 한다:
-        //  (1) 총 이상치가 잔차를 부풀려 노이즈 모델에 흡수되는 것 → 상위 10% 잔차 절사,
+        //  (1) 총 이상치가 residual를 부풀려 노이즈 모델에 흡수되는 것 → 상위 10% residual 절사,
         //  (2) 추정 잡음 수준의 미미한 초과를 실재로 오인하는 것 → 증거 게이트(ρ ≥ 3).
         // 게이트를 통과하지 못하면 초과항은 0 이고 순수 반복 법칙을 쓴다(구 동작과 동일).
         const nRepTyp = Math.max(median(nRepsArr) || 1, 1);
@@ -36923,8 +37394,8 @@ function analyze(branch, opts) {
         const rHi = ratios.slice(half), eHi = exRel.slice(half);
         const rhoMed = rHi.length ? median(rHi) : 0;
         if (o.debugNoise) console.log("  [noise] nB=%d rho=%s exRel=%s rhoHi=%s", nB, ratios.map((v) => v.toFixed(2)).join(","), exRel.map((v) => Math.sqrt(v).toFixed(4)).join(","), rhoMed.toFixed(2));
-        // 상한 게이트: setpoint 간 드리프트가 25% 를 넘는다는 것은 물리적으로 비현실적이며,
-        // 그 정도 잔차는 노이즈가 아니라 (a) 총 이상치이거나 (b) 모델이 곡선을 못 따라가는 것이다.
+        // upper bound 게이트: setpoint 간 드리프트가 25% 를 넘는다는 것은 물리적으로 비현실적이며,
+        // 그 정도 residual는 노이즈가 아니라 (a) 총 이상치이거나 (b) 모델이 곡선을 못 따라가는 것이다.
         // 그것을 σ 에 흡수시키면 이상치 처리와 차수 선택이 무력화된다 — 노이즈를 신호로 읽는 것의
         // 정확한 반대 실수다. 그런 경우 초과항을 버리고 순수 반복 법칙으로 되돌아간다.
         const EXCESS_MAX = 0.25;
@@ -36944,8 +37415,8 @@ function analyze(branch, opts) {
   vm.a0 = noiseBox.a0; vm.a1 = noiseBox.a1; vm.a2 = noiseBox.a2; vm.source = noiseBox.source;
   const lamGFinal = lamGBox.v;
   const xlo = x[0], xhi = x[n - 1];
-  // v2.6 (E4): 전이 폭 하한. 격자 간격보다 훨씬 좁은 w 는 물리적 의미가 없으므로
-  // 하한 자체는 낮추되(0.005) 격자 대비 게이트를 별도로 둔다.
+  // v2.6 (E4): 전이 width floor. 격자 간격보다 훨씬 좁은 w 는 물리적 의미가 없으므로
+  // lower bound 자체는 낮추되(0.005) 격자 대비 게이트를 별도로 둔다.
   const dxs = [];
   for (let i = 1; i < n; i++) if (x[i] - x[i - 1] > 0) dxs.push(x[i] - x[i - 1]);
   const medianDx = dxs.length ? median(dxs) : 0.01;
@@ -37000,12 +37471,12 @@ function analyze(branch, opts) {
   let outlierIdx = [], frontScatter = [];
   if (pilot) {
     // v2.6 (E5): 점화 전선 근방(t1 ± 3·max(w, 2Δx))의 점은 이상치가 아니라 측정 대상이다.
-    // 쌍안정 점멸로 산포가 크게 나오지만 제거하면 전이 자체를 버리게 된다.
+    // bistable 점멸로 spread가 크게 나오지만 제거하면 전이 자체를 버리게 된다.
     const t1P = pilot.params ? pilot.params.t1 : NaN, wP = pilot.params ? pilot.params.w : NaN;
-    // v2.7 (E5-fix): halo 에 절대 상한을 건다. 파일럿이 전이를 넓게 잡으면
+    // v2.7 (E5-fix): halo 에 절대 upper bound를 건다. 파일럿이 전이를 넓게 잡으면
     // 3·w 가 측정범위 전체를 덮어(실측: 0.614 dec = 범위의 80%, 91점 중 73점 보호)
     // 강건 이상치 처리가 통째로 꺼진다. 보호는 '전선 근방'이라는 뜻이어야 하므로
-    // 0.06 dec 와 측정범위의 15% 중 작은 쪽을 상한으로 삼는다.
+    // 0.06 dec 와 측정범위의 15% 중 작은 쪽을 upper bound로 삼는다.
     const haloCap = Math.min(0.06, 0.15 * (xhi - xlo));
     const halo = Math.min(3 * Math.max(isFinite(wP) ? wP : 0, 2 * medianDx), haloCap);
     // 데이터가 지목한 전선 ∪ 파일럿 t1 근방 — 둘 중 하나라도 걸리면 보호한다
@@ -37083,10 +37554,10 @@ function analyze(branch, opts) {
   const hasRise = chosen >= 1 && p.k2 > Math.max(p.k1, chosen === 2 ? p.k3 : -Infinity) + 0.2;
   const sMaxAtLeftEdge = hasRise && xAtMax <= xlo + edgeTol;
   const sMaxAtRightEdge = hasRise && xAtMax >= xhi - edgeTol;
-  const thresholdOutOfRange = isFinite(thresholdP) && (Math.log10(thresholdP) < xlo || Math.log10(thresholdP) > xhi);
+  let thresholdOutOfRange = isFinite(thresholdP) && (Math.log10(thresholdP) < xlo || Math.log10(thresholdP) > xhi);
 
-  // ---- v2.6 (E4): 제약 경계 접촉 감지 ----
-  // 최적화 박스나 하한에 붙어서 나온 값은 데이터의 정보가 아니라 제약의 산물이다.
+  // ---- v2.6 (E4): constraint boundary 접촉 감지 ----
+  // 최적화 박스나 lower bound에 붙어서 나온 값은 데이터의 정보가 아니라 제약의 산물이다.
   const boundHits = [];
   const BTOL = 1e-3;
   if (chosen >= 1 && isFinite(p.w) && p.w - W_FLOOR.v < BTOL)
@@ -37102,13 +37573,13 @@ function analyze(branch, opts) {
     const already = new Set(boundHits.map((b) => b.param));
     fit.theta.forEach((t, j) => {
       const nm = names[j] || ("theta[" + j + "]");
-      // softplus 하한에 붙은 파라미터는 θ = −BOX 로도 나타난다 — 같은 사실을 두 번 세지 않는다
+      // softplus lower bound에 붙은 파라미터는 θ = −BOX 로도 나타난다 — 같은 사실을 두 번 세지 않는다
       if (t < 0 && already.has(nm)) return;
-      // 하한 쪽 접촉(θ = −BOX)은 병리가 아니다: B→0(배경 없음), k→0(기울기 0) 은
-      // 모두 물리적으로 정상인 해다. 파라미터가 발산해 상한에 붙는 경우만 보고한다.
+      // lower bound 쪽 접촉(θ = −BOX)은 병리가 아니다: B→0(배경 없음), k→0(기울기 0) 은
+      // 모두 물리적으로 정상인 해다. 파라미터가 발산해 upper bound에 붙는 경우만 보고한다.
       if (!(t > 0 && Math.abs(t - THETA_BOX) < 0.05)) return;
-      // 기울기 파라미터가 상한에 붙어도, 보고값 s_max 가 상한 근처가 아니면
-      // 그 상한은 보고값에 영향을 주지 않는다(전이가 t2 에서 잘려 실효 기울기가 작은 경우).
+      // 기울기 파라미터가 upper bound에 붙어도, 보고값 s_max 가 upper bound 근처가 아니면
+      // 그 upper bound는 보고값에 영향을 주지 않는다(전이가 t2 에서 잘려 실효 기울기가 작은 경우).
       // "어떤 파라미터가 경계에 있는가"가 아니라 "경계가 보고값을 결정했는가"로 판정한다.
       if (/^k[123]$/.test(nm) && !(sMax > 0.5 * THETA_BOX)) return;
       boundHits.push({ param: nm, at: "box", value: t, bound: THETA_BOX });
@@ -37117,6 +37588,46 @@ function analyze(branch, opts) {
   // 격자보다 좁은 전이: 어떤 매끄러운 모델도 s_max 에 유한한 값을 줄 수 없다
   const wSubGrid = chosen >= 1 && isFinite(p.w) && p.w < 0.5 * medianDx;
   if (wSubGrid) boundHits.push({ param: "w", at: "sub-grid", value: p.w, bound: 0.5 * medianDx });
+
+  // ---- v3.7: model-free s_max lower bound (secant) · v3.8: 암준위 차감 ----
+  // 파라메트릭 s_max 가 이 lower bound보다 작으면, 그 값은 **모델과 무관하게** refuted 것이다.
+  // 어떤 모델이 맞는지는 말하지 않는다 — "현재 값이 너무 작다"만 말한다.
+  let darkInfo = null;
+  try { darkInfo = darkFloor(x, I); } catch (e) { darkInfo = null; }
+  let sLowerBoundRaw = null, sLowerBound = null;
+  try {
+    sLowerBoundRaw = secantSlopeLowerBound(x, I, sigI, { z: 3 });
+    sLowerBound = (darkInfo && darkInfo.flat && darkInfo.Dsub > 0)
+      ? secantSlopeLowerBound(x, I, sigI, { z: 3, dark: darkInfo.Dsub, sigDark: darkInfo.sd })
+      : sLowerBoundRaw;
+    // 차감은 lower bound를 조여야 한다. 혹시 더 작아지면(수치·표본 사정) 강한 쪽을 쓴다.
+    if (sLowerBoundRaw && sLowerBound && sLowerBoundRaw.slope > sLowerBound.slope) sLowerBound = sLowerBoundRaw;
+  } catch (e) { sLowerBound = sLowerBoundRaw; }
+  const secantExceeds = !!(sLowerBound && isFinite(sLowerBound.slope) && sLowerBound.slope > sMax);
+
+  // ---- v3.7: ignition bracket와 문턱 모순 판정 ----
+  let ignition = null, thresholdBracket = null, thresholdSource = "model", thresholdPModel = thresholdP;
+  let thresholdUsed = thresholdP;
+  try { ignition = ignitionBracket(x, I, {}); } catch (e) { ignition = null; }
+  // ---- v3.8: 국소 점화 적합 ----
+  let localFit = null;
+  if (!o.internal && o.localFit !== false && !o.fast) {
+    try { localFit = localIgnitionFit(x, I, sigI, ignition, darkInfo); } catch (e) { localFit = { usable: false, why: "예외: " + e.message }; }
+  }
+  if (ignition && ignition.usable) {
+    thresholdBracket = [ignition.pLo, ignition.pHi];
+    // 모델 문턱이 관측된 점화 구간보다 **아래**이고, 그 위치에서 신호가 연속 3점 배경이면
+    // 모델 문턱은 데이터와 모순이다. 그때만 관측 브래킷으로 대체한다.
+    if (isFinite(thresholdP) && thresholdP < ignition.pLo
+        && thresholdContradicted(x, I, thresholdP, ignition.gate, 2)) {
+      thresholdUsed = ignition.pMid;
+      thresholdSource = "ignition-bracket";
+    } else if (!isFinite(thresholdP)) {
+      // 모델이 문턱을 내지 못한 경우에도 관측 브래킷은 남는다 (코퍼스의 '산출 실패' 153건)
+      thresholdUsed = ignition.pMid;
+      thresholdSource = "ignition-bracket";
+    }
+  }
 
   // ---- diagnostics ----
   const maskedResid = fit.rawResid.filter((_, i) => mask[i]);
@@ -37188,23 +37699,69 @@ function analyze(branch, opts) {
     } catch (e) { paJump = null; }
   }
   const jumpWins = paJump && isFinite(paJump.slope) && paJump.slope > sMax;
-  const paReport = jumpWins ? paJump.slope : sMax;
   const paGridLimited = !!(jumpWins && paJump.slope > PA_CONST.JUMP_DOMINANCE * Math.max(sMax, 1e-12));
+
+  // ---- v3.7: lower bound 상태의 단일 정의 ----
+  // 지금까지 'lower bound'은 세 군데에서 따로 판정됐고(가장자리 · constraint boundary · 점프), 그 중
+  // 점프만 보고 경로(paSource)와 프로파일 우도에 연결돼 있었다. 그래서 constraint boundary에
+  // 붙은 141c 가 sMaxIsLowerBound=true 인 채로 paSource="resolved" 로 나왔다.
+  // 판정을 한 곳으로 모아 **lower bound이면 반드시 lower bound이라고 말하게** 한다.
+  let sMaxLowerBound = sMaxAtLeftEdge || sMaxAtRightEdge || boundHits.length > 0 || secantExceeds;
+  const lbSlope = sLowerBound && isFinite(sLowerBound.slope) ? sLowerBound.slope : -Infinity;
+  // paSource 의 의미를 네 가지로 **분리**한다. 합성 격자가 가르쳐 준 구분이다:
+  //   "jump"        격자가 전이를 덮어 한 스텝 안에서 끝났다 (기존)
+  //   "lower-bound" **검증된 lower bound가 실제로 있다** — secant lower bound가 파라메트릭 값을 넘었다.
+  //                 paReport 는 그 lower bound이고, 어떤 Δlog P 에서 나왔는지 함께 낸다.
+  //   "unresolved"  파라메트릭 값이 제약·가장자리로 신뢰할 수 없지만 **더 강한 진술이 없다**.
+  //                 paReport = s_max 이나 point estimate로 읽으면 안 된다.
+  //   "resolved"    point estimate
+  // 이전 판에서는 "제약에 걸렸으면 s_max 는 lower bound"이라고 보았는데, 합성에서 그 s_max 가
+  // 참값을 1.10배 **넘는** 칸이 나왔다(w=0.03, 상승구간 5점). 제약 접촉은 값이 못 미더움을
+  // 뜻할 뿐 아래쪽 보증이 아니다 — 그래서 "unresolved" 를 따로 둔다.
+  let paReport, paSource, paReportDlogP = null, paReportBasis = "parametric";
+  // v3.8 — 국소 적합이 **식별 가능**할 때만 point estimate로 쓴다.
+  // 식별 조건: ν 가 상자에 붙지 않았고, transition width가 lower bound가 아니며, ν 자유/고정 해가 2배 안.
+  // 그리고 model-free lower bound와 모순되면(lower bound보다 작으면) 쓰지 않는다 — lower bound가 더 강한 진술이다.
+  // **국소 적합은 헤드라인으로 쓰지 않는다** — 족 간 검증에서 남은 실패가 있다:
+  //   · 전이가 격자보다 훨씬 좁으면서 모양이 비대칭이면 0.30배로 과소 보고(ν̂ 가 작게 나옴)
+  //   · 문턱 아래 꼬리가 지수보다 빨리 죽으면(erf) 참 s_signal 자체가 유한하지 않다
+  // 가드(ν 상자·width floor·모양비)가 경성 계단은 전부 거르지만 위 둘은 못 거른다.
+  // 헤드라인이 틀리는 것보다 부차 보고로 두는 편이 낫고, 요구사항 §0 과도 맞는다.
+  // 사용자는 localFit 로 값을 그대로 볼 수 있고, 무엇에 의존하는지도 함께 본다.
+  const localAgreesWithBound = !!(localFit && localFit.usable && isFinite(localFit.sMax)
+    && localFit.sMax >= (isFinite(lbSlope) ? lbSlope : -Infinity) - 1e-9);
+  if (localFit) localFit.agreesWithBound = localAgreesWithBound;
+  // o.localFitHeadline === true 로 **명시적으로** 열 수 있다. 기본은 꺼짐.
+  // 자동 선택(개형을 보고 기본값을 바꾸는 것)은 판별자를 찾지 못해 보류했다 —
+  // ν̂ 상자·모양비·"전이 안 점 개수" 셋 다 0.30배 실패 칸을 좋은 칸과 갈라내지 못했다
+  // (전이 안 점 개수: 좋은 칸 1개 vs 실패 칸 2개 — 문턱이 존재하지 않는다).
+  const useLocalHeadline = o.localFitHeadline === true && localAgreesWithBound && localFit.sMax > sMax;
+  if (localFit) localFit.usedForReport = !!useLocalHeadline;
+  if (jumpWins) { paReport = paJump.slope; paSource = "jump"; paReportDlogP = paJump.dlogP; paReportBasis = "jump"; }
+  else if (useLocalHeadline) { paReport = localFit.sMax; paSource = "local-fit"; paReportBasis = "local"; }
+  else if (lbSlope > sMax) { paReport = lbSlope; paSource = "lower-bound"; paReportDlogP = sLowerBound.dlogP; paReportBasis = "secant"; }
+  else if (sMaxLowerBound) { paReport = sMax; paSource = "unresolved"; paReportBasis = "parametric"; }
+  else { paReport = sMax; paSource = "resolved"; }
 
   // ---- v2.8 (P1): 고정-기울기 프로파일 우도 ----
   // 점프가 이기는(=전선이 분해되지 않은) 경우, 파라메트릭 s_max 는 "데이터가 지지하는 값"이
-  // 아니라 "격자·폭하한이 허용한 값"일 수 있다. 그 얕은 값이 자기 우도로 기각되는지를
+  // 아니라 "격자·폭lower bound가 허용한 값"일 수 있다. 그 얕은 값이 자기 우도로 기각되는지를
   // 제약 우도비로 직접 확인한다. 비용이 크므로(적합 8회) 이 조건에서만 돌린다.
   // internal:true 는 내부 재실행(부트스트랩 draw · S1 지터 · branch B)의 표식이다.
   // stabilityCheck:false 로 대신 판별하면 안 된다 — 그 값은 '이번 실행에서 안정성 검사를
   // 할지'를 뜻할 뿐이라 외부 호출자가 비용을 아끼려고 끄면 프로파일까지 조용히 꺼진다.
   let slopeProfile = null;
+  // v3.7: 게이트를 '점프가 이긴 경우'에서 **lower bound 상태 전체**로 넓힌다.
+  // 프로파일 우도가 필요한 상황은 "s_max 가 데이터가 아니라 제약이 정한 값일 때"이고,
+  // 점프 우세는 그 여러 경로 중 하나일 뿐이다. constraint boundary(width floor)로 붙은 경우가
+  // 코퍼스의 다수인데 바로 그 경우에 꺼져 있었다.
   const wantProfile = !o.internal
-    && (o.profileSlope === true || (o.profileSlope !== false && jumpWins && paGridLimited && !o.fast));
+    && (o.profileSlope === true
+        || (o.profileSlope !== false && !o.fast && ((jumpWins && paGridLimited) || sMaxLowerBound)));
   if (wantProfile) {
     // 프로파일은 '데이터가 무엇을 지지하는가'를 묻는 것이므로 가장 유연한 족(maxOrder)에서
     // 수행한다. 선택 차수로 하면 파시모니 가드가 떨어뜨린 H0/H1 에서 프로파일을 돌리게 되어
-    // '그 족이 계단을 표현할 수 없다'는 사실만 재확인한다(실측: down branch H1 은 모든 상한에서
+    // '그 족이 계단을 표현할 수 없다'는 사실만 재확인한다(실측: down branch H1 은 모든 upper bound에서
     // 같은 해, Δχ²=0). 같은 족 안의 중첩 제약이므로 우도비 진술은 그대로 유효하다.
     const profOrder = Math.max(chosen, Math.max(o.maxOrder, 1));
     try {
@@ -37213,20 +37770,28 @@ function analyze(branch, opts) {
     } catch (e) { slopeProfile = null; }
     if (slopeProfile) {
       slopeProfile.reportedSMax = sMax;
-      // 보고된 s_max 가 프로파일 하한보다 얕으면 그 값은 자기 우도로 기각된 것이다
+      // 보고된 s_max 가 프로파일 lower bound보다 얕으면 그 값은 자기 우도로 기각된 것이다
       slopeProfile.reportedRejected = isFinite(slopeProfile.floor) && sMax <= slopeProfile.floor;
     }
   }
+  // 프로파일 우도 lower bound(slopeProfile.floor)은 **보고값에 넣지 않는다.**
+  // 합성 격자에서 이 값이 참값을 초과하는 칸이 나왔다 — 상승 구간에 점이 3개일 때
+  // 참 17.68 에 대해 floor 30, 심한 칸은 250 (14배). 원인: 족이 자료를 표현하지 못하면
+  // 그 부적합이 Δχ² 를 부풀려 낮은 upper bound들이 **거짓으로 기각**된다. 즉 우도 진술 자체가
+  // 오지정 아래에서 교정돼 있지 않다. lower bound를 자처하면서 참값을 넘는 것은 point estimate 오차보다
+  // 나쁘므로, 이 값은 진단으로만 남기고 paReport 에서는 뺀다.
+  // (secant lower bound는 같은 격자 178칸에서 참값 초과 0건이었다 — 그래서 그쪽만 쓴다.)
+  if (slopeProfile) slopeProfile.usedForReport = false;
 
   // ---- v3.0: 점멸(duty cycle) 관측층 ----
-  // 반복 측정의 분산은 지금까지 노이즈 법칙 추정에만 쓰고 버렸다. 쌍안정 점멸이 있는
-  // setpoint 에서는 그 분산이 **신호**다 — 어떤 점이 두 상태의 혼합인지, 점유율이 얼마인지,
+  // 반복 측정의 분산은 지금까지 노이즈 법칙 추정에만 쓰고 버렸다. bistable 점멸이 있는
+  // setpoint 에서는 그 분산이 **신호**다 — 어떤 점이 두 상태의 혼합인지, occupancy가 얼마인지,
   // dwell 안에서 얼마나 평균화됐는지를 모델과 무관하게 알려준다.
   // internal:true(부트스트랩 draw · S1 지터 · branch B)에서는 계산하지 않는다 —
   // 그 경로는 이 결과를 소비하지 않는데 draw 마다 비용만 곱해진다.
-  // ---- v3.2: 교차분지 점유율 ----
-  // 히스테리시스가 있으면 반대 분지가 같은 파워의 고상태를 **직접 측정**한다.
-  // 분지내 추정(위)은 그 준위를 외삽해야 하는데, 외삽에 쓰는 점들이 아직 부분 점등이면
+  // ---- v3.2: cross-branch occupancy ----
+  // 히스테리시스가 있으면 반대 branch가 같은 파워의 고상태를 **직접 측정**한다.
+  // branch 내 추정(위)은 그 준위를 외삽해야 하는데, 외삽에 쓰는 점들이 아직 부분 점등이면
   // 준위가 과소평가되어 f̂ 가 1 쪽으로 부풀어 오른다 — 이쪽이 그 계통을 원리적으로 없앤다.
   let crossOcc = null;
   if (o.crossBranch !== false && o.paTrace && !o.internal
@@ -37242,7 +37807,7 @@ function analyze(branch, opts) {
     }
     catch (e) { occupancy = null; }
   }
-  // 두 추정이 같은 파워에서 얼마나 다른가 — v3.0/v3.1 의 분지내 값이 편향됐음을 드러낸다
+  // 두 추정이 같은 파워에서 얼마나 다른가 — v3.0/v3.1 의 branch 내 값이 편향됐음을 드러낸다
   if (crossOcc && crossOcc.checked && crossOcc.valid && occupancy && occupancy.checked) {
     const byIdx = new Map(crossOcc.rows.map((r) => [Math.round(r.x * 1e6), r]));
     const cmp = [];
@@ -37256,18 +37821,18 @@ function analyze(branch, opts) {
     crossOcc.withinBiasMedian = cmp.length ? median(cmp.map((c) => c.ratio)) : NaN;
   }
 
-  // ---- v2.9: 쌍안정 서술 (BistableFit) ----
+  // ---- v2.9: bistable 서술 (BistableFit) ----
   // H 족이 전선을 매끄러운 시그모이드로 근사하는 한 s_max 는 유한하지 않다(v2.8 프로파일).
   // 같은 데이터를 '저상태 멱법칙 + 고상태 멱법칙 + 전환 파워 + 전환 폭'으로 서술하면
   // 보고량이 전부 유한해진다. 두 족은 같은 강건 코어·같은 공통 마스크 χ² 를 쓰므로
   // AICc 로 직접 비교할 수 있다(robustFitCore 를 공유하는 이유).
   let bistable = null;
-  // ── v3.4: 점유율 제약의 출처 결정 ──
-  // 교차분지 f 는 반대 분지가 **같은 파워의 고상태를 직접 측정**한 값이므로 외삽이 없다.
-  // 그것이 유효하고(간극 있음·계단형 광퇴색 없음) 절대 점유율로 읽을 수 있을 때만 쓴다.
+  // ── v3.4: occupancy 제약의 출처 결정 ──
+  // cross-branch f 는 반대 branch가 **같은 파워의 고상태를 직접 측정**한 값이므로 외삽이 없다.
+  // 그것이 유효하고(간극 있음·계단형 광퇴색 없음) 절대 occupancy로 읽을 수 있을 때만 쓴다.
   // 참값 대조(합성 11조건×3씨앗, 제약이 걸린 33건):
   //   n_high 중앙오차 517% → 18% · P_s 11% → 0% · 폭 73% → 11%.
-  //   대가: n_high 붕괴(<0.5) 0건 → 2건(6%). 그 2건은 NHIGH_FLOOR 로 미식별 처리된다.
+  //   대가: n_high 붕괴(<0.5) 0건 → 2건(6%). 그 2건은 NHIGH_FLOOR 로 unidentified 처리된다.
   // 게이트가 거부한 조건에서는 v3.3 과 완전히 동일하게 동작한다.
   let occConstraint = null, occSourceUsed = "none";
   const crossUsable = !!(crossOcc && crossOcc.checked && crossOcc.valid && crossOcc.absolute);
@@ -37290,8 +37855,8 @@ function analyze(branch, opts) {
     try {
       bistable = bistableAnalyze(x, I, sigG, lamGFinal, scaleB, o.huberC, mask, globalOpts,
         splineC, darkPrior, medianDx,
-        // **분지내** 점유율 제약은 여전히 기본 꺼짐이다(v3.1 재확인: 개선 4·악화 1·무변화 7 —
-        // 사실상 무변화). 기본으로 켠 것은 **교차분지** 제약뿐이다(위 occSourceUsed 참조).
+        // **branch 내** occupancy 제약은 여전히 기본 꺼짐이다(v3.1 재확인: 개선 4·악화 1·무변화 7 —
+        // 사실상 무변화). 기본으로 켠 것은 **cross-branch** 제약뿐이다(위 occSourceUsed 참조).
         // 두 추정의 차이는 실측에서 ×2.87 이며, 그 기원은 v3.3 에서 세 가설을 모두 기각한 뒤
         // **미상으로 남아 있다** — 재현되는 불일치만 확립되어 있다.
         { aiccGuard: o.aiccGuard, fast: o.fast,
@@ -37309,7 +37874,7 @@ function analyze(branch, opts) {
       bistable.lowCurve = grid.map((xv) => Math.pow(10, clamp(bistable.params.aL + bistable.params.nL * xv, -300, 300)));
       bistable.highCurve = grid.map((xv) => Math.pow(10, clamp(bsHighH(bistable.params, xv, bistable.chosenOrder), -300, 300)));
       bistable.fCurve = grid.map((xv) => bsOcc(bistable.params, xv));
-      // ── 적합된 전환과 **관측된 점유율**이 맞는가 ──
+      // ── 적합된 전환과 **관측된 occupancy**이 맞는가 ──
       // 제약으로 넣지 않더라도 이 대조는 공짜로 얻어진다. 어긋나면 그 자체가 결과다:
       // 모델이 그린 전환이 실제 점멸 관측과 다르다는 뜻이다.
       if (occupancy && occupancy.checked) {
@@ -37334,7 +37899,7 @@ function analyze(branch, opts) {
   }
 
   // ---- v2.7 (S1): 선택 안정성 검사 (전체 파이프라인 재실행) ----
-  // 이 엔진에서 실제로 위험한 실패는 "못 맞춘다"가 아니라 "우연히 어느 분지에 떨어졌는가로
+  // 이 엔진에서 실제로 위험한 실패는 "못 맞춘다"가 아니라 "우연히 어느 branch에 떨어졌는가로
   // 보고값이 바뀐다"이다. 실측(WJ-0075c down): 파워값에 상대 1e-12 — 측정 정밀도보다
   // 9 자릿수 작은 — 요동을 주면 선택 차수가 H0↔H2 로 뒤집히고 χ²(H2)가 7,266↔12,509 로
   // 오간다. 이런 결과는 "더 잘 맞추기"가 아니라 "보고 불가"로 처리해야 한다.
@@ -37390,20 +37955,23 @@ function analyze(branch, opts) {
     grid, sTot, sSig, modelCurve, splineCurve,
     fitsSummary: Object.fromEntries(Object.entries(fits).map(([k2, f]) => [k2, f ? { aicc: f.aicc, chi2: f.chi2, k: f.k } : null])),
     chosenOrder: chosen, params: p, theta: fit.theta, paramSE,
-    paReport, paSource: jumpWins ? "jump" : "resolved", paGridLimited,
+    paReport, paSource, paGridLimited, paReportDlogP, paReportBasis,
     paJump, paDark, darkPrior,
-    paThreshold: jumpWins ? paJump.pth : (isFinite(thresholdP) ? thresholdP : sMaxAtP),
+    paThreshold: jumpWins ? paJump.pth : (isFinite(thresholdUsed) ? thresholdUsed : sMaxAtP),
     sMax, sMaxAtP, sTotMax, sTotMaxAtP: Math.pow(10, xTotMax),
-    sMaxIsLowerBound: sMaxAtLeftEdge || sMaxAtRightEdge || boundHits.length > 0,
+    sMaxIsLowerBound: sMaxLowerBound,
     sMaxEdge: sMaxAtLeftEdge ? "left" : (sMaxAtRightEdge ? "right" : null),
-    sMaxBoundReason: boundHits.length ? "constraint" : ((sMaxAtLeftEdge || sMaxAtRightEdge) ? "range-edge" : null),
+    sMaxBoundReason: boundHits.length ? "constraint"
+      : (secantExceeds ? "secant" : ((sMaxAtLeftEdge || sMaxAtRightEdge) ? "range-edge" : null)),
+    sLowerBound, sLowerBoundRaw, secantExceeds, darkFloor: darkInfo, localFit,
     boundHits, wFloor: W_FLOOR.v, medianDlogP: medianDx, stability,
     slopeProfile,
     bistable, occupancy, crossOcc, occSourceUsed,
     occConstraintN: occConstraint ? occConstraint.length : 0,
     aggEffective: branch.aggEffective || "none", aggApplied: aggArr.slice(),
     thresholdOutOfRange,
-    thresholdP, saturationP, background: p.B, slopeVaries,
+    thresholdP: thresholdUsed, thresholdPModel, thresholdSource, thresholdBracket, ignition,
+    saturationP, background: p.B, slopeVaries,
     // v2.7 (T1) 접선-교점 문턱. spline 쪽은 파라메트릭과 독립이므로 파라메트릭이
     // 실패해도 값이 남는다 — 결과 카드·뷰어는 t1 이 NaN 이거나 boundHits 가 있을 때
     // 이쪽을 주 보고값으로 쓴다.
@@ -37557,7 +38125,7 @@ function evaluate(analysis, boot) {
   } else if (isFinite(d.maxParamCorr)) {
     ident = 100 * clamp(1 - Math.max(d.maxParamCorr - 0.95, 0) / 0.05, 0, 1) * 0.8;
   }
-  // v2.6 (E4): 제약 경계에 붙은 파라미터가 있으면 s_max 는 점추정이 아니다.
+  // v2.6 (E4): constraint boundary에 붙은 파라미터가 있으면 s_max 는 point estimate가 아니다.
   const nBound = (analysis.boundHits || []).length;
   if (nBound > 0) ident = Math.min(ident, 100 * clamp(0.30 - 0.10 * (nBound - 1), 0, 1));
   // v2.7 (S1): 옵티마이저 조건만 바꿔도 차수·s_max 가 달라지면 그 값은 데이터의 성질이 아니다.
@@ -37629,12 +38197,12 @@ function synth(scenario, seed) {
 /* ==================== 점멸(duty cycle) 관측층 — v3.0 =========================
  *
  * 무엇을 보는가: 한 setpoint 안의 **반복 측정 분산**. 지금까지 엔진은 반복을 노이즈 법칙
- * 추정에만 쓰고 버렸다. 그런데 쌍안정 점멸이 일어나는 setpoint 에서는 반복이 저상태와
+ * 추정에만 쓰고 버렸다. 그런데 bistable 점멸이 일어나는 setpoint 에서는 반복이 저상태와
  * 고상태 사이에서 갈리므로 분산이 계수통계 기대치를 크게 넘는다 — 이것은 노이즈가 아니라
  * **신호**다.
  *
  * 왜 필요한가(v2.9 가 남긴 축퇴): 점화 중간 준위(예: 저 130 → 중간 984 → 고 13,748 cps)를
- * 모델은 두 가지로 설명할 수 있다 — (a) 점유율 f 가 중간값, (b) 고상태 멱법칙이 그 점을
+ * 모델은 두 가지로 설명할 수 있다 — (a) occupancy f 가 중간값, (b) 고상태 멱법칙이 그 점을
  * 지나도록 가팔라짐. 둘이 유연성을 나눠 쓰는 한 n_high 가 결정되지 않는다.
  * 반복 분산은 이 둘을 가른다: (a)이면 과분산, (b)이면 계수통계 그대로.
  *
@@ -37645,7 +38213,7 @@ function synth(scenario, seed) {
  *  3) 척도는 **중앙값으로 자가보정**한다. 애프터펄싱·레이저 요동처럼 전 구간에 고르게
  *     깔린 초과분산은 귀무에 흡수되고, 국소적으로 튀는 setpoint 만 남는다.
  *  4) 다중검정은 BH-FDR 로 통제한다 — 거짓양성률이 '설계된 값'이지 관측된 값이 아니다.
- *  5) 절반 이상이 걸리면 그것은 쌍안정이 아니라 장치 문제다 — 그렇게 보고한다.
+ *  5) 절반 이상이 걸리면 그것은 bistable가 아니라 장치 문제다 — 그렇게 보고한다.
  */
 /** 정규화 하부 불완전 감마 P(a, x) — 급수/연분수. χ² CDF 에 쓴다. */
 function lowerGammaP(a, xv) {
@@ -37697,11 +38265,11 @@ function bhThreshold(ps, q) {
 }
 
 /**
- * setpoint 별 과분산 판정과 점유율 추정.
+ * setpoint 별 과분산 판정과 occupancy 추정.
  *
  * 반환 rows[i] = { i, x, P, mean, varObs, varNull, ratio, p, blink,
  *                  fMean, fVar, kappa, loLevel, hiLevel }
- *  - fMean : 평균에서 나온 점유율 = (R − R_lo)/(R_hi − R_lo) — **값**을 준다
+ *  - fMean : 평균에서 나온 occupancy = (R − R_lo)/(R_hi − R_lo) — **값**을 준다
  *  - blink : 과분산 판정 — 그 값이 '혼합 해석으로 읽어도 되는가'의 **타당성**을 준다
  *  - kappa : 관측 초과분산 / 완전 이산 점멸이 낼 분산 f(1−f)ΔR².
  *            1 에 가까우면 dwell 안에서 한 상태에 머물렀다는 뜻, 0 에 가까우면
@@ -37807,7 +38375,7 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
   // 고상태 가지는 휘어 있으므로(실측 WJ-0075c up: 점화 직후 국소 기울기 25→11→10→6)
   // 직선 로그-로그 외삽의 결과가 몇 점을 쓰느냐에 따라 달라진다. 실측 민감도:
   // NEI 2→12 에서 마지막 점의 f̂ 가 0.847→0.638 로 33% 이동했다. 한 값을 골라 쓰면
-  // 그 임의성이 통째로 숨는다. 그래서 여러 NEI 로 계산해 **중앙값을 값으로, 산포를
+  // 그 임의성이 통째로 숨는다. 그래서 여러 NEI 로 계산해 **중앙값을 값으로, spread를
   // 계통 불확실성으로** 쓴다. 통계 오차(반복 SEM)와 제곱합해 σ_f 를 만든다.
   const NEI_SET = Array.isArray(o.neighborsSet) ? o.neighborsSet : [3, 5, 8];
   const chi2Inv99 = (nu2) => {
@@ -37831,24 +38399,24 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
   };
   // ── v3.5: 고준위 법칙에 쓰는 점이 **정말 다 켜져 있는가** ──
   //
-  // 분지내 f̂ 가 교차분지 f̂ 보다 실측에서 ×2.87 크다는 사실은 v3.0 부터 알려져 있었고,
+  // branch 내 f̂ 가 cross-branch f̂ 보다 실측에서 ×2.87 크다는 사실은 v3.0 부터 알려져 있었고,
   // v3.3 은 그 기전에 대한 세 가설을 모두 기각한 채 '원인 미상'으로 남겼다. 원인은 이것이다:
   //
   //   점멸 검출(FDR)은 전환 구간 **전체**를 잡지 못한다. dwell 안에서 텔레그래프가 빠르게
   //   평균화되면(κ 큼) 반복 분산이 작아져 전환의 일부만 걸린다. 그러면 블록 바로 위의
-  //   '깨끗한' 점들이 아직 부분 점등 상태이고, 그 점들로 세운 멱법칙은 기울기에 점유율
+  //   '깨끗한' 점들이 아직 부분 점등 상태이고, 그 점들로 세운 멱법칙은 기울기에 occupancy
   //   상승분을 포함한다(겉보기 지수 ~20). 그것을 블록 쪽으로 되외삽하면 고준위가
   //   과소평가된다.
   //
-  // 실측 WJ-0075c up: 최대 블록이 전환폭의 43% 만 덮고, 위쪽 '깨끗한' 점 8개의 교차분지
-  // f 가 0.594…0.984 (중앙 0.821). 고준위 외삽 24k–39k vs 반대분지 실측 82k–97k → ×3.03.
+  // 실측 WJ-0075c up: 최대 블록이 전환폭의 43% 만 덮고, 위쪽 '깨끗한' 점 8개의 cross-branch
+  // f 가 0.594…0.984 (중앙 0.821). 고준위 외삽 24k–39k vs 반대branch 실측 82k–97k → ×3.03.
   // 편향을 분해하면 분자항(저준위) ×1.000 · 분모항(고준위) ×3.03 으로, 전부 여기서 나온다.
   //
   // v3.3 이 이 기전을 기각한 이유도 밝혀졌다: 생성기의 blinkNsw=30 에서는 검출이 전환의
   // 92–100% 를 덮어 기전이 발현될 수 없다(편향 ×1.2–1.7). 점멸을 빠르게 하면 재현된다 —
   // nsw=300 에서 덮는비율 47% · 위쪽점 f 0.80 · 편향 ×2.95 로 실측과 정량적으로 일치한다.
   //
-  // 교차분지 층이 있으면 그 f 로 **부분 점등 점을 걸러낸다**. 없으면(단방향 스윕)
+  // cross-branch 층이 있으면 그 f 로 **부분 점등 점을 걸러낸다**. 없으면(단방향 스윕)
   // 걸러낼 수단이 없으므로 진단만 보고한다.
   const xoRows = (o.crossOcc && o.crossOcc.checked && o.crossOcc.valid && o.crossOcc.absolute)
     ? o.crossOcc.rows : null;
@@ -37903,8 +38471,8 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
       const Rlo = median(los), Rhi = median(his), dR = Rhi - Rlo;
       r.loLevel = Rlo; r.hiLevel = Rhi;
       r.fMean = median(fs);
-      // 계통: NEI 에 따른 f̂ 산포 (반폭). 한 변형만 살아남으면 계통을 알 수 없으므로
-      // 준위 회귀의 잔차 산포로 대체한다.
+      // 계통: NEI 에 따른 f̂ spread (반폭). 한 변형만 살아남으면 계통을 알 수 없으므로
+      // 준위 회귀의 residual spread로 대체한다.
       const fSys = fs.length >= 2 ? 0.5 * (Math.max(...fs) - Math.min(...fs)) : NaN;
       const LN10 = Math.LN10;
       const sMean = Math.sqrt(r.varObs / r.nRep);
@@ -37923,7 +38491,7 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
         const maxVar = Math.max(fv * (1 - fv) * dR * dR, 1e-300);
         r.kappa = excess / maxVar;
         r.mixtureConsistent = r.kappa <= chi2Inv99(r.nu) / r.nu;
-        if (!r.mixtureConsistent) r.rejectReason = "κ̂ 상한 초과 (혼합으로 설명 불가)";
+        if (!r.mixtureConsistent) r.rejectReason = "κ̂ upper bound 초과 (혼합으로 설명 불가)";
         const disc = 1 - 4 * excess / (dR * dR);
         r.fVar = disc >= 0 ? 0.5 * (1 - Math.sqrt(disc)) : 0.5;
       } else r.mixtureConsistent = true;
@@ -37933,7 +38501,7 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
   for (const r of rows) {
     if (r.blink && r.mixtureConsistent === false) { r.blink = false; r.overdispersedOther = true; }
   }
-  // 점유율은 파워에 대해 단조 증가해야 한다(전환을 지나며 고상태 체류가 늘어난다).
+  // occupancy는 파워에 대해 단조 증가해야 한다(전환을 지나며 고상태 체류가 늘어난다).
   // 비단조면 그 검출들은 실제 전환이 아닐 가능성이 크다 — 거르지 않고 **표시**한다.
   let fMonotone = true;
   {
@@ -37948,9 +38516,9 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
   frac = nBlink / rows.length;
   // ── 편향 진단 (v3.5) ──
   // 검출 블록이 전환의 몇 %를 덮는가. 낮으면 고준위 법칙이 부분 점등 점으로 세워진다.
-  // 이 진단은 **실제 점멸 검출이 있고** 교차분지 전환폭이 정의될 때만 뜻이 있다.
+  // 이 진단은 **실제 점멸 검출이 있고** cross-branch 전환폭이 정의될 때만 뜻이 있다.
   //  - nBlink = 0 이면 블록은 느슨한 suspect(p<0.2) 잡음이지 전환 구간이 아니다.
-  //    (실측 WJ-0128c #20 up: nBlink=0 인데 덮는비율 136%, 위쪽 점 점유율 0.009 가 나왔다.)
+  //    (실측 WJ-0128c #20 up: nBlink=0 인데 덮는비율 136%, 위쪽 점 occupancy 0.009 가 나왔다.)
   //  - 전환이 격자보다 예리하면 width1090 이 블록 폭보다 작아 비가 1 을 넘는다.
   //    그때 '덮는 비율'은 의미가 없으므로 1 로 자르고 별도로 표시한다.
   let detectCoverage = NaN, hiPointsOcc = NaN, coverageDegenerate = false;
@@ -37979,7 +38547,7 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
     nOtherDispersed: rows.filter((r) => r.overdispersedOther).length,
     fMonotone,
     nu: nuMed, nRows: rows.length, nBlink, fracBlink: frac,
-    // 절반 이상이 걸리면 국소 현상이 아니다 — 쌍안정이라고 부르면 안 된다
+    // 절반 이상이 걸리면 국소 현상이 아니다 — bistable이라고 부르면 안 된다
     global: frac > 0.5,
     rows,
     blinkIdx: rows.filter((r) => r.blink).map((r) => r.i),
@@ -37987,14 +38555,14 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
 }
 
 /**
- * v3.2 — 교차분지 점유율 (cross-branch occupancy).
+ * v3.2 — cross-branch occupancy (cross-branch occupancy).
  *
- * 왜 필요한가: 분지내 점유율(v3.0)은 고상태 준위를 **전환 구간 너머에서 외삽**해야 하고,
+ * 왜 필요한가: branch 내 occupancy(v3.0)은 고상태 준위를 **전환 구간 너머에서 외삽**해야 하고,
  * 그 외삽에 쓰는 점들이 아직 부분 점등이면 준위가 과소평가되어 f̂ 가 1 쪽으로 부풀어 오른다.
- * 실측(WJ-0075c up, 3.12 mW): 분지내 외삽 준위 ≈ 22,500 vs 하행 실측 86,403 → f̂ 0.478 vs 0.158.
+ * 실측(WJ-0075c up, 3.12 mW): branch 내 외삽 준위 ≈ 22,500 vs 하행 실측 86,403 → f̂ 0.478 vs 0.158.
  * **3배 차이**이고, 방향이 계통적이다.
  *
- * 무엇을 하는가: 히스테리시스가 있으면 반대 분지는 **같은 파워에서 이미 점등된 상태**를
+ * 무엇을 하는가: 히스테리시스가 있으면 반대 branch는 **같은 파워에서 이미 점등된 상태**를
  * 직접 측정한다. 그러면 고상태 준위를 외삽하지 않고 실측값으로 쓸 수 있다:
  *
  *     f(P) = (I_this(P) − D) / (I_other(P) − D)
@@ -38005,17 +38573,17 @@ function occupancyFromReplicates(x, I, reps, sigmaOfI, opts) {
  *      실측: WJ-0075c 0.965(3.5% 오차) vs WJ-0139c 0.901(10%).
  *  (2) **실제 간극**: f 가 의미 있게 1 아래인 점이 있어야 한다. WJ-0139c 는 f 가 어디서나
  *      1.0~1.3 이어서 발광준위 히스테리시스가 없고, 이 방법이 줄 정보가 없다.
- *  (3) 기준 분지가 암계수 위에 있어야 한다.
+ *  (3) 기준 branch가 암계수 위에 있어야 한다.
  */
 function crossBranchOccupancy(trace, branchName, opts) {
   const o = opts || {};
   if (!trace || !trace.P || !trace.I || trace.P.length < 20) return { checked: false, reason: "트레이스 부족" };
-  if (branchName !== "up" && branchName !== "down") return { checked: false, reason: "분지 미지정" };
+  if (branchName !== "up" && branchName !== "down") return { checked: false, reason: "branch 미지정" };
   const P0 = trace.P, I0 = trace.I, raw = trace.Iraw || null;
   const n = P0.length;
   let peak = 0;
   for (let i = 1; i < n; i++) if (P0[i] > P0[peak]) peak = i;
-  if (peak < 8 || n - peak < 8) return { checked: false, reason: "단방향 스윕 — 반대 분지 없음" };
+  if (peak < 8 || n - peak < 8) return { checked: false, reason: "단방향 스윕 — 반대 branch 없음" };
   const mk = (lo, hi) => {
     const a = [];
     for (let i = lo; i <= hi; i++) {
@@ -38027,7 +38595,7 @@ function crossBranchOccupancy(trace, branchName, opts) {
     return a;
   };
   const upArr = mk(0, peak), dnArr = mk(peak + 1, n - 1);
-  if (upArr.length < 8 || dnArr.length < 8) return { checked: false, reason: "분지 점 수 부족" };
+  if (upArr.length < 8 || dnArr.length < 8) return { checked: false, reason: "branch 점 수 부족" };
   const self = branchName === "up" ? upArr : dnArr;
   const other = branchName === "up" ? dnArr : upArr;
   // ── 게이트 (1): 반환점 연속성 — 광퇴색 검사 ──
@@ -38038,11 +38606,11 @@ function crossBranchOccupancy(trace, branchName, opts) {
   let bleachFrac = isFinite(continuity) ? Math.abs(1 - continuity) : NaN;
   const bleachLimit = isFinite(o.bleachLimit) ? o.bleachLimit : 0.10;
   // **방향이 진단을 가른다** (합성 생성기가 잡아낸 결함):
-  //  continuity < 1 → 나중 분지가 어둡다 = 광퇴색. 기준 분지를 그대로 쓸 수 없다.
-  //  continuity > 1 → 나중 분지가 **밝다**. 광퇴색으로는 불가능하다.
+  //  continuity < 1 → 나중 branch가 어둡다 = 광퇴색. 기준 branch를 그대로 쓸 수 없다.
+  //  continuity > 1 → 나중 branch가 **밝다**. 광퇴색으로는 불가능하다.
   //    상행이 최고 파워에서도 아직 다 켜지지 않았다는 뜻이다(스윕이 충분히 높지 않았다).
-  //    이때도 f 는 계산되지만 '절대 점유율'이 아니라 **반대 분지 대비 상대값**이다 —
-  //    기준 분지가 f=1 이라는 보장이 없기 때문이다. 거부하지 않고 그렇게 표시한다.
+  //    이때도 f 는 계산되지만 '절대 occupancy'이 아니라 **반대 branch 대비 상대값**이다 —
+  //    기준 branch가 f=1 이라는 보장이 없기 때문이다. 거부하지 않고 그렇게 표시한다.
   //  (이전 판은 둘을 모두 '광퇴색 의심'으로 묶어 넓은 전환 케이스를 오진하며 거부했다.)
   const refNotSaturated = isFinite(continuity) && continuity > 1 + bleachLimit;
   // 로그-로그 보간 — 값과 **불확도**를 함께 낸다(v3.5).
@@ -38055,8 +38623,8 @@ function crossBranchOccupancy(trace, branchName, opts) {
   // 두 가지 바닥을 둔다.
   //  (1) 계수통계 바닥: 계수율 I 를 시간 τ 로 적분해 n 회 평균했으면 분산은 최소 I/(τ·n).
   //      이것은 추정이 아니라 **아는 값**이다.
-  //  (2) 소표본 보정: s² ~ σ²·χ²_{n−1}/(n−1) 이므로 표본 s 는 σ 의 점추정일 뿐이다.
-  //      한쪽 84% 상한으로 올려 보수적으로 쓴다(n=5 이면 약 1.56 배).
+  //  (2) 소표본 보정: s² ~ σ²·χ²_{n−1}/(n−1) 이므로 표본 s 는 σ 의 point estimate일 뿐이다.
+  //      한쪽 84% upper bound로 올려 보수적으로 쓴다(n=5 이면 약 1.56 배).
   const CHI2_LO_16 = { 1: 0.0403, 2: 0.3475, 3: 0.9008, 4: 1.6488, 5: 2.5165,
     6: 3.4746, 7: 4.5024, 8: 5.5849, 9: 6.7116, 10: 7.8751 };
   const smallSampleInflation = (n) => {
@@ -38129,20 +38697,20 @@ function crossBranchOccupancy(trace, branchName, opts) {
   // ── 광퇴색에 대해 이 지표가 할 수 있는 말의 한계 ──
   // `continuity` 는 반환점의 **계단**만 잡는다. 실제 광퇴색은 스윕 내내 연속적으로 진행하므로
   // 계단을 만들지 않는다 — 합성으로 확인했다(bleach 45% 인데 연속성 0.986).
-  // 그러면 같은 파워에서 두 분지를 비교하면 되지 않을까? 그것도 안 된다:
-  // 나중 분지가 어두운 원인이 (a) 누적 광퇴색인지 (b) 발광준위 히스테리시스인지
+  // 그러면 같은 파워에서 두 branch를 비교하면 되지 않을까? 그것도 안 된다:
+  // 나중 branch가 어두운 원인이 (a) 누적 광퇴색인지 (b) 발광준위 히스테리시스인지
   // **한 번의 루프로는 분리되지 않는다**(둘 다 같은 부호로 나타난다). 고파워 구간을 써도
   // 그쪽은 시간 간격이 가장 짧아 광퇴색 영향이 최소이고, 상행이 아직 포화 전이면
   // 비가 1/f 로 오염된다(실측 합성: 어떤 bleach 값에서도 비가 ~1.2 로 고정).
   // 분리하려면 **루프를 반복**해 두 번째 루프가 첫 번째를 재현하는지 봐야 한다.
   // 따라서 여기서는 계단만 보고하고, 그 이상을 주장하지 않는다.
   const bleachSuspect = isFinite(continuity) && continuity < 1 - bleachLimit;
-  // 암계수: 자기 분지의 저출력 끝
+  // 암계수: 자기 branch의 저출력 끝
   const nDark = Math.max(6, Math.floor(self.length * 0.25));
   const darkPts = self.slice(0, nDark).map((p) => p.I);
   const D = median(darkPts);
   // 암준위 자체의 불확도 — v3.5. 중앙값의 표준오차는 평균의 것보다 √(π/2)≈1.2533 배 크다.
-  // 저출력 끝이 완전히 평탄하지 않으면 이 산포가 그 기울기까지 담는데, 그쪽으로 틀리는 편이
+  // 저출력 끝이 완전히 평탄하지 않으면 이 spread가 그 기울기까지 담는데, 그쪽으로 틀리는 편이
   // 안전하다(불확도를 과소평가하는 것보다 낫다).
   let sdD = NaN;
   if (darkPts.length >= 3) {
@@ -38190,28 +38758,28 @@ function crossBranchOccupancy(trace, branchName, opts) {
   return {
     checked: true, branch: branchName, rows, dark: D, darkSd: sdD,
     continuity, bleachFrac, bleachSuspect, refNotSaturated,
-    // 기준 분지가 완전히 점등됐다고 볼 수 있을 때만 f 를 '절대 점유율'로 읽는다
+    // 기준 branch가 완전히 점등됐다고 볼 수 있을 때만 f 를 '절대 occupancy'로 읽는다
     absolute: valid && !refNotSaturated,
     nPoints: rows.length, nBelow, gap, monotone, width1090, valid,
     reason: valid
       ? (refNotSaturated
-        ? "상행이 최고 파워에서도 포화하지 않았다 — f 는 절대 점유율이 아니라 반대 분지 대비 상대값이다"
+        ? "상행이 최고 파워에서도 포화하지 않았다 — f 는 절대 occupancy가 아니라 반대 branch 대비 상대값이다"
         : null)
       : (!gap ? "발광준위 히스테리시스 간극 없음 — 이 방법이 줄 정보가 없다"
-        : "반환점에서 나중 분지가 계단처럼 어둡다 — 기준 분지를 그대로 쓸 수 없다"),
+        : "반환점에서 나중 branch가 계단처럼 어둡다 — 기준 branch를 그대로 쓸 수 없다"),
   };
 }
 
-/* ==================== 쌍안정 모델족 (v2.9, BistableFit) ====================
+/* ==================== bistable 모델족 (v2.9, BistableFit) ====================
  *
  * 왜 새 족이 필요한가 — v2.8 프로파일 우도가 증명한 것:
- * 매끄러운 시그모이드로 계단을 근사하는 한 최대기울기 s_max 에는 **상한이 없다**
- * (WJ-0075c 두 분지 모두 s_max ≤ 500 까지 전부 기각, turnover 없음). 이것은 최적화
+ * 매끄러운 시그모이드로 계단을 근사하는 한 최대기울기 s_max 에는 **upper bound가 없다**
+ * (WJ-0075c 두 branch 모두 s_max ≤ 500 까지 전부 기각, turnover 없음). 이것은 최적화
  * 실패가 아니라 **보고량 선택의 오류**다: 불연속에 가까운 점화에서 "기울기의 최댓값"은
- * 전이 폭 파라미터가 정하는 값이지 데이터가 정하는 값이 아니다.
+ * transition width 파라미터가 정하는 값이지 데이터가 정하는 값이 아니다.
  *
  * 해결은 모델을 더 유연하게/더 경직되게 만드는 것이 아니라 **보고량이 유한해지도록
- * 매개화를 바꾸는 것**이다. 쌍안정 점화의 물리 서술은 다음과 같다:
+ * 매개화를 바꾸는 것**이다. bistable 점화의 물리 서술은 다음과 같다:
  *
  *   I(P) = B + (1−f)·10^(a_L + n_L·x) + f·10^(h_H(x)),   f = σ((x − x_s)/ω)
  *
@@ -38222,19 +38790,19 @@ function crossBranchOccupancy(trace, branchName, opts) {
  * s_max 를 죽인 축퇴가 이 보고량들에는 존재하지 않는다. 계단이 예리하다는 사실은
  * 병리가 아니라 ω 가 작다는 측정 결과가 된다.
  *
- * 히스테리시스: 상행·하행 분지를 각각 적합하면 전환 파워가 두 개 나오고
- * 그 로그 차이가 히스테리시스 폭이다 — 쌍안정성의 직접 관측량.
+ * 히스테리시스: 상행·하행 branch를 각각 적합하면 전환 파워가 두 개 나오고
+ * 그 로그 차이가 히스테리시스 폭이다 — bistable성의 직접 관측량.
  */
-/** 전환 폭의 하한. H 족의 W_FLOOR 와 달리 **격자보다 훨씬 작아도 된다** —
+/** 전환 폭의 lower bound. H 족의 W_FLOOR 와 달리 **격자보다 훨씬 작아도 된다** —
  *  이 족에서는 ω 가 보고량을 결정하지 않기 때문이다. 0 으로 두지 않는 이유는 순전히
  *  수치적이다(σ 의 도함수가 정확히 0/∞ 이 되면 LM 이 진행하지 못한다). */
 const BS_W_FLOOR = 1e-3;
 /** 파라미터 수: [차수][비대칭 여부]. 비대칭이면 형태 파라미터 ν 가 θ 끝에 하나 붙는다. */
 const BS_NPARAMS = { 0: 7, 1: 10 };
 const bsNParams = (order, skew) => BS_NPARAMS[order] + (skew ? 1 : 0);
-/** ν 의 상한 — 무한히 가파른 상승 꼬리는 ω→0 과 같은 축퇴를 만든다. */
+/** ν 의 upper bound — 무한히 가파른 상승 꼬리는 ω→0 과 같은 축퇴를 만든다. */
 const BS_NU_MAX = 200;
-/** 고상태 멱지수의 물리 바닥 — 이 아래면 '고상태'가 아니므로 미식별로 보고한다(v3.4). */
+/** 고상태 멱지수의 물리 바닥 — 이 아래면 '고상태'가 아니므로 unidentified로 보고한다(v3.4). */
 const NHIGH_FLOOR = 1.0;
 /** 고상태 지수를 보고하기 위해 필요한 **문턱 위 측정 구간**(decade) — v3.5.
  *
@@ -38253,7 +38821,7 @@ const NHIGH_FLOOR = 1.0;
  *  점 개수(nHighPts ≥ 5)만으로는 걸러지지 않는다: 0.16 dec 케이스도 점은 9–10개다.
  *  구간 길이가 점 개수와 다른 정보를 담고 있다. */
 const NHIGH_RANGE_MIN = 0.25;
-/** 점유율 제약을 **철회**하는 갈등 문턱 (v3.5).
+/** occupancy 제약을 **철회**하는 갈등 문턱 (v3.5).
  *
  *  제약이 정당하게 편향을 고칠 때도 세기 χ² 는 나빠진다. 그래서 갈등비 자체를 문턱으로
  *  쓰는 것은 v3.4 에서 명시적으로 거부했다. 그러나 그때는 분포를 몰랐다. 이제 안다:
@@ -38262,7 +38830,7 @@ const NHIGH_RANGE_MIN = 0.25;
  *
  *  20배를 넘으면 그 자료는 이 방법이 검증된 영역 밖에 있다는 뜻이므로, 제약을 적용한
  *  결과를 내놓는 대신 **무제약 적합으로 되돌리고 갈등을 크게 보고한다**. 값을 조용히
- *  바꾸는 것보다 "이 분지에서는 두 자료가 양립하지 않는다"고 말하는 편이 정직하다.
+ *  바꾸는 것보다 "이 branch에서는 두 자료가 양립하지 않는다"고 말하는 편이 정직하다.
  *  합성 54건 중 이 문턱에 걸리는 것은 0건이다(거짓양성 없음). 실측에서는
  *  WJ-0075c 상행만 걸린다(87배). */
 const OCC_CONFLICT_MAX = 20;
@@ -38282,7 +38850,7 @@ function unpackBS(order, th, scaleB, dxMin, skew) {
     nH2: NaN, xsat: NaN, v: NaN, nu: 1,
   };
   if (skew) {
-    // v3.1 — 점유율 형태 파라미터. f = [1+exp(−z)]^(−ν) 에서 상승 꼬리 속도는 ν/ω,
+    // v3.1 — occupancy 형태 파라미터. f = [1+exp(−z)]^(−ν) 에서 상승 꼬리 속도는 ν/ω,
     // 포화 꼬리 속도는 1/ω 이다(수치 확인). 즉 ν 가 **두 꼬리를 분리**한다 —
     // ν>1 이면 '가파른 점화 + 느린 포화'가 된다. ν=1 이 로지스틱(기존 모델)이므로
     // 중첩 비교가 성립하고, 추가할 가치가 있는지는 AICc 가 정한다.
@@ -38310,7 +38878,7 @@ function bsHighSlope(p, x, order) {
   if (!(order >= 1)) return p.nH;
   return p.nH + (p.nH2 - p.nH) * sigmoid((x - p.xsat) / p.v);
 }
-/** 점유율 f(x) — ν=1 이면 로지스틱과 정확히 같다. */
+/** occupancy f(x) — ν=1 이면 로지스틱과 정확히 같다. */
 function bsOcc(p, x) {
   const z = (x - p.xs) / p.w;
   const nu = isFinite(p.nu) && p.nu > 0 ? p.nu : 1;
@@ -38432,7 +39000,7 @@ function bistableStarts(order, x, I, spline, scaleB, darkPrior, mask, skew) {
   return out;
 }
 
-/** 쌍안정 적합 — 강건 코어를 H 족과 공유하므로 χ²/AICc 가 직접 비교 가능하다. */
+/** bistable 적합 — 강건 코어를 H 족과 공유하므로 χ²/AICc 가 직접 비교 가능하다. */
 function fitBistable(order, x, I, sigG, lamG, scaleB, starts, huberC, mask, globalOpts, dxMin, occData, skew) {
   const n = x.length;
   const useMask = mask || new Array(n).fill(true);
@@ -38447,7 +39015,7 @@ function fitBistable(order, x, I, sigG, lamG, scaleB, starts, huberC, mask, glob
     for (let i = 0; i < n; i++) mu[i] = bistableI(p, x[i], order);
     return mu;
   };
-  // v3.0 — 관측된 점유율을 제약으로 넣는다. f(x) 는 모델이 이미 가진 함수이므로
+  // v3.0 — 관측된 occupancy를 제약으로 넣는다. f(x) 는 모델이 이미 가진 함수이므로
   // 새 파라미터가 늘지 않는다. 이것이 '점화 중간 준위를 f 로 볼 것인가 고상태 지수로
   // 볼 것인가'의 축퇴를 끊는다 — 반복 분산이 그 답을 데이터로 정해 주기 때문이다.
   const occ = (occData || []).filter((dd) => isFinite(dd.x) && isFinite(dd.f) && isFinite(dd.sd) && dd.sd > 0);
@@ -38469,8 +39037,8 @@ function fitBistable(order, x, I, sigG, lamG, scaleB, starts, huberC, mask, glob
   for (const i of accepted) chi2 += rawResid[i] * rawResid[i];
   const nAcc = accepted.length, k = np;
   const aicc = nAcc > k + 1 ? chi2 + 2 * k + (2 * k * (k + 1)) / (nAcc - k - 1) : Infinity;
-  // 점유율 잔차는 **AICc 에 넣지 않는다**: H 족은 f 라는 양이 없어 같은 자료로 평가할 수
-  // 없기 때문이다. 대신 쌍안정 쪽만 이 제약을 지고 평균 적합 χ² 로 비교받는다 —
+  // occupancy residual는 **AICc 에 넣지 않는다**: H 족은 f 라는 양이 없어 같은 자료로 평가할 수
+  // 없기 때문이다. 대신 bistable 쪽만 이 제약을 지고 평균 적합 χ² 로 비교받는다 —
   // 제약은 평균 χ² 를 나쁘게만 만들 수 있으므로, 그래도 이기면 정당한 승리다.
   let chi2Occ = 0;
   if (occ.length) {
@@ -38479,16 +39047,43 @@ function fitBistable(order, x, I, sigG, lamG, scaleB, starts, huberC, mask, glob
       if (isFinite(e)) chi2Occ += e * e;
     }
   }
+  // ---- v3.7: θ 상자 경계 접촉 노출 ----
+  // H 족에는 boundHits 가 있는데 bistable 적합에는 없었다. 그래서 θ 가 THETA_BOX 에
+  // 붙어 나온 값(예: nu = 60 = THETA_BOX)이 **적합값처럼** 호출자에게 전달됐다.
+  // 우연히 참값 근처면 더 위험하다 — 경계값을 물리량으로 착각하게 된다.
+  //
+  // softplus 로 감싼 양수 파라미터는 θ → −BOX 가 '그 파라미터 → 0' 이라는 정상 해이므로
+  // 보고하지 않는다(H 족과 같은 관례). 생짜 절편(aL, aH)은 아래쪽 경계도 병리이므로 본다.
+  // xs(θ[5])는 자체 상자(측정범위 근방)를 쓰므로 여기서 세지 않는다.
+  const bsNameOf = (j) => {
+    const nuIdx = order >= 1 ? 10 : 7;
+    if (j === nuIdx && skew) return "nu";
+    return { 0: "B", 1: "aL", 2: "nL", 3: "aH", 4: "nH", 5: "xs", 6: "w", 7: "nH2", 8: "xsat", 9: "v" }[j]
+      || ("theta[" + j + "]");
+  };
+  const RAW_PARAMS = new Set(["aL", "aH"]);
+  const boundHits = [];
+  const BSTOL = 0.05;
+  outcome.theta.forEach((t, j) => {
+    if (j === 5) return;                                   // xs 는 별도 상자
+    if (!isFinite(t)) return;
+    const nm = bsNameOf(j);
+    const hi2 = t > 0 && Math.abs(t - THETA_BOX) < BSTOL;
+    const lo2 = t < 0 && Math.abs(t + THETA_BOX) < BSTOL && RAW_PARAMS.has(nm);
+    if (!hi2 && !lo2) return;
+    boundHits.push({ param: nm, at: hi2 ? "box-hi" : "box-lo", theta: t, bound: THETA_BOX,
+                     value: p[nm] });
+  });
   return { order, skew: !!skew, theta: outcome.theta, params: p, cost: outcome.score, chi2, aicc, k,
-    chi2Occ, nOcc: occ.length,
+    chi2Occ, nOcc: occ.length, boundHits,
     rawResid, irlsW: outcome.irlsW, accepted, nAccepted: nAcc };
 }
 
 /**
- * 쌍안정 서술의 드라이버: BS0/BS1 을 적합하고 AICc 로 고른 뒤, **유한한 보고량**과
- * 그 식별성 판정을 함께 낸다.
+ * bistable 서술의 드라이버: BS0/BS1 을 적합하고 AICc 로 고른 뒤, **유한한 보고량**과
+ * 그 identifiability 판정을 함께 낸다.
  *
- * 식별성 판정이 왜 보고량만큼 중요한가: 저상태 가지가 암계수 바닥 아래에 있으면
+ * identifiability 판정이 왜 보고량만큼 중요한가: 저상태 가지가 암계수 바닥 아래에 있으면
  * n_L 과 대비비는 원리적으로 결정되지 않는다(WJ-0075c 가 정확히 이 경우다 — 점화 직전
  * 신호가 암계수와 구별되지 않는다). 그때도 **전환 파워 P_s 와 고상태 지수 n_H 는
  * 그대로 식별된다.** 무엇이 결정되고 무엇이 결정되지 않는지를 분리해 보고하는 것이
@@ -38500,9 +39095,9 @@ function bistableAnalyze(x, I, sigG, lamG, scaleB, huberC, mask, globalOpts, spl
   const useMask = mask || new Array(n).fill(true);
   const nMask = useMask.reduce((a, m) => a + (m ? 1 : 0), 0);
   const guard = isFinite(o.aiccGuard) ? o.aiccGuard : 4;
-  // 관측된 점유율 — 걸렸고, 혼합으로 설명되며, 마스크를 통과한 setpoint 만 쓴다
-  // 제약의 출처는 두 가지다: (a) 호출자가 준비해 준 배열(v3.4 — 교차분지 점유율),
-  // (b) 분지내 반복 분산(v3.0). (a) 가 있으면 그것을 쓴다 — 교차분지 쪽은 고상태 준위를
+  // 관측된 occupancy — 걸렸고, 혼합으로 설명되며, 마스크를 통과한 setpoint 만 쓴다
+  // 제약의 출처는 두 가지다: (a) 호출자가 준비해 준 배열(v3.4 — cross-branch occupancy),
+  // (b) branch 내 반복 분산(v3.0). (a) 가 있으면 그것을 쓴다 — cross-branch 쪽은 고상태 준위를
   // 외삽하지 않으므로 계통이 원리적으로 없다(v3.2 에서 측정).
   const occData = (Array.isArray(o.occData) && o.occData.length)
     ? o.occData.filter((dd) => isFinite(dd.x) && isFinite(dd.f) && isFinite(dd.sd) && dd.sd > 0)
@@ -38512,7 +39107,7 @@ function bistableAnalyze(x, I, sigG, lamG, scaleB, huberC, mask, globalOpts, spl
           .map((r) => ({ x: r.x, f: r.fMean, sd: r.fSd, i: r.i }))
       : []);
   const maxOrder = o.maxOrder === 0 ? 0 : 1;
-  // v3.1 — 후보는 두 축이다: 고상태 포화(order 0/1) × 점유율 형태(로지스틱 / 비대칭 ν).
+  // v3.1 — 후보는 두 축이다: 고상태 포화(order 0/1) × occupancy 형태(로지스틱 / 비대칭 ν).
   // `skew:false` 로 끄면 v3.0 과 동일한 두 후보만 본다.
   // **비대칭 축은 기본 꺼짐**. 측정: 로지스틱 생성 데이터 12회 중 3회(25%)가 잘못 선택되고
   // 그때 파라미터가 무너진다(ν=60, P_s 오차 63%). 참으로 비대칭(ν=8)인 데이터에서도 5/12 만
@@ -38595,7 +39190,7 @@ function bistableAnalyze(x, I, sigG, lamG, scaleB, huberC, mask, globalOpts, spl
       break;
     }
   }
-  // ── 식별성 ──
+  // ── identifiability ──
   let nLowPts = 0, nHighPts = 0, xLastLow = NaN;
   for (const i of idx) {
     if (x[i] < xHalf - 3 * p.w) { nLowPts++; if (!(xLastLow > x[i])) xLastLow = x[i]; }
@@ -38638,9 +39233,9 @@ function bistableAnalyze(x, I, sigG, lamG, scaleB, huberC, mask, globalOpts, spl
   const gapFloor = Math.max(isFinite(medianDx) && medianDx > 0 ? medianDx : 0, W_FLOOR.v);
   const satAtGap = chosen >= 1 && isFinite(satGap) && satGap <= gapFloor * 1.05;
   // ── v3.4: n_high 물리 바닥 ──
-  // 점유율 제약이 걸리면 적합은 전환 예산을 f 에 몰아주고 고상태를 **평탄하게**(n_H→0)
+  // occupancy 제약이 걸리면 적합은 전환 예산을 f 에 몰아주고 고상태를 **평탄하게**(n_H→0)
   // 놓아버릴 수 있다. 그러면 전환 이후의 멱법칙 상승이 통째로 오차로 남는데도
-  // 기존 식별성 층은 nHighVaries=false·highResolved=true 로 그 0 을 **단일값으로 승인**한다
+  // 기존 identifiability 층은 nHighVaries=false·highResolved=true 로 그 0 을 **단일값으로 승인**한다
   // (실측 WJ-0075c up 에서 nHighSingle=0.00 이 그렇게 보고됐다).
   // 판정: PA 고상태의 멱지수가 선형(1) 아래로 내려가면 그것은 고상태가 아니다.
   // 참값 대조(합성 11조건×3씨앗, 제약이 걸린 33건): 오차<50% 인 24건 중 오표시 0건,
@@ -38656,6 +39251,14 @@ function bistableAnalyze(x, I, sigG, lamG, scaleB, huberC, mask, globalOpts, spl
     chosenOrder: chosen, chosenSkew,
     chosenKey: (occWithdrawn ? keyOf(chosen, chosenSkew) : bestKey) + (occWithdrawn ? "(철회)" : ""),
     nu: p.nu, width1090Dec: bsWidth1090(p),
+    // ---- v3.7: 어떤 파라미터가 θ 상자 경계에 붙었는가 ----
+    // 경계에 붙은 값은 적합값이 아니라 제약의 산물이므로 **값으로 보고하면 안 된다**.
+    // 판정은 여기서 하고, 표시는 호출자가 한다(엔진은 화면을 모른다).
+    boundHits: fit.boundHits || [],
+    paramsAtBound: (fit.boundHits || []).map((b) => b.param),
+    nuAtBound: (fit.boundHits || []).some((b) => b.param === "nu"),
+    nHighAtBound: (fit.boundHits || []).some((b) => b.param === "nH" || b.param === "nH2"),
+    nLowAtBound: (fit.boundHits || []).some((b) => b.param === "nL" || b.param === "aL"),
     fitsSummary: Object.fromEntries(Object.entries(fits).map(([k2, f]) => [k2, f ? { aicc: f.aicc, chi2: f.chi2, k: f.k, order: f.order, skew: !!f.skew } : null])),
     theta: fit.theta, params: p, chi2: fit.chi2, aicc: fit.aicc, k: fit.k,
     chi2Occ: fit.chi2Occ, nOcc: fit.nOcc, occUsed: occData.length,
@@ -38672,7 +39275,7 @@ function bistableAnalyze(x, I, sigG, lamG, scaleB, huberC, mask, globalOpts, spl
     pSwitch: Math.pow(10, xHalf), logPSwitch: xHalf, pSwitchBracket: bracket,
     pSaturation: chosen >= 1 ? Math.pow(10, p.xsat) : NaN,
     log10Contrast, contrast: Math.pow(10, clamp(log10Contrast, -300, 300)),
-    // 저상태가 바닥 아래면 대비비는 하한이다 (분모를 바닥으로 대체)
+    // 저상태가 바닥 아래면 대비비는 lower bound이다 (분모를 바닥으로 대체)
     log10ContrastLB: hH - Math.log10(Math.max(floorLevel, 1e-300)),
     switchWidthDec: p.w,
     widthAtFloor: p.w <= BS_W_FLOOR * 1.05,
@@ -38685,29 +39288,29 @@ function bistableAnalyze(x, I, sigG, lamG, scaleB, huberC, mask, globalOpts, spl
 }
 
 /**
- * 여러 분지의 고상태 국소지수를 **절대 파워 격자**에서 합산한다 (v3.6).
+ * 여러 branch의 고상태 국소지수를 **절대 파워 격자**에서 합산한다 (v3.6).
  *
- * 왜 필요한가: 한 분지의 문턱 위 구간이 0.25 dec 에 못 미치면 n_high 는 결정되지 않는다
- * (NHIGH_RANGE_MIN). 실측 16분지 중 14개가 그렇다 — 스윕을 더 높은 파워까지 늘리지
- * 못하는 상황에서는 **여러 분지를 묶는 것**이 유일한 우회로다.
+ * 왜 필요한가: 한 branch의 문턱 위 구간이 0.25 dec 에 못 미치면 n_high 는 결정되지 않는다
+ * (NHIGH_RANGE_MIN). 실측 16 branch 중 14개가 그렇다 — 스윕을 더 높은 파워까지 늘리지
+ * 못하는 상황에서는 **여러 branch를 묶는 것**이 유일한 우회로다.
  *
- * **P_s 배수가 아니라 절대 파워로 묶어야 한다.** 분지마다 전환 파워가 다르므로
- * "1.2×P_s" 는 분지마다 다른 절대 파워를 가리킨다. 실측 WJ-0128c 12분지를 1.2×P_s 로
+ * **P_s 배수가 아니라 절대 파워로 묶어야 한다.** branch마다 전환 파워가 다르므로
+ * "1.2×P_s" 는 branch마다 다른 절대 파워를 가리킨다. 실측 WJ-0128c 12 branch를 1.2×P_s 로
  * 묶으면 상행 2.9 · 하행 5.6 으로 갈려 지수가 파워에 세게 의존하는 것처럼 보이지만,
  * 절대 파워로 묶으면 0.010–0.013 mW 에서 3.75–3.94 로 평탄하다. 그 '의존성'은 artifact 였다.
  *
- * 참값 검증(자리마다 P_s 를 흩뿌린 합성 6자리 × 2분지 = 11분지, 구간 0.10–0.47 dec):
+ * 참값 검증(자리마다 P_s 를 흩뿌린 합성 6자리 × 2 branch = 11 branch, 구간 0.10–0.47 dec):
  * 네 파워 모두 **오차 0%**, 90% 구간 ±1–2%.
  *
- * 왜 되는가 — 평균이 나쁜 분지를 고치기 때문이 아니다. **하행 분지는 전환 파워가 낮아
+ * 왜 되는가 — 평균이 나쁜 branch를 고치기 때문이 아니다. **하행 branch는 전환 파워가 낮아
  * 문턱 위 구간이 길고 그래서 잘 결정되며**(합성: 하행 6개가 2.17–2.22, 참값 2.20),
  * 중앙값이 짧은 상행의 이상치(1.25)에 끌리지 않기 때문이다. 즉 이 방법은
- * "긴 구간 분지가 하나라도 있으면 그것을 찾아내는" 강건 추정이지 마법이 아니다.
+ * "긴 구간 branch가 하나라도 있으면 그것을 찾아내는" 강건 추정이지 마법이 아니다.
  *
  * @param bistables analyze() 결과의 .bistable 배열 (붕괴·구간없음은 알아서 걸러낸다)
  * @returns { grid: [{P, n, lo90, hi90, nBranch, values}], branches, usable }
  */
-/** 분지 간 사분범위/중앙값이 이 값을 넘으면 '하나의 n_high' 가정이 깨진 것으로 본다.
+/** branch 간 사분범위/중앙값이 이 값을 넘으면 '하나의 n_high' 가정이 깨진 것으로 본다.
  *  동질 합성 9조건에서 0.012–0.141, 이질(이봉) 합성에서 0.811. */
 const POOL_IQR_MAX = 0.20;
 
@@ -38754,17 +39357,17 @@ function poolHighExponent(bistables, opts) {
       lo90: ms[Math.floor(0.05 * nBoot)], hi90: ms[Math.floor(0.95 * nBoot)],
       nBranch: vals.length, values: vals.slice().sort((a2, b2) => a2 - b2) });
   }
-  // 가장 많은 분지가 겹치는 지점을 대표값으로 고른다
+  // 가장 많은 branch가 겹치는 지점을 대표값으로 고른다
   let best = null;
   for (const g of grid) if (!best || g.nBranch > best.nBranch) best = g;
-  // ── 이질성 판정 (v3.6) ──
+  // ── heterogeneity 판정 (v3.6) ──
   //
-  // 합산 중앙값은 "모든 분지가 같은 n_high 를 가진다"는 가정 위에서만 하나의 값에 대한
+  // 합산 중앙값은 "모든 branch가 같은 n_high 를 가진다"는 가정 위에서만 하나의 값에 대한
   // 추정이다. 자리마다 실제로 다르면 중앙값은 **분포의 요약**일 뿐이고, 90% 구간을
   // 신뢰구간으로 읽으면 안 된다.
   //
-  // 판정은 **분지 간 사분범위를 중앙값으로 나눈 값**으로 한다. 동질 합성에서 이 값이
-  // 얼마나 나오는지를 재서 문턱을 잡았다 (6자리 × 2분지, 9개 조건):
+  // 판정은 **branch 간 사분범위를 중앙값으로 나눈 값**으로 한다. 동질 합성에서 이 값이
+  // 얼마나 나오는지를 재서 문턱을 잡았다 (6자리 × 2 branch, 9개 조건):
   //   n_H 1.5 / 2.2 / 4.0 / 8.0 · 고상태 soft · 잡음 0.05 · 광퇴색 8% · 반복 3 · 힌지 sat1
   //   → 0.012 · 0.016 · 0.028 · 0.032 · 0.034 · 0.037 · 0.064 · 0.101 · 0.141
   // 즉 **동질이면 0.15 를 넘지 않는다.** 참 n_H 가 자리마다 다른 합성(1.6 다섯 · 3.1 다섯)
@@ -38774,7 +39377,7 @@ function poolHighExponent(bistables, opts) {
   // (느린 점멸에서 시드에 따라 IQR 2.694 가 나온 적이 있다). 어느 쪽이든 **구간을
   // 하나의 값에 대한 신뢰구간으로 읽으면 안 된다**는 결론은 같다.
   //
-  // 중요: 이질적이어도 **개별 분지 추정은 정확하다**(위 합성에서 분지별 오차
+  // 중요: 이질적이어도 **개별 branch 추정은 정확하다**(위 합성에서 branch별 오차
   // 0·0·0·0·0·1·3·6%). 무너지는 것은 '하나의 값으로 요약하는 것'이지 추정 자체가 아니다.
   let iqrRel = NaN;
   if (best && best.values.length >= 4) {
@@ -38789,7 +39392,7 @@ function poolHighExponent(bistables, opts) {
     grid, best };
 }
 
-/** 쌍안정 합성 데이터 생성기 — 참값을 알고 회수 여부를 판정하기 위한 것.
+/** bistable 합성 데이터 생성기 — 참값을 알고 회수 여부를 판정하기 위한 것.
  *  전환 폭 ω 만 바꿔가며 같은 실험을 반복하는 것이 v2.9 의 결정적 검증이다. */
 function synthBistable(scenario, seed) {
   const rng = makeRng(seed || 1);
@@ -38797,7 +39400,7 @@ function synthBistable(scenario, seed) {
     n: 90, reps: 5, xlo: -1.2, xhi: 0.6,
     B: 120, aL: 1.6, nL: 1.0, aH: 4.1, nH: 1.8, xs: 0.0, w: 0.02,
     nH2: 1.0, xsat: 0.4, v: 0.08,         // order ≥ 1 일 때만 쓰인다
-    nu: 1,                                // 점유율 형태 (1 = 로지스틱)
+    nu: 1,                                // occupancy 형태 (1 = 로지스틱)
     a0: 12, a1: 10, a2: 0.02, order: 0,
   }, scenario);
   const p = { B: s.B, aL: s.aL, nL: s.nL, aH: s.aH, nH: s.nH, xs: s.xs, w: s.w,
@@ -38805,7 +39408,7 @@ function synthBistable(scenario, seed) {
   const P = [], I = [], reps = [], fTrue = [];
   // blinkNsw 를 주면 전환 구간의 반복을 **telegraph 과정**으로 만든다:
   // dwell 당 전환 횟수 N_sw 가 작으면 반복이 두 상태로 갈리고, 크면 dwell 안에서 평균화된다.
-  // 이것이 실제 데이터의 과분산 서명을 만든다 — 점유율 제약을 검증하려면 필수다.
+  // 이것이 실제 데이터의 과분산 서명을 만든다 — occupancy 제약을 검증하려면 필수다.
   const nSw = isFinite(s.blinkNsw) ? s.blinkNsw : NaN;
   const dwellOcc = (f) => {
     if (!(nSw > 0)) return f;
@@ -38845,8 +39448,8 @@ function synthBistable(scenario, seed) {
 /**
  * v3.3 — 양방향 스윕 합성 생성기 (발광준위 히스테리시스 포함).
  *
- * 왜 필요한가: 교차분지 점유율(v3.2)은 두 방향 스윕이 있어야 성립하는데 기존
- * `synthBistable` 은 단일 분지만 만든다. 참값 대조가 불가능하면 그 추정기가 맞는지,
+ * 왜 필요한가: cross-branch occupancy(v3.2)은 두 방향 스윕이 있어야 성립하는데 기존
+ * `synthBistable` 은 단일 branch만 만든다. 참값 대조가 불가능하면 그 추정기가 맞는지,
  * 제약으로 써도 되는지를 **측정으로** 결정할 수 없다.
  *
  * 물리 서술 (실측 WJ-0075c 가 보여준 것을 그대로 매개화):
@@ -38857,7 +39460,7 @@ function synthBistable(scenario, seed) {
  *   xs_up > xs_dn 이면 전환 파워 히스테리시스, w_up ≫ w_dn 이면 상행이 완만하게 켜진다
  *   (실측: 상행 10→90% 폭 0.135 dec 가 모델이 맞춘 0.011 dec 보다 12배 넓었다).
  *
- * 교차분지 추정기의 참값은 **f_up(x) 자체**다 — 겹침 구간에서 f_dn ≈ 1 이므로
+ * cross-branch 추정기의 참값은 **f_up(x) 자체**다 — 겹침 구간에서 f_dn ≈ 1 이므로
  * (I_up − D)/(I_dn − D) → f_up. f_dn 이 1 에서 벗어난 만큼이 그 추정기의 원리적 편향이고,
  * 이 생성기로 그 크기를 직접 잴 수 있다.
  *
@@ -38883,7 +39486,7 @@ function synthSweep(scenario, seed) {
   // ── v3.5: 고상태 준위의 모양을 고를 수 있게 한다 ──
   // v3.4 까지 생성기의 고상태는 **순수 멱법칙**이었다. 그것은 BS order 0 이 정확히
   // 표현하는 형태이므로, 배터리가 "고상태 매개화가 충분한가"를 물어본 적이 없다.
-  // 실측 WJ-0075c 는 반대 분지의 겹침 구간 곡선이 멱법칙+힌지 하나로 표현되지 않는다
+  // 실측 WJ-0075c 는 반대 branch의 겹침 구간 곡선이 멱법칙+힌지 하나로 표현되지 않는다
   // (비 0.68–2.87). 그 상황을 참값과 함께 만들기 위한 선택지다.
   //   power : 10^(aH+nH·x)                          — 종전(대조군)
   //   sat1  : 힌지 하나 (BS order 1 이 정확히 표현) — 대조군
@@ -38947,10 +39550,10 @@ function synthSweep(scenario, seed) {
       const mu = (s.B + (1 - fd) * L + fd * H) * decay * (1 + s.a2 * rng.normal());
       row.push(pois(Math.max(mu * s.tau, 0)) / s.tau);
     }
-    // **실현** 점유율 — 이 스윕에서 실제로 일어난 dwell 평균의 반복 평균.
+    // **실현** occupancy — 이 스윕에서 실제로 일어난 dwell 평균의 반복 평균.
     // 공칭 f 는 앙상블 기댓값이고, 느린 점멸에서는 둘이 크게 다르다(f=0.056 인데
     // 5회 반복이 모두 꺼진 채로 나오는 일이 실제로 일어난다). 세기 자료는 실현값을
-    // 담고 있으므로, 점유율 추정기를 채점할 때 비교 대상은 **실현값**이어야 한다.
+    // 담고 있으므로, occupancy 추정기를 채점할 때 비교 대상은 **실현값**이어야 한다.
     const fReal = fRealSum / s.reps;
     P.push(Math.pow(10, x)); Iraw.push(row);
     Wh.push(220 + 50 * (x - s.xlo) / Math.max(s.xhi - s.xlo, 1e-9));
@@ -39034,6 +39637,289 @@ function paMergeClose(x, I, frac, src, nAgg) {
   }
   return { x: xs, I: Is, src: ss, nAgg: ns };
 }
+/* ---------------------------------------------------------------------------
+ * model-free s_max lower bound — secant(secant) 기울기
+ *
+ * 평균값 정리: 미분 가능한 s 에 대해 임의의 두 점 i<j 에서
+ *     (log10 I_j − log10 I_i) / (x_j − x_i)  ≤  max_{[x_i,x_j]} s(x)
+ * 즉 **어떤 secant 기울기도 s_max 의 lower bound**이다. 모델도, 매끄러움 가정도 필요 없다.
+ * 이것이 "격자가 전이를 분해하지 못할 때 무엇을 말할 수 있는가"의 정답이다 —
+ * point estimate는 불가능하지만 lower bound는 언제나 가능하다.
+ *
+ * 잡음 처리: I 는 관측값이므로 아래쪽 점이 우연히 낮게 튀면 secant가 부풀려진다.
+ * 그래서 상승량에서 **Z·σ 만큼을 먼저 깎는다**(단측 신뢰lower bound). 깎고도 남는 것만
+ * lower bound로 쓴다 — 잡음으로 부풀릴 수 없고, 참값을 넘을 확률은 Z 로 통제된다.
+ * 배경 평탄부의 무의미한 비(114→190 같은)는 σ 가 커서 자동으로 걸러진다.
+ *
+ * 원시(raw) I 를 쓴다 — paJumpOnTrace 와 같은 관례이며, 배경을 빼면 뺀 값의
+ * 불확실도가 다시 들어와 lower bound가 lower bound가 아니게 될 수 있다.
+ */
+function secantSlopeLowerBound(x, I, sigI, opts) {
+  const o = opts || {};
+  const Z = isFinite(o.z) ? o.z : 3;
+  const n = x.length;
+  if (n < 3) return null;
+  const LN10 = Math.LN10;
+  // v3.8 — 암준위 차감(선택). 차감하면 s_signal 을 직접 겨냥하므로 lower bound가 조여진다.
+  // 차감량의 불확실도 sigDark 도 여유에 함께 넣는다.
+  const dark = isFinite(o.dark) && o.dark > 0 ? o.dark : 0;
+  const sigDark = isFinite(o.sigDark) && o.sigDark > 0 ? o.sigDark : 0;
+  const y = new Array(n), sy = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const Ii = I[i] - dark;
+    if (!isFinite(Ii) || Ii <= 0) { y[i] = NaN; sy[i] = NaN; continue; }
+    y[i] = Math.log10(Ii);
+    const s = isFinite(sigI[i]) && sigI[i] > 0 ? Math.sqrt(sigI[i] * sigI[i] + sigDark * sigDark) : NaN;
+    sy[i] = isFinite(s) ? s / (Ii * LN10) : NaN;      // log10 공간 σ
+  }
+  let best = null;
+  for (let i = 0; i < n - 1; i++) {
+    if (!isFinite(y[i]) || !isFinite(sy[i])) continue;
+    for (let j = i + 1; j < n; j++) {
+      if (!isFinite(y[j]) || !isFinite(sy[j])) continue;
+      const h = x[j] - x[i];
+      if (!(h > 0)) continue;
+      const rise = y[j] - y[i] - Z * Math.sqrt(sy[i] * sy[i] + sy[j] * sy[j]);
+      if (!(rise > 0)) continue;
+      const slope = rise / h;
+      if (!best || slope > best.slope) {
+        best = { slope, dlogP: h, iLo: i, iHi: j, pLo: Math.pow(10, x[i]), pHi: Math.pow(10, x[j]),
+                 iLoValue: I[i], iHiValue: I[j], z: Z, dark, sigDark };
+      }
+    }
+  }
+  if (!best) return null;
+  // 같은 lower bound를 주는 가장 **좁은** 구간을 함께 알려 준다 — "Δlog P 얼마에서 나온 lower bound인가"가
+  // 물리적으로 의미 있는 정보이기 때문이다(요구사항 2).
+  return best;
+}
+
+/* ---------------------------------------------------------------------------
+ * 암준위(검출기 dark count) 추정과 **평탄성 검정** — v3.8
+ *
+ * 왜 필요한가: s = Δlog10 I / Δlog10 P 인데 I = D + S 이므로
+ *     d log10 I/dx = [S/(D+S)] · d log10 S/dx = f_S · s_signal ,  f_S < 1
+ * 즉 **관측 기울기는 신호 기울기보다 항상 작다**. 점화 직전에는 S ~ D 라 f_S ≈ 0.5,
+ * 기울기가 절반으로 눌린다. D 는 검출기 암계수(기기 artifact)이지 신호가 아니므로
+ * 빼는 것이 맞다.
+ *
+ * 그런데 **과다 차감은 위험하다**: I_i − D 에서 D 가 크면 낮은 점이 0 에 가까워져
+ * log 비가 폭발하고, lower bound가 참값을 넘을 수 있다(합성에서 실제로 발생). 반대로 과소
+ * 차감은 lower bound를 약하게 할 뿐이다. 그래서 두 겹으로 보수적으로 간다.
+ *   (1) 암평탄부가 **평탄하지 않으면 아예 빼지 않는다.** 전-사태 발광이 이미 오르고
+ *       있는 자료(완만한 전이)에서는 '상수 바닥'이 원리적으로 정의되지 않는다.
+ *   (2) 평탄해도 D̂ − 3σ 로 **일부러 덜 뺀다.**
+ * 합성 검증: 차감 후 lower bound가 참 s_signal 을 넘은 건수 0/15, lower bound는 1.09~1.56배 조여졌다.
+ */
+function darkFloor(x, I) {
+  const n = x.length;
+  if (n < 10) return null;
+  const { D: D0, sig: sd0, gate } = paDarkAndGate(I);
+  if (!isFinite(gate) || !(gate > 0)) return null;
+  let iLit = -1;
+  for (let i = 1; i < n - 1; i++) if (I[i] > gate && I[i + 1] > gate) { iLit = i; break; }
+  const upTo = iLit > 0 ? iLit : n;
+  const idx = [];
+  for (let i = 0; i < upTo; i++) if (isFinite(I[i]) && I[i] <= gate) idx.push(i);
+  if (idx.length < 6) return { D: D0, sd: sd0, flat: false, nDark: idx.length, gate, Dsub: 0, why: "암평탄부 점 부족" };
+  const vals = idx.map((i) => I[i]);
+  const xs = idx.map((i) => x[i]);
+  const medOf = (a) => { const b = a.slice().sort((p2, q2) => p2 - q2);
+    return b.length % 2 ? b[(b.length - 1) / 2] : 0.5 * (b[b.length / 2 - 1] + b[b.length / 2]); };
+  const seOf = (a) => { const m = medOf(a); const mad = 1.4826 * medOf(a.map((v) => Math.abs(v - m)));
+    return (mad > 0 ? mad : Math.sqrt(Math.max(m, 1))) / Math.sqrt(a.length); };
+  const h = Math.floor(idx.length / 2);
+  const lo = vals.slice(0, h), hi = vals.slice(h);
+  const delta = medOf(hi) - medOf(lo);
+  const sDelta = Math.sqrt(seOf(lo) * seOf(lo) + seOf(hi) * seOf(hi));
+  const span = xs[xs.length - 1] - xs[0];
+  const flat = Math.abs(delta) <= 3 * sDelta && span >= 0.10;
+  const D = medOf(vals), sd = seOf(vals);
+  return { D, sd, flat, delta, sDelta, span, nDark: idx.length, gate,
+    Dsub: flat ? Math.max(0, D - 3 * sd) : 0,
+    why: flat ? null : (span < 0.10 ? "암평탄부 구간이 0.10 dec 미만" : `암평탄부가 기울어 있음 (Δ=${(delta / sDelta).toFixed(1)}σ)`) };
+}
+
+/* ---------------------------------------------------------------------------
+ * ignition bracket — 배경 평탄부에서 점등으로 넘어간 구간을 **관측으로만** 집는다.
+ * 모델을 쓰지 않으므로, 모델이 낸 문턱이 이 구간 밖(저파워 쪽)에 있으면
+ * 그것은 데이터와 모순이라는 것을 판정할 수 있다.
+ * 완만한 전이에서는 "배경이 평탄하다가 갑자기 켜진다"는 조건 자체가 성립하지 않아
+ * usable=false 로 물러난다 — 기존 동작을 건드리지 않기 위한 설계다.
+ */
+function ignitionBracket(x, I, opts) {
+  const o = opts || {};
+  const n = x.length;
+  if (n < 10) return null;
+  const { D, sig, gate } = paDarkAndGate(I);
+  if (!isFinite(gate) || !(gate > 0)) return null;
+  const lit = (i) => isFinite(I[i]) && I[i] > gate;
+  // 첫 '점등' = 게이트를 넘고 다음 점에서도 넘어 있는 첫 점(지속성)
+  let iLit = -1;
+  for (let i = 1; i < n - 1; i++) if (lit(i) && lit(i + 1)) { iLit = i; break; }
+  if (iLit <= 0) return null;
+  // 그 앞의 마지막 배경점
+  let iDark = -1;
+  for (let i = iLit - 1; i >= 0; i--) if (isFinite(I[i]) && I[i] <= gate) { iDark = i; break; }
+  if (iDark < 0) return null;
+  // 배경 평탄부가 실재하는가 (최소 5점) · 점등부가 실재하는가 (게이트의 10배 이상까지)
+  let nDark = 0;
+  for (let i = 0; i <= iDark; i++) if (isFinite(I[i]) && I[i] <= gate) nDark++;
+  let iMax = 0;
+  for (let i = 0; i < n; i++) if (isFinite(I[i]) && I[i] > I[iMax]) iMax = i;
+  const usable = nDark >= 5 && I[iMax] > 10 * gate && iMax > iLit;
+  return {
+    usable, D, sig, gate, nDark, iDark, iLit,
+    pLo: Math.pow(10, x[iDark]), pHi: Math.pow(10, x[iLit]),
+    pMid: Math.pow(10, 0.5 * (x[iDark] + x[iLit])),
+    dlogP: x[iLit] - x[iDark],
+  };
+}
+
+/* ---------------------------------------------------------------------------
+ * 국소 점화 적합 — v3.8
+ *
+ * 왜: 전역 H 적합은 암평탄부(점 수십 개)·점화·멱법칙·포화를 한 벌의 꺾은선으로
+ * 동시에 맞춰야 해서 점화를 넓게 퍼뜨린다(141c: 0.03 dec 점화를 0.33 dec 로).
+ * PA 비선형성은 **전이의 국소 성질**이므로 그 구간만 스위치 모형으로 맞추는 편이 낫다.
+ *
+ * 순환을 피하기 위한 규칙:
+ *  · 창은 **적합 전에 자료로만** 정한다 — 기울기가 큰 곳을 골라 창을 잡으면 선택 편향이
+ *    그대로 추정치에 들어간다. 여기서는 관측 ignition bracket(암→점등)에서 고정 여유를 준다.
+ *  · D 는 암평탄부에서, n_H 는 점화 위 멱법칙에서 **각각 따로** 고정한다.
+ *  · 창 안에서 자유로운 것은 (A, x_s, w, ν) 네 개뿐이다.
+ *
+ *   S(x) = A · g^ν · 10^{n_H (x−x_s)},  g = [1+exp(−(x−x_s)/w)]^{−1}
+ *   s_signal(x) = n_H + (ν/(w ln10))·(1−g)
+ *
+ * ν 를 **반드시 자유롭게 둔다**. 족 간 검증에서 ν=1 고정은 생성 모양이 다르면
+ * 0.43~1.65배로 빗나갔고(과대 쪽으로도 빗나간다), ν 를 풀면 0.91~1.12배로 회복됐다.
+ *
+ * 그리고 **회복이 불가능한 영역이 있다**: 문턱 아래 꼬리가 지수보다 빨리 죽으면
+ * (erf·경성 계단) 참 s_signal 자체가 유한하지 않다. 그 영역에서는 ν̂ 가 상자에 붙고
+ * seed 간 spread가 폭발한다 — 그것을 감지해 **point estimate를 내지 않는다**.
+ */
+const LF_NU_MAX = 50, LF_NU_MIN = 0.02, LF_W_FLOOR = 5e-4;
+function localIgnitionFit(x, I, sigI, ign, dk) {
+  if (!ign || !ign.usable) return { usable: false, why: "ignition bracket 없음" };
+  const D = dk && isFinite(dk.D) ? dk.D : ign.D;
+  const { iDark, iLit } = ign;
+  // n_H — 점화보다 0.15 dec 위의 멱법칙에서 따로 잰다
+  const hi = [];
+  for (let i = 0; i < x.length; i++) if (x[i] >= x[iLit] + 0.15 && I[i] - D > 0) hi.push(i);
+  if (hi.length < 3) return { usable: false, why: "점화 위 멱법칙 구간이 3점 미만" };
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const i of hi) { const yy = Math.log10(I[i] - D); sx += x[i]; sy += yy; sxx += x[i] * x[i]; sxy += x[i] * yy; }
+  const nH = (hi.length * sxy - sx * sy) / (hi.length * sxx - sx * sx);
+  if (!isFinite(nH)) return { usable: false, why: "n_H 추정 실패" };
+  // 창: 마지막 배경점 −0.05 dec ~ 첫 점등점 +0.15 dec (자료로만 정해진다)
+  const win = [];
+  for (let i = 0; i < x.length; i++) if (x[i] >= x[iDark] - 0.05 && x[i] <= x[iLit] + 0.15) win.push(i);
+  if (win.length < 8) return { usable: false, why: `창 안 점이 ${win.length}개 (8개 필요)` };
+  const LN10 = Math.LN10;
+  const mk = (q) => ({ A: Math.exp(clamp(q[0], -50, 50)), xs: q[1],
+    w: LF_W_FLOOR + Math.abs(q[2]), nu: clamp(Math.exp(clamp(q[3], -6, 6)), LF_NU_MIN, LF_NU_MAX) });
+  const cost = (q) => {
+    const p = mk(q); let c = 0;
+    for (const i of win) {
+      const z = (x[i] - p.xs) / p.w;
+      const g = z >= 0 ? 1 / (1 + Math.exp(-z)) : Math.exp(z) / (1 + Math.exp(z));
+      const mu = D + p.A * Math.pow(g, p.nu) * Math.pow(10, nH * (x[i] - p.xs));
+      const Ii = Math.max(I[i], 1e-9);
+      const sg = (isFinite(sigI[i]) && sigI[i] > 0 ? sigI[i] : Math.sqrt(Math.max(Ii, 1))) / (Ii * LN10);
+      const r = (Math.log10(Ii) - Math.log10(Math.max(mu, 1e-12))) / sg;
+      c += r * r;
+    }
+    return isFinite(c) ? c : 1e300;
+  };
+  const xs0 = 0.5 * (x[iDark] + x[iLit]);
+  let best = null;
+  // 시작점: 폭 3개 × 진폭 2개 × 모양 3개 = 18회. 48회(2200 iter)와 결과가 같고 3배 빠르다
+  // (족 간 검증에서 회수율 동일). 비용이 288건 일괄 처리에서 직접 문제가 된다.
+  for (const w0 of [0.002, 0.015, 0.08]) for (const A0 of [10, 500]) for (const nu0 of [0.3, 1, 3]) {
+    const r = nelderMead(cost, [Math.log(A0), xs0, w0, Math.log(nu0)], [0.7, 0.03, w0 * 0.7, 0.6], 1800);
+    if (!best || r.f < best.f) best = r;
+  }
+  const p = mk(best.q);
+  const sMaxAt = (pp) => {
+    let sm = -Infinity, xm = x[win[0]];
+    for (let i = 0; i <= 400; i++) {
+      const xx = x[win[0]] + (x[win[win.length - 1]] - x[win[0]]) * i / 400;
+      const z = (xx - pp.xs) / pp.w;
+      const g = z >= 0 ? 1 / (1 + Math.exp(-z)) : Math.exp(z) / (1 + Math.exp(z));
+      const sv = nH + (pp.nu / (pp.w * LN10)) * (1 - g);
+      if (sv > sm) { sm = sv; xm = xx; }
+    }
+    return { sMax: sm, at: Math.pow(10, xm) };
+  };
+  const r0 = sMaxAt(p);
+  // ---- identifiability 판정 ----
+  const nuAtBox = p.nu >= 0.95 * LF_NU_MAX || p.nu <= 1.05 * LF_NU_MIN;
+  const wAtFloor = p.w <= 1.05 * LF_W_FLOOR;
+  // ν 고정(=1) 해와 비교 — 모양이 자료로 정해졌는지의 직접 검사.
+  // 크게 갈리면 '모양이 답을 정한 것'이므로 point estimate를 내지 않는다.
+  let shapeRatio = NaN;
+  {
+    const cost1 = (q) => cost([q[0], q[1], q[2], 0]);
+    let b1 = null;
+    for (const w0 of [0.002, 0.02]) {
+      const r = nelderMead(cost1, [Math.log(100), xs0, w0], [0.7, 0.03, w0 * 0.7], 1200);
+      if (!b1 || r.f < b1.f) b1 = r;
+    }
+    const p1 = mk([b1.q[0], b1.q[1], b1.q[2], 0]);
+    const s1 = sMaxAt(p1).sMax;
+    shapeRatio = Math.max(r0.sMax, s1) / Math.max(Math.min(r0.sMax, s1), 1e-12);
+  }
+  const usable = !nuAtBox && !wAtFloor && isFinite(r0.sMax) && r0.sMax > 0 && shapeRatio <= 2.0;
+  return {
+    usable, sMax: r0.sMax, sMaxAtP: r0.at, xs: p.xs, w: p.w, nu: p.nu, nH, A: p.A,
+    nWin: win.length, nHi: hi.length, chi2: best.f, D, shapeRatio, nuAtBox, wAtFloor,
+    why: usable ? null
+      : nuAtBox ? `모양 파라미터 ν 가 상자 경계(${p.nu.toFixed(2)}) — 문턱 아래 꼬리가 결정되지 않음`
+      : wAtFloor ? "transition width가 lower bound에 붙음"
+      : shapeRatio > 2.0 ? `모양 가정이 답을 좌우함 (ν 자유/고정 해가 ${shapeRatio.toFixed(1)}배 차이)`
+      : "수치 실패",
+  };
+}
+/** 결정론적 Nelder–Mead (국소 적합 전용 — 전역 탐색은 상위 층이 맡는다) */
+function nelderMead(fn, q0, step, iters) {
+  const n = q0.length;
+  let S = [q0.slice()];
+  for (let i = 0; i < n; i++) { const q = q0.slice(); q[i] += step[i]; S.push(q); }
+  let fv = S.map(fn);
+  for (let it = 0; it < iters; it++) {
+    const o = fv.map((v, i) => i).sort((a, b) => fv[a] - fv[b]);
+    S = o.map((i) => S[i]); fv = o.map((i) => fv[i]);
+    const c = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) c[j] += S[i][j] / n;
+    const r = c.map((cc, j) => cc + (cc - S[n][j])); const fr = fn(r);
+    if (fr < fv[0]) { const e = c.map((cc, j) => cc + 2 * (cc - S[n][j])); const fe = fn(e);
+      if (fe < fr) { S[n] = e; fv[n] = fe; } else { S[n] = r; fv[n] = fr; } }
+    else if (fr < fv[n - 1]) { S[n] = r; fv[n] = fr; }
+    else { const co = c.map((cc, j) => cc + 0.5 * (S[n][j] - cc)); const fc = fn(co);
+      if (fc < fv[n]) { S[n] = co; fv[n] = fc; }
+      else for (let i = 1; i <= n; i++) { S[i] = S[i].map((v, j) => S[0][j] + 0.5 * (v - S[0][j])); fv[i] = fn(S[i]); } }
+  }
+  const b = fv.map((v, i) => i).sort((a, b2) => fv[a] - fv[b2])[0];
+  return { q: S[b], f: fv[b] };
+}
+
+/** 모델 문턱이 관측과 모순인가 — 주장한 문턱에서 그 뒤 m 점까지 모두 배경이면 모순이다.
+ *  (완만한 전이에서는 참 문턱에서 이미 신호가 들려 있으므로 이 조건이 서지 않는다.) */
+function thresholdContradicted(x, I, thrP, gate, m) {
+  if (!isFinite(thrP) || !isFinite(gate)) return false;
+  const xt = Math.log10(thrP);
+  let iTh = -1;
+  for (let i = 0; i < x.length; i++) if (x[i] <= xt) iTh = i;
+  if (iTh < 0) return true;                       // 문턱이 측정범위보다 아래
+  const need = isFinite(m) ? m : 2;
+  let k = 0;
+  for (let i = iTh; i < x.length && k <= need; i++, k++) {
+    if (!(isFinite(I[i]) && I[i] <= gate)) return false;
+  }
+  return k > need;
+}
+
 function paDarkAndGate(Ih) {
   const ns = Math.max(3, Math.floor(PA_CONST.DARK_FRAC * Ih.length));
   const low = Ih.slice().sort((a, b) => a - b).slice(0, ns);
@@ -39121,7 +40007,7 @@ function paHighStateBranch(P, I, W, pass, opts) {
   const m = paMergeClose(x0, hs.Ih, PA_CONST.MERGE_FRAC, hs.src, hs.nAgg);
   const Pm = m.x.map((v) => Math.pow(10, v));
   // v2.6 (E1): 원시 반복을 살려 보낸다. 이것이 없으면 노이즈 법칙을 측정할 수 없고
-  // 엔진은 파일럿 잔차 폴백으로 떨어져 a1(계수 통계 성분)을 0으로 몰아버린다.
+  // 엔진은 파일럿 residual 폴백으로 떨어져 a1(계수 통계 성분)을 0으로 몰아버린다.
   // src[j] 는 (a..b) 슬라이스 기준 인덱스이므로 +a 로 원본 좌표계로 되돌린다.
   const Iraw = opts && opts.Iraw ? opts.Iraw : null;
   const reps = Iraw ? m.src.map((j) => (j >= 0 && Iraw[j + a] ? Iraw[j + a].slice() : null)) : null;
@@ -39529,7 +40415,7 @@ function riseAnalyze(input, opts) {
   const dt = input.dtMedian;
   if (rise.ok && isFinite(dt) && isFinite(rise.free.t1e) && rise.free.t1e < 3 * dt) {
     rise.unresolvedFast = true;
-    rise.notes.push(`상승이 시간 분해능(${(dt * 1e3).toPrecision(3)} ms/샘플)에 근접 — 보고값은 상한`);
+    rise.notes.push(`상승이 시간 분해능(${(dt * 1e3).toPrecision(3)} ms/샘플)에 근접 — 보고값은 upper bound`);
   }
   // decay after gate-off
   let decay = null;
@@ -39550,7 +40436,7 @@ function riseAnalyze(input, opts) {
     const isLogistic = rise.fit && rise.fit.model === "logistic_delay";
     const strongDelay = isLogistic && rise.fit.params.r * rise.fit.params.tm > 2;
     if (rise.unresolvedFast) {
-      verdict = { klass: "unresolved", text: "상승이 분해능보다 빠름 (τ 상한만 보고) — 임계 위 멀리이거나 비-avalanche" };
+      verdict = { klass: "unresolved", text: "상승이 분해능보다 빠름 (τ upper bound만 보고) — 임계 위 멀리이거나 비-avalanche" };
     } else if (strongDelay || rho > 0.25) {
       verdict = { klass: "avalanche", text: "S자형 유도기 검출 — avalanche형 상승 (임계 근방 동작)" };
     } else if (rho >= 0 && rho < 0.12) {
@@ -39759,6 +40645,7 @@ return {
   // internals exposed for tests
   glog10, estimateVarianceModel, makeSplineBasis, fitPSpline, fitHinge, unpackH, modelI, slopeOf, hingeStarts,
   runsTest, makeRng, lm, median, mad, quantile, tangentThreshold, deSearch, profileSlopeFloor,
+  secantSlopeLowerBound, ignitionBracket, darkFloor, localIgnitionFit,
   robustFitCore, unpackBS, bistableI, bistableSlope, bsHighSlope, bsOcc, bsHalfX, bsWidth1090, bistableStarts, fitBistable, bistableAnalyze, synthBistable, synthSweep, BS_W_FLOOR,
   poolHighExponent,
   occupancyFromReplicates, chi2SF, bhThreshold, crossBranchOccupancy,
@@ -40579,9 +41466,12 @@ const App = {
     bandMin: 480, bandMax: 680,
     xUnit: "W",            // "W" | "density" (mW/cm², needs calibration)
     fileSort: "name",      // 파일 목록 정렬: name(자연순) | added | type | size
-    // v2.6 뷰어 레이어 (기본: 데이터 + 피팅 곡선 + PA + I_th + 잔차만)
-    layers: { fit: true, pa: true, ith: true, resid: true, excluded: true, bistable: true, blink: true,
+    // v3.8 뷰어 레이어 — 기본은 **최소**: 분석 대상 branch + 피팅 곡선 + I_th + PA 위치.
+    // (LAYER_DEFAULTS 와 같은 값이어야 한다. 두 벌이 어긋나면 저장본이 기본값을 덮어쓴다.)
+    layers: { fit: true, pa: true, ith: true,
+      resid: false, excluded: false, bistable: false, blink: false, other: false,
       envelope: false, spline: false, weights: false, bootband: false, norm: false },
+    layersV: 2,            // 레이어 기본값 세대. 저장본이 더 낮으면 한 번 새 기본값으로 이관한다.
   },
   calib: {
     pairs: [{ pm: null, end: null }, { pm: null, end: null }, { pm: null, end: null }], // PM↔endpoint 측정쌍 (행 3~5개, 채운 만큼만 계산)
@@ -40591,16 +41481,20 @@ const App = {
     objSel: -1,                   // 선택된 objective 인덱스 (-1 = 직접 입력)
     objMag: null,                 // 현재 배율 (선택 시 자동 입력, 직접 수정 가능)
     umPerPx: null,                // (구버전 호환) 직접 입력 유효 픽셀 스케일
+    umPerPxMeasured: null,        // 눈금 타깃으로 **실측한** µm/px — 있으면 최우선
+    displayGamma: 1,              // v3.11: 뷰어 표시 LUT 의 감마. 1 이면 보정 없음.
+                                  //   저장본이 y = 255·(I/255)^(1/γ) 로 인코딩되어 있으면
+                                  //   피팅 전에 I = 255·(y/255)^γ 로 되돌린다.
     beam: null,                   // fitGaussian2D 결과 (+binFactor)
     metrics: null,                // beamMetrics 결과
     densityMode: "peak",          // peak | e2avg | fwhm
-    areaBasis: "d4sigma",         // d4sigma (ISO 11146 회전 D4σ · 기본) | gauss (1/e² Gaussian 피팅)
+    areaBasis: "auto",            // auto(측정 교차점으로 선택 · 기본) | d4sigma | gauss
     areaBasisUserSet: false,      // true면 사용자가 직접 고른 값 — 기본값 변경 시 덮어쓰지 않는다
     lensDbUrl: null,              // 공용 렌즈 목록 Firebase RTDB URL (빌드 내장값보다 우선)
     lambdaNm: 1064,               // 여기 파장 (회절 한계 대조용)
     enabled: false,
     // ---- INNO Ledger 연동 (설계 확정본 §4 항목4 · Phase 7) ----
-    ledger: { projectId: "", apiKey: "", uid: "" },  // Firestore 접속 정보 (PC별 설정값, lensDbUrl과 동일 패턴)
+    ledger: { projectId: "", apiKey: "", uid: "" },  // Firestore 접속 정보 (PC별 설정값, lensDbUrl와 동일 패턴)
     session: null,             // 현재 적용된 Ledger 보정 세션 요약값 (fetchLedgerCalib 결과)
     sessionActive: false,      // true면 calibCoefficient()가 session.coefficient를 우선 사용
     sessionError: null,        // 마지막 조회 실패 사유 (배지에 표시)
@@ -40639,8 +41533,8 @@ function downloadBlob(name, blob) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 function downloadText(name, text, mime = "text/plain") {
-  // BOM은 Excel이 CSV의 한글을 깨뜨리지 않게 하려는 것 → CSV/텍스트에만 붙인다.
-  // JSON에 BOM이 붙으면 엄격한 파서(JSON.parse 등)가 거부한다.
+  // BOM는 Excel가 CSV의 한글을 깨뜨리지 않게 하려는 것 → CSV/텍스트에만 붙인다.
+  // JSON에 BOM가 붙으면 엄격한 파서(JSON.parse 등)가 거부한다.
   const bom = /json/i.test(mime) ? "" : "﻿";
   downloadBlob(name, new Blob([bom + text], { type: mime + ";charset=utf-8" }));
 }
@@ -40852,7 +41746,7 @@ function renderAll() {
       <svg width="72" height="72" viewBox="0 0 24 24" fill="none"><path d="M12 3L3 19h18L12 3z" stroke="#3987e5" stroke-width="1.4"/><path d="M9.5 14.5l1.8-3.4 1.4 2.2 1.8-3.8" stroke="#c98500" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <div class="big">INNO Prism에 오신 것을 환영합니다</div>
       <div>.h5 광학 측정 파일을 열거나 이 창에 끌어다 놓으세요.<br>
-      Power scan은 자동으로 Non-linearity 피팅이 수행됩니다.</div>
+      Power scan는 자동으로 Non-linearity 피팅이 수행됩니다.</div>
       <div class="flex"><button class="primary" onclick="document.getElementById('file-input').click()">파일 열기</button>
       <button onclick="document.getElementById('dir-input').click()">폴더 열기</button></div>
       <div class="muted small">모든 데이터는 이 PC의 브라우저 안에서만 처리됩니다 (오프라인 동작).</div>
@@ -40883,6 +41777,58 @@ function renderAll() {
     default: return renderGeneric(rec);
   }
 }
+/** v3.7 — 보고 상태 배지. 네 상태를 **다른 말로** 표시한다:
+ *  lower bound(검증됨) / unidentified / 격자한계 점프 / point estimate. 셋을 한 색으로 칠하면 구분이 사라진다. */
+function paBadge(a) {
+  if (a.paSource === "lower-bound") return ' <span class="tag-Low">model-free lower bound</span>';
+  if (a.paSource === "unresolved") return ' <span class="tag-Poor">unidentified — point estimate 아님</span>';
+  if (a.paGridLimited) return ' <span class="tag-Low">grid-limited lower bound</span>';
+  return "";
+}
+/** 왜 unidentified인가 — 판정 근거를 그대로 옮긴다(추측하지 않는다). */
+function unresolvedWhy(a) {
+  const bh = a.boundHits || [];
+  if (bh.length) {
+    const w = bh.find((b) => b.param === "w");
+    if (w && w.at === "sub-grid") return `transition width가 파워 격자보다 좁습니다 (w=${fmt(w.value, 3)} < 격자/2=${fmt(w.bound, 3)} dec)`;
+    if (w) return `transition width가 lower bound에 붙었습니다 (w=${fmt(w.value, 3)} dec = 모델 최소폭)`;
+    return `constraint boundary 접촉: ${bh.map((b) => b.param).join(", ")}`;
+  }
+  if (a.sMaxEdge) return `기울기 최대가 측정범위 ${a.sMaxEdge === "left" ? "왼쪽" : "오른쪽"} 끝입니다`;
+  return "식별 조건 미충족";
+}
+/** v3.8 — dark floor (검출기 암계수) 차감 상태.
+ *  I = D + S 이므로 관측 기울기 = [S/(D+S)]·신호 기울기 로 **눌린다**. D 는 기기 artifact 이므로
+ *  빼는 것이 맞지만, 과다 차감은 lower bound를 부풀리므로 평탄할 때만 · 3σ 덜 뺀다. */
+function darkTxt(a) {
+  const d = a.darkFloor;
+  if (!d) return "";
+  if (!d.flat) {
+    return `<div class="s muted">dark floor 차감 안 함 — ${esc(d.why || "평탄하지 않음")}.
+      pre-avalanche 발광이 이미 오르고 있으면 '상수 바닥'이 정의되지 않으므로 빼지 않습니다
+      (억지로 빼면 낮은 점이 0 에 붙어 lower bound가 부풀려집니다).</div>`;
+  }
+  const raw = a.sLowerBoundRaw && isFinite(a.sLowerBoundRaw.slope) ? a.sLowerBoundRaw.slope : NaN;
+  const cor = a.sLowerBound && isFinite(a.sLowerBound.slope) ? a.sLowerBound.slope : NaN;
+  return `<div class="s">dark floor 차감됨: D = ${fmt(d.D, 4)} counts → ${fmt(d.Dsub, 4)} 만큼 차감
+    <span class="muted">(D̂ − 3σ, 일부러 덜 뺌)</span>${isFinite(raw) && isFinite(cor) && cor > raw
+      ? ` · lower bound ${fmt(raw, 4)} → <b>${fmt(cor, 4)}</b> (×${fmt(cor / raw, 3)})` : ""}</div>`;
+}
+/** v3.8 — 국소 점화 적합 (부차 보고). 헤드라인이 아닌 이유까지 함께 보인다. */
+function localFitTxt(a) {
+  const L = a.localFit;
+  if (!L) return "";
+  if (!L.usable) {
+    return `<div class="s muted">국소 점화 적합 (local S-curve): ${isFinite(L.sMax) ? "n_max ≈ " + fmt(L.sMax, 4) : "산출 실패"}
+      ${isFinite(L.nu) ? `· shape ν̂ = ${fmt(L.nu, 3)}` : ""} — <b>point estimate로 쓰지 않음</b>: ${esc(L.why || "-")}</div>`;
+  }
+  return `<div class="s">국소 점화 적합 (local S-curve): <b>n_max ≈ ${fmt(L.sMax, 4)}</b> @ P=${fmt(L.sMaxAtP, 4)} W
+    · shape ν̂ = ${fmt(L.nu, 3)} · transition width ${fmt(L.w, 3)} dec · n_H = ${fmt(L.nH, 3)} (창 ${L.nWin}점)
+    <span class="muted">— 점화 구간만 떼어 맞춘 값입니다. 전역 적합과 달리 암평탄부·포화의 영향을 받지 않지만,
+    문턱 아래 tail 의 모양 가정에 의존합니다. 합성 검증 회수율 0.92~1.16배(모양이 표집된 조건).</span>
+    ${L.usedForReport ? "" : `<div class="s muted">헤드라인에는 쓰지 않습니다 — 기본값은 보수적입니다
+      (<code>localFitHeadline: true</code> 로 열 수 있습니다).</div>`}</div>`;
+}
 function viewTabLabel(rec) {
   return { power_apd: "분석 · Power scan", power_emccd: "분석 · Power scan", emccd_readout: "스펙트럼", ple: "PLE 맵", scan2d: "2D 맵", histogram: "히스토그램", rise_time: "분석 · Rise time", darkening: "분석 · Darkening", generic: "미리보기" }[rec.det.type] || "보기";
 }
@@ -40896,7 +41842,7 @@ const CALIB_W_PER_UW = 1e-6;
 const wToUw = (v) => (v == null || !isFinite(v) ? "" : Number((v / CALIB_W_PER_UW).toPrecision(12)));
 const uwToW = (v) => (v === "" || v == null || !isFinite(Number(v)) ? null : Number(v) * CALIB_W_PER_UW);
 
-/** 측정쌍 행 수의 하한·상한. 하한은 "항상 보이는 행 수"일 뿐 입력 의무가 아니다 —
+/** 측정쌍 행 수의 lower bound·upper bound. lower bound는 "항상 보이는 행 수"일 뿐 입력 의무가 아니다 —
  *  계산은 **실제로 채운 개수**로만 한다(빈 행은 없는 것과 같다). */
 const CALIB_PAIR_MIN = 3;
 const CALIB_PAIR_MAX = 5;
@@ -40925,7 +41871,7 @@ function normalizeCalibPairs(c) {
 
 /** C = P_sample / P_PM  from 1–CALIB_PAIR_MAX (PM, endpoint) pairs.
  *  1 pair → plain ratio; 2+ pairs → through-origin LSQ slope.
- *  3+ pairs → 잔차로 기울기 표준오차까지 낸다(원점 통과이므로 dof = n−1). */
+ *  3+ pairs → residual로 기울기 표준오차까지 낸다(원점 통과이므로 dof = n−1). */
 function calibCoefficient() {
   const c0 = App.calib;
   if (c0.sessionActive && c0.session && isFinite(c0.session.coefficient)) {
@@ -40943,7 +41889,7 @@ function calibCoefficient() {
   }
   const spreadPct = ratios.length > 1 ? 100 * (Math.max(...ratios) - Math.min(...ratios)) / C : NaN;
   // 기울기 표준오차 — 점이 3개 이상일 때만 낸다. n=2 는 dof=1 이라 수치는 나오지만
-  // 읽을 값이 못 된다(잔차 하나로 산포를 추정하는 셈). 내지 않는 편이 정직하다.
+  // 읽을 값이 못 된다(residual 하나로 spread를 추정하는 셈). 내지 않는 편이 정직하다.
   let seC = NaN;
   if (pairs.length >= 3) {
     let ss = 0, sxx2 = 0;
@@ -40953,12 +41899,30 @@ function calibCoefficient() {
   return { C, nPairs: pairs.length, ratios, spreadPct, seC };
 }
 /** 유효 픽셀 크기 (µm/px) = 카메라 피치 / objective 배율. 구버전 직접입력 fallback. */
+/** 유효 픽셀 크기 (µm/px).
+ *
+ * v3.9 — **실측값이 있으면 그것을 쓴다.** pitch/배율 계산은 다음을 전부 모른다:
+ *  · 무한보정 대물의 실제 배율은 M = f_경통렌즈 / f_대물 이라 **경통렌즈가 제조사
+ *    표준(Nikon 200 · Olympus 180 · Zeiss 165 mm)과 다르면 표기 배율이 아니다.**
+ *    Nikon 60× 를 180 mm 경통에 물리면 54× 다 → 스케일 11% · 면적 23% 오차.
+ *  · 카메라 포트의 C-mount 어댑터 배율(0.5×/0.7×/1×). 0.7× 면 스케일 43% ·
+ *    **면적 2배** → 파워밀도가 절반으로 틀린다.
+ *  · 포트 안의 릴레이 광학계.
+ * 눈금 타깃이나 크기를 아는 비드를 **같은 카메라 경로로** 찍어 재면 이 셋이 한 번에
+ * 해결된다. 그래서 실측값을 최우선으로 둔다. */
 function calibEffUmPerPx() {
   const c = App.calib;
+  if (isFinite(c.umPerPxMeasured) && c.umPerPxMeasured > 0) return c.umPerPxMeasured;
   const pitch = isFinite(c.cameraPitch) && c.cameraPitch > 0 ? c.cameraPitch : 6.45;
   if (isFinite(c.objMag) && c.objMag > 0) return pitch / c.objMag;
   if (isFinite(c.umPerPx) && c.umPerPx > 0) return c.umPerPx; // legacy manual value
   return NaN;
+}
+/** 계산값 (실측이 있어도 대조용으로 필요) */
+function calibNominalUmPerPx() {
+  const c = App.calib;
+  const pitch = isFinite(c.cameraPitch) && c.cameraPitch > 0 ? c.cameraPitch : 6.45;
+  return (isFinite(c.objMag) && c.objMag > 0) ? pitch / c.objMag : NaN;
 }
 /** 밀도 계산에 실제로 쓸 빔 면적 메트릭 — Ledger 보정 세션이 활성이고 그 세션에
  * metrics(§4 항목2·4, Phase 8)가 있으면 그걸 우선 쓴다(다른 PC에서 이미 피팅해 둔 값도
@@ -40978,8 +41942,8 @@ function calibAreaCm2() {
 /** 두 폭 정의(회전 Gaussian 1/e² vs ISO 11146 회전 D4σ) 비교 + 회전 무시 시
  *  발생하는 면적 과대평가량 + 품질 경고를 한 블록으로 렌더링. */
 /** 선택된 렌즈의 사양(NA·매질·초점거리)과 회절 한계 대조.
- *  회절 한계 FWHM ≈ 0.51·λ/NA (침지 시에도 λ는 진공 파장, NA가 n을 포함).
- *  측정 FWHM이 이 값보다 작으면 물리적으로 불가능 → 배율·픽셀피치·NA 중
+ *  회절 한계 FWHM ≈ 0.51·λ/NA (침지 시에도 λ는 진공 파장, NA가 n를 포함).
+ *  측정 FWHM가 이 값보다 작으면 물리적으로 불가능 → 배율·픽셀피치·NA 중
  *  하나가 잘못된 것이므로, 파워밀도가 조용히 틀리는 것을 여기서 잡아낸다. */
 function lensInfoHtml(c) {
   const o = c.objSel >= 0 && c.objectives ? c.objectives[c.objSel] : null;
@@ -41009,6 +41973,51 @@ function lensInfoHtml(c) {
   }
   return `선택: <b>${esc(o.maker || "")} ${esc(o.model || "")}</b> ${fmt(o.mag, 4)}×` +
     (bits.length ? " · " + bits.join(" · ") : "") + diag;
+}
+/** v3.10 — 업로드 이미지 무결성 요약 (업스케일 / 톤커브).
+ *  이 검사는 "빔이 이상한가"가 아니라 "이 파일을 물리량으로 쓸 수 있는가"를 묻는다.
+ *  · 업스케일: 화면 캡쳐는 표시 배율 L 만큼 보간되어 µm/px 가 L 배 틀리고 면적은 L² 배 틀린다.
+ *  · 톤커브: 감마/auto-contrast 가 씌워지면 픽셀값이 ADU 에 비례하지 않으므로 FWHM·D4σ·
+ *    enclosed power 가 모두 무의미해진다 — 이건 나중에 나눠서 고칠 수 있는 오차가 아니다.
+ *  배수를 µm/px 보정에 쓰라고 권고하는 것은 **선형성이 확인된 경우로 한정**한다
+ *  (비선형 영상에서는 리샘플 커널과 톤커브가 얽혀 L 이 최대 ~35% 과대평가되기 때문). */
+function integrityHtml(q, imgW) {
+  if (!q) return "";
+  if (q.error) return ` · <span class="tag-Low">무결성 검사 실패: ${esc(q.error)}</span>`;
+  const bits = [];
+  const up = q.upscale, lin = q.linearity;
+  if (up && up.ok && up.upscaled) {
+    const nom = calibNominalUmPerPx();
+    const sug = (q.scaleSuggestion && isFinite(nom)) ? nom / q.scaleSuggestion.divideUmPerPxBy : NaN;
+    bits.push(`<span class="tag-Poor">⚠ 원본이 아님 — 화면 배율 ≈ ${fmt(up.L, 3)}× (가로 ${fmt(up.Lx, 3)} · 세로 ${fmt(up.Ly, 3)})</span>` +
+      `<span class="muted"> 배경 잡음의 상관길이로 측정 — 스케일바와 무관하게 결정됨</span>` +
+      (isFinite(sug)
+        ? ` · <b>실측 µm/px 에 ${fmt(sug, 4)} 입력 권장</b><span class="muted"> (공칭 ${fmt(nom, 4)} ÷ ${q.scaleSuggestion.divideUmPerPxBy}, 면적 ÷${q.scaleSuggestion.areaFactor})</span>`
+        : ` · <span class="muted">선형성이 확인되지 않아 배수를 µm/px 보정에 쓰지 않는다 — 원본 재촬영 권장</span>`));
+  } else if (up && up.ok) {
+    bits.push(`<span class="tag-High">원본 1:1 (상관길이 ${fmt(up.L, 3)})</span>`);
+  } else if (up) {
+    bits.push(`<span class="tag-Low">업스케일 판정 불가: ${esc(up.reason || "")}</span>`);
+  }
+  if (lin && lin.ok && lin.verdict === "nonlinear") {
+    const g = isFinite(lin.beta) ? 2 - lin.beta : NaN;
+    const gSug = isFinite(lin.beta) ? 2 - lin.beta : NaN;
+    bits.push(`<span class="tag-Poor">⚠ 톤커브 검출 — 픽셀값이 ADU 에 비례하지 않음</span>` +
+      (isFinite(gSug) && gSug > 1.2 && (!App.calib || !(App.calib.displayGamma > 1))
+        ? ` · <b>"표시 감마 보정 γ" 에 ${fmt(Math.round(gSug * 20) / 20, 3)} 시도 권장</b>` : "") +
+      `<span class="muted"> 분산이 밝기에 따라 감소 (기울기 ${lin.b.toExponential(2)} ± ${lin.seB.toExponential(1)})` +
+      (isFinite(g) && g > 1 ? `, 감마 ≈ ${fmt(g, 3)} 에 해당` : "") +
+      ` — 선형 검출기로는 불가능. FWHM·D4σ·enclosed power 가 모두 편향됨</span>`);
+  } else if (lin && lin.ok && lin.verdict === "linear") {
+    bits.push(`<span class="tag-High">선형성 정합 (Var ∝ 신호, R²=${fmt(lin.r2, 3)})</span>` +
+      `<span class="muted"> — γ ≲ 1.6 의 완만한 톤커브는 이 검사로 배제되지 않는다</span>`);
+  } else {
+    const why = lin && lin.ok ? lin.indeterminateWhy : (lin ? lin.reason : "");
+    bits.push(`<span class="tag-Low">선형성 판정 불가</span><span class="muted"> ${esc(why || "")}` +
+      ` — 확인하려면 빔을 일부러 디포커스해 넓게 편 프레임을 한 번 찍으면 된다</span>`);
+  }
+  if (q.action) bits.push(`<b>${esc(q.action)}</b>`);
+  return `<br><span class="muted">─ 업로드 무결성 ─</span> ` + bits.join(" · ");
 }
 function beamBasisCompareHtml(c) {
   const b = c.beam;
@@ -41044,8 +42053,26 @@ function beamBasisCompareHtml(c) {
         "2차 모멘트는 r² 가중이라 넓은 받침에 끌려갑니다"
       : Math.abs(ratio - 1) > 0.07
       ? "약한 비-Gaussian성 — 이 구간에서는 <b>ISO D4σ(기본)가 더 정확합니다</b> (비 1.11 에서 D4σ +1% vs Gaussian −9%)"
-      : "Gaussian과 잘 일치 (두 기준 등가 — 기본 D4σ 유지 권장)";
+      : "Gaussian와 잘 일치 (두 기준 등가 — 기본 D4σ 유지 권장)";
     bits.push(`면적비 D4σ/Gaussian = <b class="${cls}">${fmt(ratio, 4)}</b> — <span class="${cls}">${msg}</span>`);
+  }
+  // v3.9 — curve of growth: core 밖 빛의 양. 파워밀도 식은 P 전부가 core 에 든다고
+  // 가정하므로, 이 비가 1 보다 크면 그만큼 **과대평가**된다.
+  if (isFinite(b.enclosedRatio) && Array.isArray(b.growth) && b.growth.length) {
+    const er = b.enclosedRatio;
+    const cls2 = er > 2 ? "tag-Poor" : er > 1.3 ? "tag-Low" : "tag-High";
+    const g = b.growth.map((q) => `${q.kSigma}σ:${fmt(q.ratio, 3)}`).join(" · ");
+    bits.push(`<span class="muted">─ curve of growth (core 밖 빛) ─</span>`);
+    bits.push(`포함 플럭스 / core 플럭스 = <b class="${cls2}">${fmt(er, 3)}</b> (반경 ${fmt(b.growthRadiusSigma, 2)}σ)`
+      + ` <span class="muted">· 성장곡선 ${g}</span>`);
+    if (er > 1.3) {
+      bits.push(`<span class="${cls2}">core 밖에 빛이 있습니다 — 파워밀도 식 I₀ = P/A_peak 는 <b>측정한 P 전부가 core 에 든다</b>고 가정합니다.`
+        + ` 이 halo 가 <b>시료면의 실제 빛</b>이라면 peak irradiance 는 약 <b>${fmt(100 / er, 3)}%</b> (÷${fmt(er, 3)}) 로 낮춰 읽어야 합니다.`
+        + ` 결상경로에서 생긴 산란/글레어라면 시료면에는 없으므로 보정하면 안 됩니다 —`
+        + ` <b>레이저 차단 프레임</b>과 <b>노출시간 스케일링</b>으로 둘을 가릴 수 있습니다.</span>`);
+      bits.push(`<span class="muted">이 추정은 바깥 annulus 가 halo 에 오염되어 halo 를 <b>과소</b>평가합니다`
+        + ` (합성 검증: 참 대비 −15~−40%). 즉 실제 보정폭은 이보다 클 수 있습니다.</span>`);
+    }
   }
   if (isFinite(naive)) {
     bits.push(`<span style="color:var(--s4)">회전 보정 효과</span>: 회전을 무시한 카메라축 D4σ` +
@@ -41062,13 +42089,28 @@ function beamBasisCompareHtml(c) {
 
 /** 선택된 면적 기준의 σ/θ (px) — Gaussian 피팅 또는 ISO 11146 회전 D4σ 모멘트.
  *  두 기준 모두 회전을 반영한 주축 σ를 쓰므로 면적이 과대평가되지 않는다. */
+const BASIS_CROSSOVER = 1.35;   // v3.6.2 에서 참값 대조로 잰 교차점
 function calibBasisSigma(beam) {
   const b = beam || App.calib.beam;
   if (!b) return null;
-  if (App.calib.areaBasis === "d4sigma" && b.moments && isFinite(b.moments.sigmaMajor)) {
-    return { sx: b.moments.sigmaMajor, sy: b.moments.sigmaMinor, theta: b.moments.theta, src: "d4sigma" };
+  const hasM = !!(b.moments && isFinite(b.moments.sigmaMajor));
+  const ratio = b.d4sAreaRatio;
+  // v3.9 — "auto": **측정된 교차점**으로 고른다.
+  // v3.6.2 참값 대조: 면적비 ≤1.35 에서는 D4σ 가 정확하고(비 1.11 에서 D4σ +1% vs
+  // Gaussian −9%), 그 위에서는 역전되어 비 2.92 에서 D4σ 가 +131% 로 발산한다.
+  // 실측 빔에서 면적비 17.78 이 나온 사례가 있었고, 그때 d4sigma 고정이면 유효면적이
+  // 17.78배 커져 파워밀도가 그만큼 과소평가된다 — 조용히 그러면 안 된다.
+  let basis = App.calib.areaBasis || "auto";
+  let autoPicked = null;
+  if (basis === "auto") {
+    autoPicked = (hasM && isFinite(ratio) && ratio <= BASIS_CROSSOVER) ? "d4sigma" : "gauss";
+    basis = autoPicked;
   }
-  return { sx: b.sx, sy: b.sy, theta: b.theta, src: "gauss" };
+  if (basis === "d4sigma" && hasM) {
+    return { sx: b.moments.sigmaMajor, sy: b.moments.sigmaMinor, theta: b.moments.theta,
+             src: "d4sigma", autoPicked, ratio };
+  }
+  return { sx: b.sx, sy: b.sy, theta: b.theta, src: "gauss", autoPicked, ratio };
 }
 /** 현재 기준으로 beamMetrics 재계산 (µm 스케일 = 유효 px × 비닝) */
 function calibComputeMetrics() {
@@ -41137,8 +42179,8 @@ function fmtDensityAuto(mwVal, digits = 4) {
  *  · SDK를 번들하지 않고 **REST + SSE(EventSource)** 만 사용한다. 앱의 오프라인
  *    단일 HTML 원칙을 지키면서(용량 증가 0) 진짜 실시간 push를 받는다.
  *  · localStorage 사본을 항상 유지한다 → 서버/네트워크가 없어도 목록이 보이고,
- *    origin이 달라져도(파일 vs GitHub Pages) 최소한 그 브라우저에서는 남는다.
- *  · 오프라인에서 추가한 항목은 pending으로 표시하고 연결 시 자동 재전송한다.
+ *    origin가 달라져도(파일 vs GitHub Pages) 최소한 그 브라우저에서는 남는다.
+ *  · 오프라인에서 추가한 항목은 pending로 표시하고 연결 시 자동 재전송한다.
  *  · 공유되는 것은 렌즈 제조사/모델/배율뿐이며, 측정 데이터는 전송하지 않는다.
  */
 let refreshLensUI = null;   // 보정 모달이 열려 있을 때만 설정됨
@@ -41236,7 +42278,7 @@ function lensMerge() {
       const k = o._key || lensKey(o);
       if (seen.has(k) || LensSync.tomb.has(k)) continue;
       if (o._pending) out.push({ ...lensEntry(o), _key: k, _pending: true });
-      // _pending이 아닌데 서버에 없다 = 다른 PC에서 삭제됨 → 제거
+      // _pending가 아닌데 서버에 없다 = 다른 PC에서 삭제됨 → 제거
     }
   }
   out.sort((a, b) => String(a.maker || "").localeCompare(String(b.maker || ""), "ko") || (a.mag - b.mag));
@@ -41281,7 +42323,7 @@ async function lensPreflight(base) {
     return "권한 거부 (401) — Firebase 콘솔 → Realtime Database → 규칙에서 lenses 경로의 .read 를 true 로 게시했는지 확인하세요";
   }
   if (r.status === 404) {
-    return "주소를 찾을 수 없습니다 (404) — Realtime Database URL이 맞는지, 뒤에 /lenses 나 .json 을 붙이지 않았는지 확인하세요";
+    return "주소를 찾을 수 없습니다 (404) — Realtime Database URL가 맞는지, 뒤에 /lenses 나 .json 을 붙이지 않았는지 확인하세요";
   }
   if (!r.ok) return `서버 응답 ${r.status}`;
   try { await r.json(); } catch (e) { return "응답을 해석할 수 없습니다 (Realtime Database 주소가 맞는지 확인하세요)"; }
@@ -41340,7 +42382,7 @@ function lensSyncStop() {
   if (LensSync.timer) { clearTimeout(LensSync.timer); LensSync.timer = null; }
   if (LensSync.es) { try { LensSync.es.close(); } catch (e) {} LensSync.es = null; }
 }
-/** 렌즈 1건 서버 등록 (실패해도 로컬에는 남고 pending으로 재시도) */
+/** 렌즈 1건 서버 등록 (실패해도 로컬에는 남고 pending로 재시도) */
 async function lensPush(o) {
   const base = lensDbUrl();
   if (!base) return false;
@@ -41446,9 +42488,9 @@ async function maybeApplyLedgerSession(rec) {
     renderCalibBadge(); return;
   }
   const d = result.doc;
-  // Phase 8: Ledger의 opt_calib 문서에 Prism이 내보낸 metrics(빔 면적 µm² 절대값 — 이미 유효
+  // Phase 8: Ledger의 opt_calib 문서에 Prism가 내보낸 metrics(빔 면적 µm² 절대값 — 이미 유효
   // 픽셀 스케일이 반영돼 있어 재계산 없이 그대로 쓸 수 있음, exportCalibSession() 참고)가
-  // 있으면 그대로 옮긴다. 필드 하나라도 숫자가 아니면(예: 사람이 실수로 다른 JSON을 가져온
+  // 있으면 그대로 옮긴다. 필드 하나라도 숫자가 아니면(예: 사람이 실수로 다른 JSON를 가져온
   // 경우) 통째로 무시 — 절반만 채워진 면적값으로 조용히 틀린 계산을 하는 것보다 안전하다.
   const dm = d.metrics && typeof d.metrics === "object" ? d.metrics : null;
   const metricsOk = dm && ["areaPeakUm2", "area1e2Um2", "areaFwhmUm2"].every((k) => isFinite(Number(dm[k])));
@@ -41534,7 +42576,7 @@ function loadCalib() {
   normalizeCalibPairs(App.calib);
   // 면적 기준 기본값이 gauss → d4sigma 로 바뀌었다. **직접 고른 값은 건드리지 않는다** —
   // 옛 저장본에 남은 "gauss" 는 고른 것이 아니라 그때의 기본값일 뿐이므로 그것만 옮긴다.
-  if (!App.calib.areaBasisUserSet && App.calib.areaBasis === "gauss") App.calib.areaBasis = "d4sigma";
+  if (!App.calib.areaBasisUserSet && (App.calib.areaBasis === "gauss" || App.calib.areaBasis === "d4sigma")) App.calib.areaBasis = "auto";
 }
 
 function openCalibModal() {
@@ -41587,6 +42629,9 @@ function openCalibModal() {
         <label class="ctl"><span>Objective Lens</span><select id="cb-obj" style="min-width:220px"></select></label>
         <label class="ctl"><span>배율 (×)</span><input id="cb-mag" type="number" step="any" value="${c.objMag ?? ""}" style="width:80px"></label>
         <label class="ctl"><span>유효 픽셀 크기</span><span id="cb-effpx" class="mono" style="padding:6px 2px;"></span></label>
+        <label class="ctl"><span>실측 µm/px <span class="muted">(눈금 타깃)</span></span>
+          <input id="cb-umpx" type="number" step="any" min="0" style="width:96px"
+            title="눈금 타깃이나 크기를 아는 비드를 같은 카메라 경로로 찍어 잰 값. 넣으면 배율 계산 대신 이 값을 씁니다 — 경통렌즈 불일치·C-mount 어댑터·릴레이를 한 번에 잡습니다."></label>
         <label class="ctl"><span>여기 파장 (nm)</span><input type="number" id="cb-lambda" step="any" min="0" style="width:92px" title="회절 한계 대조용 — 측정에 쓰는 여기 레이저 파장"></label>
       </div>
       <div id="cb-lens-info" class="small mono" style="margin-top:4px;color:var(--text-secondary);"></div>
@@ -41617,7 +42662,7 @@ function openCalibModal() {
           </span>
         </div>
         <div id="cb-sync-box" class="small" style="display:none;margin-top:8px;padding:8px;background:var(--surface-2);border-radius:8px;">
-          <div class="muted" style="margin-bottom:6px;">Firebase Realtime Database URL을 입력하면 이 브라우저가 연구실 공용 목록에 실시간 연결됩니다.
+          <div class="muted" style="margin-bottom:6px;">Firebase Realtime Database URL를 입력하면 이 브라우저가 연구실 공용 목록에 실시간 연결됩니다.
           빌드에 내장하면(빌드 담당자에게 URL 전달) 모든 PC가 입력 없이 자동 연결됩니다.</div>
           <div class="flex">
             <input id="cb-sync-url" type="text" placeholder="https://your-project-default-rtdb.firebaseio.com" style="flex:1;min-width:220px">
@@ -41635,8 +42680,13 @@ function openCalibModal() {
           <option value="e2avg">1/e² 면적 내 평균 (86.5% power)</option>
           <option value="fwhm">FWHM 면적 내 평균 (50% power)</option></select></label>
         <label class="ctl"><span>면적 기준 (빔 폭 정의)</span><select id="cb-basis">
-          <option value="d4sigma">ISO 11146 회전 D4σ (2차 모멘트·모델 무가정) · 기본</option>
+          <option value="auto">자동 — 면적비로 선택 (교차점 1.35, 참값 대조로 측정) · 기본</option>
+          <option value="d4sigma">ISO 11146 회전 D4σ (2차 모멘트·모델 무가정)</option>
           <option value="gauss">회전 Gaussian 피팅 1/e² (모델 가정)</option></select></label>
+        <label class="ctl" title="뷰어 표시 LUT 의 감마. 저장본이 y=(I)^(1/γ) 로 인코딩되어 있으면 피팅 전에 되돌린다. 1 = 보정 없음.&#10;표준 디스플레이 감마는 2.2. 무결성 검사가 톤커브를 검출하면 추정값을 제안한다.">
+          <span>표시 감마 보정 γ</span>
+          <input id="cb-gamma" type="number" step="0.05" min="1" max="4" style="width:96px"
+                 placeholder="1 = 없음" value="${isFinite(c.displayGamma) && c.displayGamma > 1 ? c.displayGamma : ""}"></label>
       </div>
       <div id="cb-beam-status" class="small muted" style="margin-top:6px;">${c.metrics ? "" : "이미지를 열면 자동으로 피팅됩니다."}</div>
       <div id="cb-beam-chart" class="chart" style="height:340px;display:${c.beam ? "" : "none"};"></div>
@@ -41645,7 +42695,7 @@ function openCalibModal() {
       <div class="flex" style="margin-top:8px;">
         <label class="flex small"><input id="cb-enable" type="checkbox" ${c.enabled ? "checked" : ""}> 보정 활성화 (Power scan 축/결과에 파워밀도 표시 — 범위에 맞는 단위 자동 선택)</label>
       </div></div>
-    <div class="flex"><span class="right"><button id="cb-export-session" class="small" title="이 보정 세션(계수+측정쌍+빔 이미지 피팅 결과)을 JSON으로 내보내 INNO Ledger에 가져올 수 있게 합니다">보정 세션 내보내기 (Ledger용)</button> <button id="cb-close" class="primary">저장 후 닫기</button></span></div>
+    <div class="flex"><span class="right"><button id="cb-export-session" class="small" title="이 보정 세션(계수+측정쌍+빔 이미지 피팅 결과)을 JSON로 내보내 INNO Ledger에 가져올 수 있게 합니다">보정 세션 내보내기 (Ledger용)</button> <button id="cb-close" class="primary">저장 후 닫기</button></span></div>
   </div>`;
   document.body.appendChild(back);
   const sortObjectives = (keep) => {
@@ -41678,6 +42728,10 @@ function openCalibModal() {
     }
     c.cameraPitch = Number(back.querySelector("#cb-pitch").value) || 6.45;
     c.objMag = back.querySelector("#cb-mag").value === "" ? null : Number(back.querySelector("#cb-mag").value);
+    const umEl = back.querySelector("#cb-umpx");
+    c.umPerPxMeasured = (umEl && umEl.value !== "" && Number(umEl.value) > 0) ? Number(umEl.value) : null;
+    const gmEl = back.querySelector("#cb-gamma");
+    c.displayGamma = (gmEl && gmEl.value !== "" && Number(gmEl.value) > 1) ? Number(gmEl.value) : 1;
     c.densityMode = back.querySelector("#cb-mode").value;
     const basisSel = back.querySelector("#cb-basis");
     if (basisSel && basisSel.value !== c.areaBasis) { c.areaBasis = basisSel.value; c.areaBasisUserSet = true; }
@@ -41685,8 +42739,15 @@ function openCalibModal() {
     const lam = Number(back.querySelector("#cb-lambda").value);
     if (isFinite(lam) && lam > 0) c.lambdaNm = lam;
     const eff = calibEffUmPerPx();
-    back.querySelector("#cb-effpx").textContent = isFinite(eff)
-      ? `${fmt(c.cameraPitch, 4)}/${fmt(c.objMag ?? NaN, 4)} = ${fmt(eff, 5)} µm/px` : "배율 입력 필요";
+    const nom = calibNominalUmPerPx();
+    const measured = isFinite(c.umPerPxMeasured) && c.umPerPxMeasured > 0;
+    back.querySelector("#cb-effpx").innerHTML = !isFinite(eff) ? "배율 입력 필요"
+      : measured
+        ? `<b>${fmt(eff, 5)} µm/px</b> <span class="muted">(실측)</span>`
+          + (isFinite(nom) ? `<br><span class="${Math.abs(eff / nom - 1) > 0.05 ? "tag-Low" : "muted"}" style="font-size:10.5px">`
+             + `계산값 ${fmt(nom, 5)} 대비 ${fmt(100 * (eff / nom - 1), 3)}% → 파워밀도 ×${fmt((nom / eff) ** 2, 4)}</span>` : "")
+        : `${fmt(c.cameraPitch, 4)}/${fmt(c.objMag ?? NaN, 4)} = ${fmt(eff, 5)} µm/px`
+          + `<br><span class="muted" style="font-size:10.5px">계산값 — 경통렌즈·C-mount 배율을 모릅니다. 눈금 타깃으로 실측 권장</span>`;
     c.metrics = calibComputeMetrics() || c.metrics;
     refreshCalibUI();
     saveCalib();
@@ -41715,14 +42776,16 @@ function openCalibModal() {
     if (infoEl) infoEl.innerHTML = lensInfoHtml(c);
     const lamEl = back.querySelector("#cb-lambda");
     if (lamEl && document.activeElement !== lamEl) lamEl.value = c.lambdaNm || "";
-    const basisName = c.areaBasis === "gauss" ? "회전 Gaussian 1/e²" : "ISO 11146 회전 D4σ";
+    const bs0 = calibBasisSigma();
+    const basisName = (bs0 && bs0.src === "gauss" ? "회전 Gaussian 1/e²" : "ISO 11146 회전 D4σ")
+      + (bs0 && bs0.autoPicked ? " <span class=\"muted\">(자동 선택)</span>" : "");
     back.querySelector("#cb-beam-out").innerHTML = m ? [
       `<b>[${basisName}]</b> 지름 (4σ): <b>${fmt(m.d1e2Xum, 4)} × ${fmt(m.d1e2Yum, 4)} µm</b> (θ=${fmt(m.thetaDeg, 3)}°)`,
       `FWHM: ${fmt(m.fwhmXum, 4)} × ${fmt(m.fwhmYum, 4)} µm · σ: ${fmt(m.sigmaXum, 4)} × ${fmt(m.sigmaYum, 4)} µm`,
       `유효 면적 — peak: ${fmt(m.areaPeakUm2, 5)} µm² · 1/e²: ${fmt(m.area1e2Um2, 5)} µm² · FWHM: ${fmt(m.areaFwhmUm2, 5)} µm²`,
       c.beam ? `피팅 R²(ROI)=${fmt(c.beam.r2, 4)} · 포화 제외 ${c.beam.nSat}px` +
         (c.beam.nNear > 0 ? ` · 근접 반사 ${c.beam.nNear}개 분리` : "") +
-        (c.beam.nClip > 0 ? ` · 잔차 클립 ${c.beam.nClip}px` : "") : "",
+        (c.beam.nClip > 0 ? ` · residual 클립 ${c.beam.nClip}px` : "") : "",
       beamBasisCompareHtml(c),
     ].filter(Boolean).join("<br>") : `<span class="muted">빔 이미지 미피팅 (배율 선택/입력 + 이미지 필요)</span>`;
     const k = densityFactor();
@@ -41732,7 +42795,11 @@ function openCalibModal() {
         `예: PM 1 mW → <b>${fmtDensityAuto(0.001 * k, 5)}</b>`
       : `<span class="muted">계수(1단계)와 빔 면적(2단계)이 준비되면 환산식이 표시됩니다.</span>`;
     back.querySelector("#cb-mode").value = c.densityMode || "peak";
-    back.querySelector("#cb-basis").value = c.areaBasis || "d4sigma";
+    back.querySelector("#cb-basis").value = c.areaBasis || "auto";
+    const umEl2 = back.querySelector("#cb-umpx");
+    if (umEl2 && document.activeElement !== umEl2) umEl2.value = isFinite(c.umPerPxMeasured) ? c.umPerPxMeasured : "";
+    const gmEl2 = back.querySelector("#cb-gamma");
+    if (gmEl2 && document.activeElement !== gmEl2) gmEl2.value = (isFinite(c.displayGamma) && c.displayGamma > 1) ? c.displayGamma : "";
     if (c.beam) drawBeamChart();
   };
   const drawBeamChart = () => {
@@ -41808,7 +42875,7 @@ function openCalibModal() {
   const addBtnEl = back.querySelector("#cb-pair-add"), delBtnEl = back.querySelector("#cb-pair-del");
   if (addBtnEl) addBtnEl.addEventListener("click", () => setPairRows(c.pairRows + 1));
   if (delBtnEl) delBtnEl.addEventListener("click", () => setPairRows(c.pairRows - 1));
-  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda").forEach((el) => el.addEventListener("change", upd));
+  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda, #cb-umpx").forEach((el) => el.addEventListener("change", upd));
   fillObjSelect();
   back.querySelector("#cb-obj").addEventListener("change", () => {
     const i = Number(back.querySelector("#cb-obj").value);
@@ -41828,7 +42895,7 @@ function openCalibModal() {
     const wdRaw = back.querySelector("#cb-obj-wd").value;
     const wdMm = wdRaw === "" ? null : Number(wdRaw);
     if (fMm !== null && !(isFinite(fMm) && fMm > 0)) { toast("초점거리는 0보다 큰 값이어야 합니다"); return; }
-    // WD 상한 50 mm — 시판 장초점 대물렌즈(저배율 Mitutoyo 계열)도 34 mm 안쪽이다.
+    // WD upper bound 50 mm — 시판 장초점 대물렌즈(저배율 Mitutoyo 계열)도 34 mm 안쪽이다.
     // 그보다 크면 µm/mm 단위 혼동일 가능성이 높다.
     if (wdMm !== null && !(isFinite(wdMm) && wdMm > 0 && wdMm <= 50)) { toast("작동거리는 0보다 크고 50 mm 이하여야 합니다 (단위: mm)"); return; }
     if (!(isFinite(mag) && mag > 0)) { toast("배율을 올바르게 입력하세요"); return; }
@@ -41923,7 +42990,7 @@ function openCalibModal() {
     const u = back.querySelector("#cb-sync-url").value.trim();
     // https 필수 (사내/로컬 테스트 서버만 http 허용)
     if (u && !/^https:\/\/[^\s]+$/i.test(u) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(u)) {
-      toast("https:// 로 시작하는 URL을 입력하세요"); return;
+      toast("https:// 로 시작하는 URL를 입력하세요"); return;
     }
     c.lensDbUrl = u || "";  saveCalib();   // 빈 입력 = 공유 해제
     LensSync.server = null; LensSync.retry = 0;
@@ -42006,6 +43073,37 @@ function openCalibModal() {
         }
         annMask.set(dil);
       }
+      /* v3.10 — 업로드 무결성 검사는 **비닝 전 원해상도**에서 해야 한다.
+       * 업스케일 검출은 이웃 픽셀의 잡음 상관을 보는 것인데, 아래에서 f배 비닝을
+       * 하면 바로 그 상관구조가 지워져 버리기 때문이다. 화면 캡쳐(리샘플된 이미지)와
+       * 톤커브(감마/auto-contrast)는 각각 면적을 L²배, 빔 형태 자체를 왜곡시키므로
+       * 피팅 전에 걸러야 한다. */
+      const grayFull = new Float64Array(W0 * H0);
+      for (let i = 0; i < W0 * H0; i++) {
+        if (annMask[i]) { grayFull[i] = NaN; continue; }
+        const i4 = i * 4;
+        grayFull[i] = 0.2126 * idata[i4] + 0.7152 * idata[i4 + 1] + 0.0722 * idata[i4 + 2];
+      }
+      let integrity = null;
+      try { integrity = PrismEngine.imageIntegrity(grayFull, W0, H0); }
+      catch (err) { integrity = { error: String(err && err.message || err) }; }
+
+      /* v3.11 — 표시 감마 되돌리기.
+       * 무결성 검사는 **원본 픽셀값**에 돌려야 한다(톤커브를 찾는 것이 그 일이므로).
+       * 그 다음에 피팅·모멘트·enclosed power 가 쓰는 배열만 선형으로 되돌린다:
+       *     저장본  y = 255·(I/255)^(1/γ)   →   복원  I = 255·(y/255)^γ
+       * 배경(pedestal)은 감마 *이전*에 들어간 것으로 본다 — 표시 LUT 는 프레임
+       * 전체에 걸리므로 암레벨도 같이 인코딩되기 때문이다. 따라서 절대 화소값을
+       * 그대로 거듭제곱하고 배경은 빼지 않는다(배경 제거는 하류에서 한다). */
+      const gam = (isFinite(c.displayGamma) && c.displayGamma > 1) ? c.displayGamma : 1;
+      if (gam !== 1) {
+        for (let i = 0; i < grayFull.length; i++) {
+          const v = grayFull[i];
+          if (!isFinite(v)) continue;
+          grayFull[i] = 255 * Math.pow(Math.max(0, v) / 255, gam);
+        }
+      }
+
       const f = Math.max(1, Math.ceil(Math.max(W0, H0) / 320));
       const w = Math.floor(W0 / f), h = Math.floor(H0 / f);
       const gray = new Float64Array(w * h);
@@ -42024,7 +43122,7 @@ function openCalibModal() {
       }
       // 빔 피팅 파이프라인: 원거리 ghost blob 제거 → 주 빔에 붙은 근접
       // 반사광 watershed 분리 → 주 빔 주변 ROI 한정 → Gaussian 피팅 →
-      // 잔차 이상픽셀(+4σ) 클리핑 재피팅
+      // residual 이상픽셀(+4σ) 클리핑 재피팅
       const fit = PrismEngine.fitBeam({ w, h, data: gray }, { satLevel: 254 });
       if (!fit.success) throw new Error(fit.message || "Gaussian 피팅 실패");
       const masked = fit.maskedData || gray;
@@ -42052,6 +43150,7 @@ function openCalibModal() {
         m.sigmaXlab /= pf; m.sigmaYlab /= pf;
       }
       fit.binFactor = f * pf;
+      fit.integrity = integrity;
       c.beam = fit;
       c.metrics = calibComputeMetrics() || c.metrics;
       back.querySelector("#cb-beam-status").innerHTML = `피팅 완료 — ${bmp.width}×${bmp.height}px (${f}× 비닝) · R²(ROI)=${fmt(fit.r2, 4)}` +
@@ -42060,8 +43159,10 @@ function openCalibModal() {
         (fit.nStreakRows > 0 ? ` · <span style="color:var(--s7)">가로 잔광 ${fit.nStreakRows}행 보정</span>` : "") +
         (fit.nGhosts > 0 ? ` · <span style="color:var(--s5)">원거리 반사광 blob ${fit.nGhosts}개 제외</span>` : "") +
         (fit.nNear > 0 ? ` · <span style="color:var(--s5)">주 빔에 붙은 근접 반사 ${fit.nNear}개 분리 제거</span>` : "") +
-        (fit.nClip > 0 ? ` · <span style="color:var(--s7)">잔차 이상픽셀 ${fit.nClip}px 제외</span>` : "") +
-        (fit.nSat > 0 ? ` · <span class="tag-Low">포화 픽셀 ${fit.nSat}개 제외</span>` : "");
+        (fit.nClip > 0 ? ` · <span style="color:var(--s7)">residual 이상픽셀 ${fit.nClip}px 제외</span>` : "") +
+        (fit.nSat > 0 ? ` · <span class="tag-Low">포화 픽셀 ${fit.nSat}개 제외</span>` : "") +
+        (gam !== 1 ? ` · <span class="tag-High">표시 감마 γ=${fmt(gam, 3)} 되돌림 (피팅은 선형화 값 기준)</span>` : "") +
+        integrityHtml(integrity, W0);
       upd();
     } catch (err) {
       back.querySelector("#cb-beam-status").innerHTML = `<span class="tag-Poor">실패: ${esc(err.message)}</span>`;
@@ -42073,10 +43174,10 @@ function openCalibModal() {
   refreshCalibUI();
 }
 /* PHASE 8 — 설계 확정본 §4 항목2·4 업그레이드: 이 PC에서 확보한 보정 세션(측정쌍·계수·
- * 빔 이미지 피팅 결과)을 JSON으로 내보내 INNO Ledger의 보정 세션 CRUD에 "가져오기"할 수 있게
+ * 빔 이미지 피팅 결과)을 JSON로 내보내 INNO Ledger의 보정 세션 CRUD에 "가져오기"할 수 있게
  * 한다. App.calib 전체를 그대로 덤프하지 않고 이렇게 필드를 하나씩 골라 담는 이유는 Phase 7에서
- * 발견한 자격정보 유출 버그(exportPowerJson이 App.calib를 통째로 내보내면서 ledger.apiKey/uid도
- * 같이 나갈 뻔했던 것)를 애초에 재현하지 않기 위해서다 — App.calib.ledger/session은 이 함수가
+ * 발견한 자격정보 유출 버그(exportPowerJson가 App.calib를 통째로 내보내면서 ledger.apiKey/uid도
+ * 같이 나갈 뻔했던 것)를 애초에 재현하지 않기 위해서다 — App.calib.ledger/session는 이 함수가
  * 아예 읽지 않는다. beam.preview(빔 이미지 히트맵 원본, 수백 KB~수 MB일 수 있음)는 밀도 계산에
  * 필요 없으므로 제외한다 — 필요한 것은 이미 절대 µm 단위로 계산된 metrics뿐이다. */
 function exportCalibSession() {
@@ -42096,10 +43197,34 @@ function exportCalibSession() {
     pairs: (c.pairs || []).filter((q) => isFinite(q.pm) && q.pm > 0 && isFinite(q.end) && q.end > 0),
     coefficient: isFinite(cc.C) ? cc.C : null,
     cameraPitch: isFinite(Number(c.cameraPitch)) ? Number(c.cameraPitch) : null,
-    areaBasis: c.areaBasis, densityMode: c.densityMode,
+    // v3.9 — 스케일 출처를 기록에 남긴다. 계산값(pitch/배율)은 경통렌즈·C-mount 배율을
+    // 모르므로, 나중에 이 파일만 보고도 어느 쪽이었는지 알 수 있어야 한다.
+    umPerPxMeasured: isFinite(Number(c.umPerPxMeasured)) ? Number(c.umPerPxMeasured) : null,
+    umPerPxNominal: isFinite(calibNominalUmPerPx()) ? calibNominalUmPerPx() : null,
+    umPerPxUsed: isFinite(calibEffUmPerPx()) ? calibEffUmPerPx() : null,
+    umPerPxSource: (isFinite(Number(c.umPerPxMeasured)) && Number(c.umPerPxMeasured) > 0) ? "measured" : "nominal",
+    // v3.11 — 되돌린 표시 감마. 1 이면 보정하지 않은 것. 이 값 없이는 아래 빔 수치를
+    // 재현할 수 없으므로 반드시 함께 기록한다.
+    displayGamma: (isFinite(Number(c.displayGamma)) && Number(c.displayGamma) > 1) ? Number(c.displayGamma) : 1,
+    areaBasis: c.areaBasis, areaBasisUsed: (calibBasisSigma() || {}).src || null,
+    densityMode: c.densityMode,
     beam: c.beam ? {
       sx: c.beam.sx, sy: c.beam.sy, theta: c.beam.theta, binFactor: c.beam.binFactor || 1,
       r2: c.beam.r2, nSat: c.beam.nSat, nNear: c.beam.nNear, nClip: c.beam.nClip,
+      d4sAreaRatio: c.beam.d4sAreaRatio ?? null,
+      enclosedRatio: c.beam.enclosedRatio ?? null,          // curve of growth (core 밖 빛)
+      growthRadiusSigma: c.beam.growthRadiusSigma ?? null,
+      growth: Array.isArray(c.beam.growth) ? c.beam.growth.map((q) => ({ kSigma: q.kSigma, ratio: q.ratio })) : null,
+      // v3.10 — 이 파일의 숫자를 나중에 신뢰할 수 있는지 판단할 근거를 같이 남긴다.
+      integrity: c.beam.integrity ? {
+        upscaleL: c.beam.integrity.upscale?.ok ? c.beam.integrity.upscale.L : null,
+        upscaleFactor: c.beam.integrity.upscale?.ok ? c.beam.integrity.upscale.factor : null,
+        linearity: c.beam.integrity.linearity?.ok ? c.beam.integrity.linearity.verdict : "unknown",
+        linearitySlope: c.beam.integrity.linearity?.ok ? c.beam.integrity.linearity.b : null,
+        linearityR2: c.beam.integrity.linearity?.ok ? c.beam.integrity.linearity.r2 : null,
+        clean: !!c.beam.integrity.clean,
+        action: c.beam.integrity.action || null,
+      } : null,
     } : null,
     metrics: c.metrics || null,
   };
@@ -42156,7 +43281,7 @@ function analysisKey() {
   return ["a26", s.branch, s.aggMode || "high", s.monotone ? 1 : 0, s.lambdaFactor, s.bandMin, s.bandMax].join("|");
 }
 function currentAnalysis(rec) { return rec.cache[analysisKey()]; }
-/** v2.9 — 히스테리시스는 두 분지의 전환 파워 차이다. 같은 설정으로 이미 분석된 반대 분지가
+/** v2.9 — 히스테리시스는 두 branch의 전환 파워 차이다. 같은 설정으로 이미 분석된 반대 branch가
  *  캐시에 있으면 그걸 쓴다(없으면 표시하지 않는다 — 없는 값을 추정하지 않는다). */
 function counterpartAnalysis(rec, branchName) {
   if (!rec || !rec.cache) return null;
@@ -42165,7 +43290,7 @@ function counterpartAnalysis(rec, branchName) {
   const a = rec.cache[parts.join("|")];
   return a && a.bistable ? a : null;
 }
-/** v3.6 — 열려 있는 **모든 파일의 두 분지**에서 쌍안정 적합을 모은다.
+/** v3.6 — 열려 있는 **모든 파일의 두 branch**에서 bistable 적합을 모은다.
  *  이미 분석돼 캐시에 있는 것만 쓴다 — 없는 값을 몰래 계산하지 않는다. */
 function collectBistables() {
   const parts = analysisKey().split("|");
@@ -42231,10 +43356,11 @@ function renderPowerScan(rec) {
       <button class="chip" data-layer="fit" title="선택된 파라메트릭 모델 곡선">피팅 곡선</button>
       <button class="chip" data-layer="pa" title="최대 기울기 지점의 접선 — 접선이 데이터의 급경사와 겹치면 잘 맞은 것">PA 위치</button>
       <button class="chip" data-layer="ith" title="문턱 파워 I_th 와 포화 파워 P_sat 세로선">I_th 위치</button>
-      <button class="chip" data-layer="resid" title="아래쪽 잔차 패널 (dex) + ±1σ/±3σ 밴드">잔차 패널</button>
-      <button class="chip" data-layer="excluded" title="이상치로 제외된 점(X)과 전선 산포로 유지된 점(◇)">제외/전선점</button>
-      <button class="chip" data-layer="bistable" title="쌍안정 서술: 저상태·고상태 두 멱법칙과 전환 파워 (이 서술이 더 지지될 때만 나타남)">쌍안정 곡선</button>
+      <button class="chip" data-layer="resid" title="아래쪽 residual 패널 (dex) + ±1σ/±3σ 밴드">residual 패널</button>
+      <button class="chip" data-layer="excluded" title="이상치로 제외된 점(X)과 전선 spread로 유지된 점(◇)">제외/전선점</button>
+      <button class="chip" data-layer="bistable" title="bistable 서술: 저상태·고상태 두 멱법칙과 전환 파워 (이 서술이 더 지지될 때만 나타남)">bistable 곡선</button>
       <button class="chip" data-layer="blink" title="반복 측정이 계수통계보다 크게 흩어진 setpoint — 두 상태 사이를 점멸한 지점">점멸 setpoint</button>
+      <button class="chip" data-layer="other" title="반대 branch (up↔down) 를 함께 표시 — 기본은 분석 대상 branch 만 보입니다">반대 branch</button>
       <span class="chip-sep"></span>
       <button class="chip" data-layer="norm" title="세로축을 I/모델 비율로 — 3 decade 축에서 숨는 오차가 전부 드러난다">정규화 뷰</button>
       <button class="chip" data-layer="weights" title="점 크기 ∝ 유효 가중치 — 곡선이 실제로 무엇에 맞춰졌는지">가중치 크기</button>
@@ -42376,7 +43502,7 @@ async function runPowerAnalysis(rec, force) {
         branch,
         options: { monotone: App.settings.monotone !== false, lambdaFactor: App.settings.lambdaFactor || 1,
           paTrace: getPATrace(rec) || undefined,
-          // v3.2 — 교차분지 점유율은 지금 보는 분지가 무엇인지 알아야 계산된다
+          // v3.2 — cross-branch occupancy는 지금 보는 branch가 무엇인지 알아야 계산된다
           branchName: effName },
       });
     } finally { delete rec.cache[pendingKey]; }
@@ -42446,13 +43572,17 @@ function computeManualSlope(rec) {
 
 /* ---------------------------------------------------------------------------
  * v2.6 뷰어 (V1–V7)
- * 기본 화면은 "데이터 + 피팅 곡선 + PA 위치 + I_th 위치 + 잔차" 다섯 가지뿐이다.
+ * 기본 화면은 "데이터 + 피팅 곡선 + PA 위치 + I_th 위치 + residual" 다섯 가지뿐이다.
  * 고상태 envelope / P-spline / 부트스트랩 밴드 / 가중치 표시는 칩으로 켤 때만 그린다.
  * PA 는 기울기이므로 점이 아니라 접선 선분으로 그린다 — 접선이 데이터의 실제 급경사와
  * 겹치는지가 눈으로 바로 보이는 피팅 검증이 된다.
  * ------------------------------------------------------------------------- */
+// v3.8 — 기본값을 **최소**로 바꿨다. 좁은 화면에서 라벨이 겹치고 한눈에 안 들어온다는
+// 문제가 실제로 있었다. 기본은 "타겟 branch 데이터 + 피팅 곡선 + I_th + PA 위치" 뿐이고,
+// residual·제외점·bistable·점멸·반대 branch 는 칩을 눌러 켠다.
 const LAYER_DEFAULTS = {
-  fit: true, pa: true, ith: true, resid: true, excluded: true, bistable: true, blink: true,
+  fit: true, pa: true, ith: true,
+  resid: false, excluded: false, bistable: false, blink: false, other: false,
   envelope: false, spline: false, weights: false, bootband: false, norm: false,
 };
 function layers() {
@@ -42464,7 +43594,7 @@ function layers() {
 function modelAt(analysis, xv) {
   try { return PrismFit.modelI(analysis.params, xv, analysis.chosenOrder); } catch (e) { return NaN; }
 }
-/** 사용점 기준 dex 잔차와 ±1σ 폭 */
+/** 사용점 기준 dex residual와 ±1σ 폭 */
 function residualsOf(analysis) {
   const d = analysis.data, out = [];
   for (let i = 0; i < d.x.length; i++) {
@@ -42525,9 +43655,20 @@ function drawPowerChart(rec, loaded, branches, analysis) {
     if (!norm) t.error_y = { type: "data", array: br.intensityStd, visible: true, thickness: 1, width: 2, color: color + "88" };
     return t;
   };
+  // 분석 대상 branch 만 기본 표시한다. 반대 branch 는 'other' 칩으로 켠다 —
+  // 두 곡선이 겹치면 점화 위치가 어느 쪽 것인지 눈으로 구분되지 않는다.
+  const used = analysis && analysis._branchUsed;
   if (down) {
-    traces.push(mkData(up, PALETTE.blue, "up scan"));
-    traces.push(mkData(down, PALETTE.orange, "down scan"));
+    const tgt = used === "down" ? down : up;
+    const oth = used === "down" ? up : down;
+    const tgtName = used === "down" ? "down scan" : "up scan";
+    const othName = used === "down" ? "up scan" : "down scan";
+    traces.push(mkData(tgt, PALETTE.blue, tgtName + " (분석 대상)"));
+    if (L.other) {
+      const t2 = mkData(oth, PALETTE.orange, othName);
+      t2.marker.size = 5; t2.marker.color = PALETTE.orange + "99";
+      traces.push(t2);
+    }
   } else {
     traces.push(mkData(branches.all, PALETTE.blue, "data"));
   }
@@ -42572,16 +43713,16 @@ function drawPowerChart(rec, loaded, branches, analysis) {
         hovertemplate: norm ? "<extra></extra>" : "P=%{x:.4g}<br>모델=%{y:.4g}<extra>H" + analysis.chosenOrder + "</extra>",
       });
     }
-    // ---- v2.9 쌍안정 서술: 두 상태의 멱법칙과 전환 파워 ----
+    // ---- v2.9 bistable 서술: 두 상태의 멱법칙과 전환 파워 ----
     // 이 곡선이 데이터와 겹치고 H 곡선이 어긋나면, 전선이 '가파른 매끄러운 전이'가 아니라
     // '두 상태 사이의 전환'이라는 뜻이다. 두 점근선을 함께 그려야 그 판단이 눈으로 된다.
     if (L.bistable && !norm && analysis.bistable && analysis.bistable.curve) {
       const bs = analysis.bistable;
       traces.push({
         x: Pgrid, y: bs.curve, mode: "lines", type: "scatter",
-        name: "쌍안정 모델" + (bs.preferred ? " (더 지지됨)" : ""),
+        name: "bistable 모델" + (bs.preferred ? " (더 지지됨)" : ""),
         line: { color: PALETTE.violet, width: 2.6 },
-        hovertemplate: "P=%{x:.4g}<br>쌍안정=%{y:.4g}<extra>BS" + bs.chosenOrder + "</extra>",
+        hovertemplate: "P=%{x:.4g}<br>bistable=%{y:.4g}<extra>BS" + bs.chosenOrder + "</extra>",
       });
       const Imin = Math.max(Math.min(...analysis.data.I.filter((v) => v > 0)), 1e-300);
       const Imax = Math.max(...analysis.data.I);
@@ -42615,7 +43756,7 @@ function drawPowerChart(rec, loaded, branches, analysis) {
           mode: "markers", type: "scatter", name: `점멸 setpoint (${br.length})`,
           marker: { symbol: "circle-open", size: 15, color: PALETTE.yellow, line: { width: 2.2 } },
           customdata: br.map((r) => [r.fMean, r.kappa, r.ratioAdj]),
-          hovertemplate: "P=%{x:.4g}<br>평균=%{y:.4g}<br>점유율 f̂=%{customdata[0]:.3f}"
+          hovertemplate: "P=%{x:.4g}<br>평균=%{y:.4g}<br>occupancy f̂=%{customdata[0]:.3f}"
             + "<br>κ̂=%{customdata[1]:.3f}<br>분산비=%{customdata[2]:.1f}<extra>점멸</extra>",
         });
       }
@@ -42636,7 +43777,7 @@ function drawPowerChart(rec, loaded, branches, analysis) {
         font: { size: 11, color: PALETTE.red }, bgcolor: "rgba(26,26,25,0.8)", borderpad: 3,
       });
     }
-    // ---- 제외점 / 전선 산포 ----
+    // ---- 제외점 / 전선 spread ----
     if (L.excluded && !norm) {
       const out = analysis.diagnostics.outliers || [];
       if (out.length) traces.push({
@@ -42648,38 +43789,56 @@ function drawPowerChart(rec, loaded, branches, analysis) {
       const fs = analysis.diagnostics.frontScatter || [];
       if (fs.length) traces.push({
         x: fs.map((i) => analysis.data.P[i] * k), y: fs.map((i) => analysis.data.I[i]),
-        mode: "markers", type: "scatter", name: `전선 산포 (${fs.length}, 유지)`,
+        mode: "markers", type: "scatter", name: `전선 spread (${fs.length}, 유지)`,
         marker: { size: 9, symbol: "diamond-open", color: PALETTE.yellow, line: { width: 1.6, color: PALETTE.yellow } },
-        hovertemplate: "P=%{x:.4g}<br>I=%{y:.4g}<extra>쌍안정 산포 — 제외하지 않음</extra>",
+        hovertemplate: "P=%{x:.4g}<br>I=%{y:.4g}<extra>bistable spread — 제외하지 않음</extra>",
       });
     }
   }
 
   // ---- V3: I_th / P_sat 라벨 달린 세로선 ----
   const kd = densityFactor(), du = activeDensityUnit();
+  // 라벨 충돌 회피: 이미 놓인 라벨과 x 가 가까우면 층(row)을 하나 내린다.
+  // 좁은 화면에서 I_th·P_sat 라벨이 겹쳐 읽히지 않던 문제의 직접 원인이었다.
+  const placed = [];
+  const xSpanDec = (() => {
+    const P = analysis ? analysis.data.P : (branches.all ? branches.all.powerAvg : null);
+    if (!P || !P.length) return 1;
+    const lo = Math.log10(Math.min(...P)), hi = Math.log10(Math.max(...P));
+    return Math.max(hi - lo, 1e-6);
+  })();
   const marker = (xv, label, color, note) => {
     if (!(isFinite(xv) && xv > 0)) return;
     shapes.push({ type: "line", x0: xv * k, x1: xv * k, xref: "x", yref: "paper", y0: 0, y1: 1,
       line: { color, width: 1.8, dash: "dashdot" } });
     const dens = isFinite(kd) && densityActive() ? `<br><span style="font-size:10.5px">${fmt(xv * kd / du.div, 3)} ${du.name}</span>` : "";
+    const lx = Math.log10(xv * k);
+    // 화면 폭의 대략 18% 안에 다른 라벨이 있으면 겹친다고 본다
+    const minGap = 0.18 * xSpanDec;
+    let row = 0;
+    while (placed.some((q) => q.row === row && Math.abs(q.x - lx) < minGap)) row++;
+    placed.push({ x: lx, row });
     annots.push({
-      x: Math.log10(xv * k), xref: "x", yref: "paper", y: 1.0, yanchor: "bottom", xanchor: "center",
+      x: lx, xref: "x", yref: "paper", y: 1.0, yanchor: "bottom", xanchor: "center",
+      yshift: row * 34,
       text: `<b>${label}</b> = ${fmt(xv, 3)} W${note ? " " + note : ""}${dens}`,
       showarrow: false, font: { size: 12, color }, bgcolor: "rgba(26,26,25,0.85)", borderpad: 3,
     });
   };
   if (analysis && L.ith) {
-    // v2.7 (T1): 접선-교점 문턱을 함께 표시한다. 전이 폭 파라미터화에 의존하지 않으므로
+    // v2.7 (T1): 접선-교점 문턱을 함께 표시한다. transition width 파라미터화에 의존하지 않으므로
     // 파라메트릭이 실패해(t₁ = NaN) 아무 문턱도 못 낼 때 이쪽이 주 보고값이 된다.
     const tg = analysis.thresholdTangent && analysis.thresholdTangent.spline;
     const t1ok = isFinite(analysis.thresholdP) && analysis.thresholdP > 0;
-    if (t1ok) marker(analysis.thresholdP, "I_th (t₁)", PALETTE.magenta, analysis.thresholdOutOfRange ? "<i>(외삽)</i>" : "");
-    if (tg) marker(tg.P, t1ok ? "I_th (접선)" : "I_th (접선)", t1ok ? "#c86fa0" : PALETTE.magenta,
-      t1ok ? "" : "<i>(모델 무관)</i>");
+    // 기본은 **보고값 하나**만 — 접선-교점 대조는 P-spline 칩을 켤 때만 함께 보인다.
+    const thLabel = analysis.thresholdSource === "ignition-bracket" ? "I_th (ignition bracket)" : "I_th (t₁)";
+    if (t1ok) marker(analysis.thresholdP, thLabel, PALETTE.magenta, analysis.thresholdOutOfRange ? "<i>(외삽)</i>" : "");
+    if (tg && (L.spline || !t1ok)) marker(tg.P, "I_th (접선)", t1ok ? "#c86fa0" : PALETTE.magenta,
+      t1ok ? "" : "<i>(model-free)</i>");
     marker(analysis.saturationP, "P_sat", "#8b8a80", "");
   }
 
-  // ---- V2: PA 위치 — 접선 선분(분해 front) 또는 구간 음영(미분해 점프) ----
+  // ---- V2: PA 위치 — 접선 선분(분해 front) 또는 구간 음영(unresolved jump) ----
   if (analysis && L.pa && !norm) {
     const jump = analysis.paSource === "jump" && analysis.paJump;
     if (jump) {
@@ -42690,7 +43849,7 @@ function drawPowerChart(rec, loaded, branches, analysis) {
         fillcolor: "rgba(201,133,0,0.18)", line: { color: PALETTE.yellow, width: 1 } });
       annots.push({
         x: Math.log10(analysis.paJump.pth * k), xref: "x", yref: "paper", y: 0.5, xanchor: "left",
-        text: `  <b>PA ≥ ${fmt(analysis.paReport, 4)}</b><br>  미분해 점프<br>  Δlog₁₀P = ${fmt(analysis.paJump.dlogP, 3)}`,
+        text: `  <b>PA ≥ ${fmt(analysis.paReport, 4)}</b><br>  unresolved jump<br>  Δlog₁₀P = ${fmt(analysis.paJump.dlogP, 3)}`,
         showarrow: false, align: "left", font: { size: 12, color: PALETTE.yellow },
         bgcolor: "rgba(26,26,25,0.85)", borderpad: 4,
       });
@@ -42711,12 +43870,20 @@ function drawPowerChart(rec, loaded, branches, analysis) {
           marker: { size: 13, symbol: "star", color: col, line: { width: 1.4, color: "#1a1a19" } },
           hovertemplate: `s_max=${fmt(analysis.sMax, 4)}<br>P=%{x:.4g}<extra></extra>`,
         });
-        if (!jump) annots.push({
-          x: Math.log10(analysis.sMaxAtP * k), y: Math.log10(Is), yshift: 30, xanchor: "center",
-          text: `PA = <b>${fmt(analysis.sMax, 4)}</b>${analysis.sMaxIsLowerBound ? " (하한)" : ""}`,
-          showarrow: false, font: { size: 13, color: PALETTE.yellow },
-          bgcolor: "rgba(26,26,25,0.85)", borderpad: 3,
-        });
+        // 차트 라벨은 **카드와 같은 값**을 말해야 한다. 접선은 parametric s_max 로 그리지만
+        // 보고값은 paReport 이므로, 둘이 다르면 그 사실을 라벨에 적는다.
+        if (!jump) {
+          const rep = analysis.paReport, ge = analysis.paSource === "lower-bound";
+          const differs = isFinite(rep) && Math.abs(rep - analysis.sMax) / Math.max(analysis.sMax, 1e-12) > 1e-6;
+          annots.push({
+            x: Math.log10(analysis.sMaxAtP * k), y: Math.log10(Is), yshift: 30, xanchor: "center",
+            text: `PA ${ge ? "≥" : "="} <b>${fmt(rep, 4)}</b>`
+              + (analysis.paSource === "unresolved" ? " <i>(unidentified)</i>" : "")
+              + (differs ? `<br><span style="font-size:10.5px">접선은 모델 s_max=${fmt(analysis.sMax, 3)}</span>` : ""),
+            showarrow: false, align: "center", font: { size: 13, color: PALETTE.yellow },
+            bgcolor: "rgba(26,26,25,0.85)", borderpad: 3,
+          });
+        }
       }
     }
   }
@@ -42737,7 +43904,7 @@ function drawPowerChart(rec, loaded, branches, analysis) {
     }
   }
 
-  // ---- V4: 잔차 패널 (같은 figure 의 2행 subplot) ----
+  // ---- V4: residual 패널 (같은 figure 의 2행 subplot) ----
   if (showResid) {
     const xs = res.map((p) => p.P * k);
     const band = (mult, alpha) => {
@@ -42752,20 +43919,20 @@ function drawPowerChart(rec, loaded, branches, analysis) {
     const used = res.filter((p) => p.used), excl = res.filter((p) => !p.used);
     traces.push({
       x: used.map((p) => p.P * k), y: used.map((p) => p.r), yaxis: "y2",
-      mode: "markers", type: "scatter", name: "잔차 (dex)", showlegend: false,
+      mode: "markers", type: "scatter", name: "residual (dex)", showlegend: false,
       marker: { size: 5, color: PALETTE.blue },
-      hovertemplate: "P=%{x:.4g}<br>잔차=%{y:.3f} dex<extra></extra>",
+      hovertemplate: "P=%{x:.4g}<br>residual=%{y:.3f} dex<extra></extra>",
     });
     if (excl.length) traces.push({
       x: excl.map((p) => p.P * k), y: excl.map((p) => p.r), yaxis: "y2",
       mode: "markers", type: "scatter", showlegend: false,
       marker: { size: 8, symbol: "x-thin", color: PALETTE.red, line: { width: 1.6, color: PALETTE.red } },
-      hovertemplate: "P=%{x:.4g}<br>잔차=%{y:.3f} dex<extra>제외</extra>",
+      hovertemplate: "P=%{x:.4g}<br>residual=%{y:.3f} dex<extra>제외</extra>",
     });
     const rms = used.length ? Math.sqrt(used.reduce((s2, p) => s2 + p.r * p.r, 0) / used.length) : NaN;
     annots.push({
       xref: "paper", yref: "paper", x: 0.005, y: 0.255, xanchor: "left", yanchor: "top",
-      text: `잔차 rms = ${fmt(rms, 3)} dex · 밴드 = ±1σ / ±3σ (점별)`,
+      text: `residual rms = ${fmt(rms, 3)} dex · 밴드 = ±1σ / ±3σ (점별)`,
       showarrow: false, font: { size: 10.5, color: "#8b8a80" },
     });
   }
@@ -42814,7 +43981,7 @@ function drawPowerChart(rec, loaded, branches, analysis) {
   };
   if (showResid) {
     layout.yaxis2 = Object.assign({}, base.yaxis, {
-      domain: [0, 0.26], title: { text: "잔차 (dex)", font: { size: 11.5 } },
+      domain: [0, 0.26], title: { text: "residual (dex)", font: { size: 11.5 } },
       zeroline: true, zerolinecolor: "#5a5a52", zerolinewidth: 1.5,
     });
   }
@@ -42956,7 +44123,7 @@ function drawSlopeChart(rec, analysis) {
   // s_max marker
   traces.push({
     x: [analysis.sMaxAtP * k], y: [analysis.sMax], mode: "markers+text", type: "scatter",
-    name: "s_max", text: [`s_max=${fmt(analysis.sMax, 4)}${analysis.sMaxIsLowerBound ? " (하한)" : ""}`],
+    name: "s_max", text: [`s_max=${fmt(analysis.sMax, 4)}${analysis.sMaxIsLowerBound ? " (lower bound)" : ""}`],
     textposition: "top center", textfont: { size: 12, color: PALETTE.yellow },
     marker: { size: 11, symbol: "star", color: PALETTE.yellow },
     hovertemplate: "s_max=%{y:.4f}<extra></extra>",
@@ -42991,12 +44158,12 @@ function renderFitResults(rec, analysis) {
   const thDens = isFinite(kd) && isFinite(a.thresholdP) ? `<div class="s" style="color:var(--accent)">= ${fmt(a.thresholdP * kd / du.div, 4)} ${du.name}</div>` : "";
   const satDens = isFinite(kd) && isFinite(a.saturationP) ? ` (= ${fmt(a.saturationP * kd / du.div, 4)} ${du.name})` : "";
   const jumpWins = a.paSource === "jump";
-  // v2.6 (V8): 제약 경계에 붙은 파라미터가 있으면 s_max 는 데이터가 아니라 제약의 산물이다.
+  // v2.6 (V8): constraint boundary에 붙은 파라미터가 있으면 s_max 는 데이터가 아니라 제약의 산물이다.
   const bh = a.boundHits || [];
-  const bhTxt = bh.map((b) => `${b.param}=${fmt(b.value, 4)} (${b.at === "floor" ? "하한" : b.at === "box" ? "박스 상한" : "격자 이하"})`).join(" · ");
+  const bhTxt = bh.map((b) => `${b.param}=${fmt(b.value, 4)} (${b.at === "floor" ? "lower bound" : b.at === "box" ? "박스 upper bound" : "격자 이하"})`).join(" · ");
   const warnBound = bh.length ? `<div class="warnbar">⚠ <b>제약 접촉</b> — ${esc(bhTxt)}<br>
-    s_max 는 데이터가 아니라 제약이 결정한 값입니다. 점추정으로 보고하지 마십시오.
-    ${bh.some((b) => b.at === "sub-grid") ? `전이 폭이 파워 격자(Δlog₁₀P=${fmt(a.medianDlogP, 3)})보다 좁아 어떤 매끄러운 모델도 유한한 s_max 를 줄 수 없습니다.` : ""}</div>` : "";
+    s_max 는 데이터가 아니라 제약이 결정한 값입니다. point estimate로 보고하지 마십시오.
+    ${bh.some((b) => b.at === "sub-grid") ? `transition width가 파워 격자(Δlog₁₀P=${fmt(a.medianDlogP, 3)})보다 좁아 어떤 매끄러운 모델도 유한한 s_max 를 줄 수 없습니다.` : ""}</div>` : "";
   // v2.7 (S1): 수치 재현성 경고 — 옵티마이저 조건과 무의미한 수준(1e-9)의 데이터 지터만
   // 바꿔도 차수·s_max 가 달라지면 그 값은 데이터의 성질이 아니다.
   const st = a.stability;
@@ -43016,25 +44183,25 @@ function renderFitResults(rec, analysis) {
   let profTxt = "";
   if (a.slopeProfile && a.slopeProfile.verdict) {
     const sp = a.slopeProfile;
-    const ladder = `<details class="s"><summary class="muted">상한별 Δχ² 보기 (제약 최대우도 ${sp.caps.length + 1}회)</summary>
+    const ladder = `<details class="s"><summary class="muted">upper bound별 Δχ² 보기 (제약 최대우도 ${sp.caps.length + 1}회)</summary>
       <div class="muted" style="margin-top:4px">${sp.caps.map((r) => `s_max ≤ ${r.cap} → Δχ² = ${fmt(r.dChi2, 3)}`).join(" · ")}
-      <br>기준 χ² = ${fmt(sp.chi2Ref, 5)} (상한 ${sp.refCap}) · 공통 점집합 n = ${sp.nUsed}</div></details>`;
+      <br>기준 χ² = ${fmt(sp.chi2Ref, 5)} (upper bound ${sp.refCap}) · 공통 점집합 n = ${sp.nUsed}</div></details>`;
     if (sp.verdict === "unbounded") {
       profTxt = `<div class="warnbar">⚠ <b>우도가 s_max 를 위로 전혀 제한하지 못합니다</b> — 프로파일 우도(H${sp.order}) 결과,
         s_max ≤ ${sp.gridTop} 인 모든 모델이 기각됩니다 (Δχ² > ${sp.dChi2Crit}, 95%·1 dof).
-        즉 매끄러운 모델의 s_max = ${fmt(a.sMax, 4)} 는 <b>이 데이터 자신의 우도가 기각한 값</b>이며 점추정이 아닙니다.
-        전선이 분해되지 않았다는 뜻이므로, 보고는 모델무관 점프 하한을 씁니다.<br>${ladder}</div>`;
+        즉 매끄러운 모델의 s_max = ${fmt(a.sMax, 4)} 는 <b>이 데이터 자신의 우도가 기각한 값</b>이며 point estimate가 아닙니다.
+        전선이 분해되지 않았다는 뜻이므로, 보고는 model-free 점프 lower bound를 씁니다.<br>${ladder}</div>`;
     } else if (sp.verdict === "bounded") {
       profTxt = `<div class="warnbar muted-warn">프로파일 우도(H${sp.order}): <b>s_max &gt; ${sp.floor}</b> 가 95% 로 요구됩니다
         (s_max ≤ ${sp.floor} 기각, ${isFinite(sp.floorNext) ? `≤ ${sp.floorNext} 는 허용`: "격자 끝"}).
-        ${sp.reportedRejected ? `보고된 s_max = ${fmt(a.sMax, 4)} 는 이 하한 아래이므로 <b>기각</b>됩니다.` : `보고된 s_max = ${fmt(a.sMax, 4)} 는 이 하한과 모순되지 않습니다.`}
+        ${sp.reportedRejected ? `보고된 s_max = ${fmt(a.sMax, 4)} 는 이 lower bound 아래이므로 <b>기각</b>됩니다.` : `보고된 s_max = ${fmt(a.sMax, 4)} 는 이 lower bound와 모순되지 않습니다.`}
         <br>${ladder}</div>`;
     } else {
-      profTxt = `<div class="warnbar muted-warn">프로파일 우도(H${sp.order}): 가장 얕은 상한(s_max ≤ ${sp.caps[0].cap})도 기각되지 않습니다 —
+      profTxt = `<div class="warnbar muted-warn">프로파일 우도(H${sp.order}): 가장 얕은 upper bound(s_max ≤ ${sp.caps[0].cap})도 기각되지 않습니다 —
         우도가 급격한 기울기를 요구하지 않습니다.<br>${ladder}</div>`;
     }
   }
-  // v2.9 — 쌍안정 서술. s_max 가 유한하지 않은 상황에서 **유한한 보고량**을 주는 것이
+  // v2.9 — bistable 서술. s_max 가 유한하지 않은 상황에서 **유한한 보고량**을 주는 것이
   // 이 카드의 목적이다: 전환 파워·대비비·고상태 지수·히스테리시스.
   const bs = a.bistable;
   const hyst = hysteresisOf(rec, analysis);
@@ -43042,36 +44209,36 @@ function renderFitResults(rec, analysis) {
   if (bs) {
     const better = bs.preferred;
     const lowOk = bs.identifiability && bs.identifiability.lowVisible;
-    bsBar = better ? `<div class="warnbar muted-warn">쌍안정 서술이 <b>더 지지됩니다</b> —
-      ΔAICc(쌍안정 − H${a.chosenOrder}) = ${fmt(bs.aiccVsH, 5)} (χ² ${fmt(a.fitsSummary[a.chosenOrder] ? a.fitsSummary[a.chosenOrder].chi2 : NaN, 5)} → ${fmt(bs.chi2, 5)}).
+    bsBar = better ? `<div class="warnbar muted-warn">bistable 서술이 <b>더 지지됩니다</b> —
+      ΔAICc(bistable − H${a.chosenOrder}) = ${fmt(bs.aiccVsH, 5)} (χ² ${fmt(a.fitsSummary[a.chosenOrder] ? a.fitsSummary[a.chosenOrder].chi2 : NaN, 5)} → ${fmt(bs.chi2, 5)}).
       이 데이터의 전선은 '가파른 매끄러운 전이'가 아니라 <b>두 상태 사이의 전환</b>입니다.
       s_max 대신 아래의 전환 파워·대비비·고상태 지수를 보고하십시오.</div>` : "";
     bsCard = `
-    <div class="card"><div class="k">전환 파워 P_s <span class="muted small">(쌍안정)</span></div>
+    <div class="card"><div class="k">전환 파워 P_s <span class="muted small">(bistable)</span></div>
       <div class="v">${fmt(bs.pSwitch, 5)} <span class="s">W</span></div>
       ${bs.pSwitchBracket ? `<div class="s muted">실측 두 점 사이: ${fmt(bs.pSwitchBracket[0], 4)} – ${fmt(bs.pSwitchBracket[1], 4)} W
         ${bs.widthSubGrid ? "— 전환 폭이 격자보다 좁아 위치는 이 구간 안에서만 결정됩니다" : ""}</div>` : ""}
-      <div class="s">전환 폭 ω = ${fmt(bs.switchWidthDec, 3)} dec (격자 ${fmt(a.medianDlogP, 3)})${bs.widthAtFloor ? " — 하한 접촉" : ""}</div>
-      ${hyst ? `<div class="s" style="color:var(--accent)">히스테리시스 P_up/P_down = ${fmt(hyst.ratio, 4)} (${fmt(hyst.dec, 3)} dec)</div>` : `<div class="s muted">히스테리시스: 반대 분지를 같은 설정으로 분석하면 표시됩니다</div>`}
-      ${a.occSourceUsed === "cross" ? `<div class="s muted">점유율 제약: <b>교차분지</b> ${a.occConstraintN}점
+      <div class="s">전환 폭 ω = ${fmt(bs.switchWidthDec, 3)} dec (격자 ${fmt(a.medianDlogP, 3)})${bs.widthAtFloor ? " — lower bound 접촉" : ""}</div>
+      ${hyst ? `<div class="s" style="color:var(--accent)">히스테리시스 P_up/P_down = ${fmt(hyst.ratio, 4)} (${fmt(hyst.dec, 3)} dec)</div>` : `<div class="s muted">히스테리시스: 반대 branch를 같은 설정으로 분석하면 표시됩니다</div>`}
+      ${a.occSourceUsed === "cross" ? `<div class="s muted">occupancy 제약: <b>cross-branch</b> ${a.occConstraintN}점
         ${isFinite(bs.chi2VsUnconstrained) ? ` · 세기 χ² 는 무제약 대비 <b>${fmt(bs.chi2VsUnconstrained, 3)}×</b>` : ""}</div>` : ""}
-      ${bs.occWithdrawn ? `<div class="s tag-Low"><b>점유율 제약을 철회했습니다.</b>
-        측정된 점유율을 만족시키려면 세기 적합을 <b>${fmt(bs.chi2VsUnconstrained, 3)}배</b> 악화시켜야 하는데,
+      ${bs.occWithdrawn ? `<div class="s tag-Low"><b>occupancy 제약을 철회했습니다.</b>
+        측정된 occupancy를 만족시키려면 세기 적합을 <b>${fmt(bs.chi2VsUnconstrained, 3)}배</b> 악화시켜야 하는데,
         이는 검증 범위(합성 54건 최대 11.3배) 밖입니다. 위 값은 <b>제약 없는 적합</b>입니다 —
-        이 분지에서는 세기 자료와 교차분지 점유율이 양립하지 않습니다. 측정된 전환 폭
-        ${fmt(a.crossOcc && a.crossOcc.width1090, 4)} dec 는 교차분지 카드에서 그대로 읽으십시오.</div>`
+        이 branch에서는 세기 자료와 cross-branch occupancy가 양립하지 않습니다. 측정된 전환 폭
+        ${fmt(a.crossOcc && a.crossOcc.width1090, 4)} dec 는 cross-branch 카드에서 그대로 읽으십시오.</div>`
         : (isFinite(bs.chi2VsUnconstrained) && bs.chi2VsUnconstrained > 5
           ? `<div class="s muted">제약이 세기 χ² 를 ${fmt(bs.chi2VsUnconstrained, 3)}배 늘렸습니다 — 합성 범위(중앙 1.8 · 최대 11.3배) 안입니다.</div>` : "")}</div>
-    <div class="card"><div class="k">상태별 멱법칙 지수 <span class="muted small">(쌍안정)</span></div>
+    <div class="card"><div class="k">상태별 멱법칙 지수 <span class="muted small">(bistable)</span></div>
       <div class="v">n_high = ${isFinite(bs.nHighSingle) ? fmt(bs.nHighSingle, 4)
         : `<span class="tag-Low" style="font-size:13px">${bs.nHighCollapsed ? "결정 불가" : "단일값 아님"}</span>`}</div>
       ${bs.nHighCollapsed ? `<div class="s tag-Low">고상태 지수가 선형(${fmt(bs.nHighFloor, 2)}) 아래로 내려갔습니다 (n_H = ${fmt(bs.params ? bs.params.nH : NaN, 3)}).
-        점유율 제약이 전환을 전부 f 로 설명하고 고상태를 평탄하게 놓은 해입니다 — <b>고상태 지수로 보고하지 마십시오</b>.
+        occupancy 제약이 전환을 전부 f 로 설명하고 고상태를 평탄하게 놓은 해입니다 — <b>고상태 지수로 보고하지 마십시오</b>.
         전환 파워·전환 폭은 그대로 유효합니다.</div>`
         : (isFinite(bs.nHighSingle) ? "" : `<div class="s muted">고상태 가지의 지수가 전환 위에서 변합니다 (변동 ${fmt(100 * bs.nHighSpread, 2)}%) — 위치를 명시해 보고하십시오:<br>
         ${bs.nHighProfile.map((r) => `${r.mult}×P_s (${fmt(r.P, 4)} W): <b>${fmt(r.n, 3)}</b>`).join(" · ")}</div>`)}
       <div class="s">n_low = ${lowOk ? `<b>${fmt(bs.nLow, 4)}</b>` : `<span class="tag-Low">결정 불가</span> — 저상태 가지가 암계수 바닥(${fmt(bs.identifiability.floorLevel, 4)}) 아래`}</div>
-      <div class="s">log₁₀ 대비비 = ${lowOk ? fmt(bs.log10Contrast, 4) : `≥ ${fmt(bs.log10ContrastLB, 4)} (바닥 기준 하한)`}</div>
+      <div class="s">log₁₀ 대비비 = ${lowOk ? fmt(bs.log10Contrast, 4) : `≥ ${fmt(bs.log10ContrastLB, 4)} (바닥 기준 lower bound)`}</div>
       ${bs.satAtGap ? `<div class="s tag-Low">고상태 포화 꺾임이 전환 바로 위(최소 간격)에 붙어 있습니다 — 그 아래 구간의 지수는 전환의 일부이지 고상태의 지수가 아닙니다</div>` : ""}
       ${bs.identifiability && !bs.identifiability.highResolved ? `<div class="s tag-Low">고상태 지수 미결정 —
         ${bs.rangeOk === false
@@ -43080,8 +44247,8 @@ function renderFitResults(rec, analysis) {
              <b>스윕을 ${fmt(100 * (Math.pow(10, Math.max(bs.nHighRangeMin - bs.nHighRangeDec, 0)) - 1), 2)}% 더 높은 파워까지 확장</b>하면 이 값이 결정됩니다.`
           : `전환 위 측정점이 ${bs.identifiability.nHighPts}개뿐입니다.`}</div>` : ""}</div>`;
   }
-  // v3.6 — 분지 합산. 한 분지의 구간이 부족해도 여러 분지를 **절대 파워**로 묶으면
-  // 고상태 지수를 낼 수 있다. 이미 분석돼 캐시에 있는 분지만 쓴다.
+  // v3.6 — branch 합산. 한 branch의 구간이 부족해도 여러 branch를 **절대 파워**로 묶으면
+  // 고상태 지수를 낼 수 있다. 이미 분석돼 캐시에 있는 branch만 쓴다.
   {
     const col = collectBistables();
     if (col.bistables.length >= 3 && typeof PrismFit.poolHighExponent === "function") {
@@ -43091,35 +44258,35 @@ function renderFitResults(rec, analysis) {
         const g = pool.best;
         const het = pool.heterogeneous;
         poolCard = `
-    <div class="card" style="grid-column:span 2"><div class="k">여러 분지 합산 고상태 지수
-      <span class="muted small">(절대 파워 기준 · ${pool.branches}분지)</span></div>
+    <div class="card" style="grid-column:span 2"><div class="k">여러 branch 합산 고상태 지수
+      <span class="muted small">(절대 파워 기준 · ${pool.branches}branch)</span></div>
       <div class="v">n_high = ${fmt(g.n, 4)} <span class="s">@ ${fmt(g.P, 4)} W</span></div>
-      <div class="s">${het ? "분지 간 산포" : "90% 구간"} ${fmt(g.lo90, 4)} – ${fmt(g.hi90, 4)}
-        · 이 파워에 겹치는 분지 ${g.nBranch}개</div>
+      <div class="s">${het ? "branch 간 spread" : "90% 구간"} ${fmt(g.lo90, 4)} – ${fmt(g.hi90, 4)}
+        · 이 파워에 겹치는 branch ${g.nBranch}개</div>
       <div class="s muted">문턱 위 구간(dec): ${pool.rangeDecs.map((v) => fmt(v, 2)).join(" · ")}</div>
       ${het
-        ? `<div class="s tag-Low"><b>분지 간 이질성 감지</b> — IQR/중앙 = ${fmt(pool.iqrRel, 3)}
-           (동질 합성은 0.15 를 넘지 않습니다). 이 산포는 추정 잡음이 아니라 <b>자리마다 실제로 다르다</b>는 뜻입니다
-           (관측 IQR 은 참 산포를 거의 1:1 로 추종합니다 — 참 ±5/15/30/45% → 관측 0.05/0.14/0.30/0.48).
+        ? `<div class="s tag-Low"><b>branch 간 heterogeneity 감지</b> — IQR/중앙 = ${fmt(pool.iqrRel, 3)}
+           (동질 합성은 0.15 를 넘지 않습니다). 이 spread는 추정 잡음이 아니라 <b>자리마다 실제로 다르다</b>는 뜻입니다
+           (관측 IQR 은 참 spread를 거의 1:1 로 추종합니다 — 참 ±5/15/30/45% → 관측 0.05/0.14/0.30/0.48).
            위 구간을 <b>하나의 값에 대한 신뢰구간으로 읽지 마십시오.</b>
-           개별 분지 추정은 이질이어도 정확하므로(합성 중앙오차 0%), 분포로 보고하십시오:<br>
+           개별 branch 추정은 이질이어도 정확하므로(합성 중앙오차 0%), 분포로 보고하십시오:<br>
            ${g.values.map((v) => fmt(v, 3)).join(" · ")}</div>`
-        : `<div class="s muted">분지 간 산포가 추정 잡음 범위 안입니다 (IQR/중앙 ${fmt(pool.iqrRel, 3)} ≤ ${fmt(pool.iqrMax, 2)})
+        : `<div class="s muted">branch 간 spread가 추정 잡음 범위 안입니다 (IQR/중앙 ${fmt(pool.iqrRel, 3)} ≤ ${fmt(pool.iqrMax, 2)})
            — 하나의 값으로 요약해도 됩니다.</div>`}
       <div class="s muted">참값 대조: 자리마다 전환 파워가 다른 합성에서 오차 0%, 90% 구간 ±1–2%.
-        단 <b>긴 구간 분지가 하나는 있어야</b> 합니다 — 합산은 강건 추정이지 정보를 만들지 않습니다.
-        ${col.labels.length ? `쓰인 분지: ${col.labels.join(" · ")}` : ""}</div></div>`;
+        단 <b>긴 구간 branch가 하나는 있어야</b> 합니다 — 합산은 강건 추정이지 정보를 만들지 않습니다.
+        ${col.labels.length ? `쓰인 branch: ${col.labels.join(" · ")}` : ""}</div></div>`;
       }
     } else if (col.bistables.length > 0 && col.bistables.length < 3) {
       poolCard = `
-    <div class="card"><div class="k">여러 분지 합산 <span class="muted small">(v3.6)</span></div>
-      <div class="s muted">분지 ${col.bistables.length}개 — 합산에는 3개 이상이 필요합니다.
-        다른 파일이나 반대 분지를 같은 설정으로 분석하면 여기에 합산 결과가 나옵니다.
+    <div class="card"><div class="k">여러 branch 합산 <span class="muted small">(v3.6)</span></div>
+      <div class="s muted">branch ${col.bistables.length}개 — 합산에는 3개 이상이 필요합니다.
+        다른 파일이나 반대 branch를 같은 설정으로 분석하면 여기에 합산 결과가 나옵니다.
         문턱 위 구간이 부족해 n_high 를 못 내는 경우의 우회로입니다.</div></div>`;
     }
   }
   // v3.0 — 점멸 관측층. 반복 분산은 노이즈가 아니라 신호다: 어떤 setpoint 가 두 상태의
-  // 혼합인지, 점유율이 얼마인지, dwell 안에서 얼마나 평균화됐는지를 모델과 무관하게 말해준다.
+  // 혼합인지, occupancy가 얼마인지, dwell 안에서 얼마나 평균화됐는지를 모델과 무관하게 말해준다.
   const occ = a.occupancy;
   let occBar = "", occCard = "";
   if (occ && occ.checked && occ.nBlink > 0) {
@@ -43136,19 +44303,19 @@ function renderFitResults(rec, analysis) {
        <td class="num muted">${fmt(r.fSdStat, 2)} / ${fmt(r.fSdSys, 2)}</td>
        <td class="num">${isFinite(r.kappa) ? fmt(r.kappa, 3) : "-"}</td><td class="num">${fmt(r.ratioAdj, 3)}</td></tr>`).join("");
     occCard = `
-    <div class="card" style="grid-column:span 2"><div class="k">점멸 점유율 (반복 분산에서, 모델 무관)</div>
+    <div class="card" style="grid-column:span 2"><div class="k">점멸 occupancy (반복 분산에서, model-free)</div>
       <div class="v">${occ.nBlink} <span class="s">/ ${occ.nRows} setpoint</span></div>
       <div class="s muted">계수통계 대비 과분산 — 이 점들의 평균은 어떤 발광 가지 위의 값이 아니라 <b>두 상태의 혼합</b>입니다.
         판정은 χ²<sub>ν=${occ.nu}</sub> 귀무분포 + BH-FDR ${fmt(occ.fdr, 2)} (임의 임계값 없음).
         ${occ.nOtherDispersed ? `과분산이지만 두 준위 혼합으로 설명되지 않는 점 ${occ.nOtherDispersed}개는 제외했습니다.` : ""}</div>
       ${kTxt ? `<div class="s">${kTxt}</div>` : ""}
-      <table class="res" style="margin-top:6px"><tr><th>P (W)</th><th>평균</th><th>점유율 f̂</th><th class="muted">σ 통계/계통</th><th>κ̂</th><th>분산비</th></tr>${cells}</table>
-      <div class="s muted">σ 의 <b>계통</b> 성분은 두 상태 준위를 외삽할 때 쓰는 이웃 점 개수(3·5·8)를 바꿔 얻은 산포입니다 —
+      <table class="res" style="margin-top:6px"><tr><th>P (W)</th><th>평균</th><th>occupancy f̂</th><th class="muted">σ 통계/계통</th><th>κ̂</th><th>분산비</th></tr>${cells}</table>
+      <div class="s muted">σ 의 <b>계통</b> 성분은 두 상태 준위를 외삽할 때 쓰는 이웃 점 개수(3·5·8)를 바꿔 얻은 spread입니다 —
         고상태 가지가 휘어 있으면 이 성분이 통계 오차를 압도합니다. 이것을 빼면 f̂ 의 정확도가 과장됩니다.</div>
-      ${occ.fMonotone === false ? `<div class="s tag-Low">점유율이 파워에 대해 <b>단조롭지 않습니다</b> — 실제 전환이라면 고상태 체류가 단조 증가해야 합니다.
+      ${occ.fMonotone === false ? `<div class="s tag-Low">occupancy가 파워에 대해 <b>단조롭지 않습니다</b> — 실제 전환이라면 고상태 체류가 단조 증가해야 합니다.
         이 검출들은 전환이 아니라 잡음일 가능성이 있습니다.</div>` : ""}
       ${br.length > 8 ? `<div class="s muted">… 외 ${br.length - 8}개</div>` : ""}
-      ${occ.global ? `<div class="s tag-Low">절반 이상의 setpoint 가 과분산입니다 — 국소적 쌍안정이 아니라 장치·측정 조건 문제일 가능성이 큽니다</div>` : ""}</div>`;
+      ${occ.global ? `<div class="s tag-Low">절반 이상의 setpoint 가 과분산입니다 — 국소적 bistable가 아니라 장치·측정 조건 문제일 가능성이 큽니다</div>` : ""}</div>`;
     const oc = bs && bs.occCheck;
     if (oc && oc.n && oc.agrees === false) {
       occBar = `<div class="warnbar muted-warn">적합된 전환과 관측된 점멸이 <b>완전히 일치하지는 않습니다</b> —
@@ -43156,12 +44323,12 @@ function renderFitResults(rec, analysis) {
         ${oc.rows.filter((r) => Math.abs(r.z) > 3).slice(0, 3).map((r) => `P=${fmt(r.P, 4)}W: 모델 ${fmt(r.fModel, 3)} vs 관측 ${fmt(r.fMeasured, 3)}`).join(" · ")}
         <br>모델 쪽이 더 빨리 포화하는 방향이며, 모델은 그 차이를 고상태 지수로 메울 수 있습니다 —
         n_high 를 단일값으로 읽을 때 주의하십시오.
-        <br><span class="muted">다만 점유율 <b>형태</b>를 데이터에서 결정하려는 시도는 실패했습니다(형태 파라미터가 세기 데이터만으로
+        <br><span class="muted">다만 occupancy <b>형태</b>를 데이터에서 결정하려는 시도는 실패했습니다(형태 파라미터가 세기 데이터만으로
         식별되지 않음). 이 편차를 해소하려면 전환 구간을 더 촘촘히 측정해 고상태 가지를 전환 근처에서 직접 고정해야 합니다.</span></div>`;
     }
   }
-  // v3.2 — 교차분지 점유율. 히스테리시스가 있으면 반대 분지가 같은 파워의 고상태를
-  // **직접 측정**하므로 외삽이 필요 없다. 분지내 추정과 크게 다르면 그 자체가 결과다.
+  // v3.2 — cross-branch occupancy. 히스테리시스가 있으면 반대 branch가 같은 파워의 고상태를
+  // **직접 측정**하므로 외삽이 필요 없다. branch 내 추정과 크게 다르면 그 자체가 결과다.
   const xo = a.crossOcc;
   let xoBar = "", xoCard = "";
   if (xo && xo.checked) {
@@ -43171,31 +44338,31 @@ function renderFitResults(rec, analysis) {
       const sampled = xo.rows.filter((r) => r.f > 0.02 && r.f < 1.02);
       const step = Math.max(1, Math.ceil(sampled.length / 8));
       xoCard = `
-    <div class="card" style="grid-column:span 2"><div class="k">교차분지 점유율 <span class="muted small">(반대 분지를 고상태 기준으로 — 외삽 없음)</span></div>
+    <div class="card" style="grid-column:span 2"><div class="k">cross-branch occupancy <span class="muted small">(반대 branch를 고상태 기준으로 — 외삽 없음)</span></div>
       <div class="v">10→90% 폭 ${wTxt}</div>
-      <div class="s muted">히스테리시스 구간에서 반대 분지는 <b>같은 파워의 점등 상태를 직접 측정</b>합니다 —
+      <div class="s muted">히스테리시스 구간에서 반대 branch는 <b>같은 파워의 점등 상태를 직접 측정</b>합니다 —
         고상태 준위를 전환 너머로 외삽할 필요가 없습니다. 유효점 ${xo.nPoints}개 ·
         반환점 연속성 ${fmt(xo.continuity, 4)} (편차 ${fmt(100 * xo.bleachFrac, 3)}% — f 에 계통으로 반영)</div>
-      ${xo.absolute === false ? `<div class="s tag-Low">이 분지가 최고 파워에서도 포화하지 않았습니다 —
-        f 는 <b>절대 점유율이 아니라 반대 분지 대비 상대값</b>입니다. 더 높은 파워까지 스윕해야 절대값이 됩니다.</div>` : ""}
+      ${xo.absolute === false ? `<div class="s tag-Low">이 branch가 최고 파워에서도 포화하지 않았습니다 —
+        f 는 <b>절대 occupancy가 아니라 반대 branch 대비 상대값</b>입니다. 더 높은 파워까지 스윕해야 절대값이 됩니다.</div>` : ""}
       <div class="s muted">연속성은 반환점의 <b>계단</b>만 잡습니다. 점진적 광퇴색은 계단을 만들지 않고,
         한 번의 루프로는 광퇴색과 발광준위 히스테리시스가 분리되지 않습니다 — 분리하려면 루프를 반복해
         두 번째가 첫 번째를 재현하는지 보아야 합니다.</div>
-      ${isFinite(bias) && bias > 1.3 ? `<div class="s tag-Low">분지내 점유율이 <b>${fmt(bias, 3)}배 부풀어</b> 있습니다 —
+      ${isFinite(bias) && bias > 1.3 ? `<div class="s tag-Low">branch 내 occupancy가 <b>${fmt(bias, 3)}배 부풀어</b> 있습니다 —
         외삽에 쓴 '전환 직후' 점들이 아직 부분 점등이라 고상태가 과소평가된 탓입니다.</div>` : ""}
-      ${xo.monotone === false ? `<div class="s tag-Low">교차분지 f 가 단조롭지 않습니다 — 광퇴색이나 기준 분지 불안정을 의심하십시오.</div>` : ""}
-      <table class="res" style="margin-top:6px"><tr><th>P (W)</th><th>이 분지</th><th>반대 분지(고상태)</th><th>f</th></tr>
+      ${xo.monotone === false ? `<div class="s tag-Low">cross-branch f 가 단조롭지 않습니다 — 광퇴색이나 기준 branch 불안정을 의심하십시오.</div>` : ""}
+      <table class="res" style="margin-top:6px"><tr><th>P (W)</th><th>이 branch</th><th>반대 branch(고상태)</th><th>f</th></tr>
         ${sampled.filter((_, i) => i % step === 0).map((r) =>
           `<tr><td class="num">${fmt(r.P, 4)}</td><td class="num">${fmt(r.I, 4)}</td><td class="num">${fmt(r.Iref, 4)}</td><td class="num"><b>${fmt(r.f, 3)}</b> ± ${fmt(r.fSd, 2)}</td></tr>`).join("")}</table></div>`;
       if (isFinite(bias) && bias > 1.3) {
-        xoBar = `<div class="warnbar muted-warn">점유율은 <b>교차분지 측정값</b>을 쓰십시오 —
-          분지내 추정은 고상태 준위를 외삽하는데, 그 외삽에 쓰는 전환 직후 점들이 아직 부분 점등이라
+        xoBar = `<div class="warnbar muted-warn">occupancy는 <b>cross-branch 측정값</b>을 쓰십시오 —
+          branch 내 추정은 고상태 준위를 외삽하는데, 그 외삽에 쓰는 전환 직후 점들이 아직 부분 점등이라
           f 가 <b>${fmt(bias, 3)}배</b> 부풀어 오릅니다.
           이 파일의 실제 전환 폭은 10→90% 기준 <b>${wTxt}</b> 로, 모델이 맞춘 폭(${bs && isFinite(bs.width1090Dec) ? fmt(bs.width1090Dec, 3) : "-"} dec)보다 훨씬 넓습니다.</div>`;
       }
     } else if (xo.reason) {
       xoCard = `
-    <div class="card"><div class="k">교차분지 점유율</div>
+    <div class="card"><div class="k">cross-branch occupancy</div>
       <div class="v" style="font-size:16px">해당 없음</div>
       <div class="s muted">${esc(xo.reason)}<br>반환점 연속성 ${fmt(xo.continuity, 4)} · 겹침 유효점 ${xo.nPoints || 0}개</div></div>`;
     }
@@ -43203,28 +44370,52 @@ function renderFitResults(rec, analysis) {
   const cards = `
   ${warnUnstable}${warnBound}${warnAgg}${profTxt}${bsBar}${occBar}${xoBar}
   <div class="cards">
-    <div class="card hero"><div class="k">보고 PA (논문 표준: max[분해 front, 점프])${a.paGridLimited ? ' <span class="tag-Low">grid-limited 하한</span>' : ""}</div>
-      <div class="v">${a.paGridLimited ? "≥ " : ""}${fmt(a.paReport, 4)}</div>
-      <div class="s">${jumpWins ? `미분해 점프 (Δlog₁₀P=${fmt(a.paJump.dlogP, 3)}) @ P=${fmt(a.paJump.pth, 4)} W` : `분해 front (모델 s_max) · 집계=${analysis._aggUsed === "high" ? "고상태" : "평균"}`}</div>
+    <div class="card hero"><div class="k">보고 PA (논문 표준: max[분해 front, 점프])${paBadge(a)}</div>
+      <div class="v">${a.paSource === "lower-bound" || a.paGridLimited ? "≥ " : ""}${fmt(a.paReport, 4)}</div>
+      <div class="s">${jumpWins ? `unresolved jump (Δlog₁₀P=${fmt(a.paJump.dlogP, 3)}) @ P=${fmt(a.paJump.pth, 4)} W`
+        : a.paSource === "lower-bound"
+          ? `model-free lower bound (secant) · <b>Δlog₁₀P = ${fmt(a.paReportDlogP, 3)} dec</b> 에서 결정 · P ${fmt(a.sLowerBound.pLo, 4)}→${fmt(a.sLowerBound.pHi, 4)} W`
+        : a.paSource === "unresolved"
+          ? `unidentified — 파라메트릭 s_max 를 그대로 싣지만 <b>point estimate가 아닙니다</b>`
+          : `분해 front (모델 s_max) · 집계=${analysis._aggUsed === "high" ? "고상태" : "평균"}`}</div>
+      ${a.paSource === "lower-bound" ? `<div class="s tag-Low">파라메트릭 s_max = ${fmt(a.sMax, 4)} 는 이 lower bound보다 작습니다 —
+        <b>모델과 무관하게 refuted 값</b>이므로 보고하지 마십시오. lower bound는 평균값 정리로 성립하며(잡음 ${a.sLowerBound.z}σ 선공제),
+        전이를 분해하려면 이 구간에서 파워 간격을 ${fmt(a.paReportDlogP, 3)} dec 보다 촘촘히 해야 합니다.</div>` : ""}
+      ${a.paSource === "unresolved" ? `<div class="s tag-Low">${esc(unresolvedWhy(a))} — 이 값을 논문에 point estimate로 싣지 마십시오.
+        model-free secant lower bound는 ${a.sLowerBound ? fmt(a.sLowerBound.slope, 4) + " (이 값보다 작아 lower bound 역할을 못 함)" : "산출되지 않았습니다"}.</div>` : ""}
+      ${darkTxt(a)}${localFitTxt(a)}
       ${jumpWins ? `<div class="s muted">파라메트릭 s_max = ${fmt(a.sMax, 4)} — <b>보고값 아님</b>. 전선이 한 파워 스텝 안에서 끝나
-        (Δlog₁₀P=${fmt(a.paJump.dlogP, 3)} ≤ 격자 ${fmt(a.medianDlogP, 3)}) 매끄러운 모델의 최대 기울기는 전이 폭 제약이 정하는 값입니다.
-        쌍안정 점화는 이론적으로 불연속에 가까울 수 있으므로, 이 상황에서 옳은 보고는 점추정이 아니라 위의 하한입니다.</div>` : ""}
+        (Δlog₁₀P=${fmt(a.paJump.dlogP, 3)} ≤ 격자 ${fmt(a.medianDlogP, 3)}) 매끄러운 모델의 최대 기울기는 transition width 제약이 정하는 값입니다.
+        bistable 점화는 이론적으로 불연속에 가까울 수 있으므로, 이 상황에서 옳은 보고는 point estimate가 아니라 위의 lower bound입니다.</div>` : ""}
       ${a.paGridLimited ? `<div class="s tag-Low">한 파워 스텝 안에서 dark→signal 점화 — 실제 PA는 이 값 이상. 더 촘촘한 파워 간격으로 재측정 시 분해 가능</div>` : ""}</div>
-    <div class="card"><div class="k">분해 front s_max${a.sMaxIsLowerBound ? ' <span class="tag-Low">하한값</span>' : ""}</div>
+    <div class="card"><div class="k">분해 front s_max${
+      a.sMaxBoundReason === "secant" ? ' <span class="tag-Poor">refuted</span>'
+      : a.sMaxBoundReason === "constraint" ? ' <span class="tag-Poor">unidentified</span>'
+      : a.sMaxBoundReason === "range-edge" ? ' <span class="tag-Low">범위 끝 절단</span>' : ""}</div>
       <div class="v">${fmt(a.sMax, 4)}${boot ? ciStr(boot.ci.sMax) : ""}</div>
       <div class="s">@ P=${fmt(a.sMaxAtP, 4)} W · 스플라인 교차검증 ${fmt(a.sTotMax, 3)}</div>
       ${a.sMaxBoundReason === "range-edge" ? `<div class="s tag-Low">기울기가 측정범위 ${a.sMaxEdge === "left" ? "왼쪽" : "오른쪽"} 끝에서 최대 — 실제 s_max는 범위 밖일 수 있음</div>` : ""}
-      ${a.sMaxBoundReason === "constraint" ? `<div class="s tag-Low">제약 경계에 걸림 — 값이 아니라 하한으로 읽어야 함</div>` : ""}</div>
+      ${a.sMaxBoundReason === "constraint" ? `<div class="s tag-Low">constraint boundary에 걸림 (${esc((a.boundHits || []).map((b) => b.param + "@" + b.at).join(", "))})
+        — <b>unidentified</b>입니다. 합성 검증에서 이 상태의 s_max 는 참값보다 작을 때도, 클 때도 있었으므로 lower bound로도 읽으면 안 됩니다.</div>` : ""}
+      ${a.sMaxBoundReason === "secant" ? `<div class="s tag-Low">model-free secant lower bound(${fmt(a.sLowerBound.slope, 4)})이 이 값을 넘습니다 — refuted</div>` : ""}</div>
     <div class="card"><div class="k">임계 파워</div>
       ${(() => {
         const tg = a.thresholdTangent && a.thresholdTangent.spline;
         const t1ok = isFinite(a.thresholdP) && a.thresholdP > 0;
-        // 파라메트릭이 실패했거나 제약에 걸렸으면 접선-교점(모델 무관)을 주 보고값으로 올린다
-        const preferTangent = !!tg && (!t1ok || (a.boundHits || []).length > 0);
+        // 파라메트릭이 실패했거나 제약에 걸렸으면 접선-교점(model-free)을 주 보고값으로 올린다
+        // v3.7: 관측 ignition bracket가 쓰였으면 그것이 이미 thresholdP 에 들어 있다(엔진이 판정).
+        const fromIgnition = a.thresholdSource === "ignition-bracket";
+        const preferTangent = !fromIgnition && !!tg && (!t1ok || (a.boundHits || []).length > 0);
         const main = preferTangent ? tg.P : (t1ok ? a.thresholdP : NaN);
         const dens = isFinite(kd) && isFinite(main) ? `<div class="s" style="color:var(--accent)">= ${fmt(main * kd / du.div, 4)} ${du.name}</div>` : "";
         return `<div class="v">${isFinite(main) ? fmt(main, 4) : "해당 없음"}<span class="s">${isFinite(main) ? " W" : ""}</span>${!preferTangent && boot && t1ok ? ciStr(boot.ci.threshold) : ""}</div>
-      <div class="s">${preferTangent ? "접선-교점 · 비모수 스플라인 기준 <span class=\"muted\">(전이 폭 파라미터화에 의존하지 않음)</span>" : "상승 전이 중심 t₁"}</div>
+      <div class="s">${fromIgnition ? "관측 ignition bracket <span class=\"muted\">(암준위 → 점등 전이, model-free)</span>"
+        : preferTangent ? "접선-교점 · 비모수 스플라인 기준 <span class=\"muted\">(transition width 파라미터화에 의존하지 않음)</span>" : "상승 전이 중심 t₁"}</div>
+      ${fromIgnition && a.thresholdBracket ? `<div class="s">브래킷 ${fmt(a.thresholdBracket[0], 4)} – ${fmt(a.thresholdBracket[1], 4)} W
+        <span class="muted">(마지막 배경점 → 첫 점등점, Δlog₁₀P=${fmt(a.ignition.dlogP, 3)} dec)</span></div>` : ""}
+      ${fromIgnition && isFinite(a.thresholdPModel) ? `<div class="s tag-Low">파라메트릭 t₁ = ${fmt(a.thresholdPModel, 4)} W 는
+        <b>관측과 모순</b>입니다 — 그 파워에서 신호가 연속 3점 배경(게이트 ${fmt(a.ignition.gate, 4)})에 머물러 있습니다. 보고값에서 제외했습니다.</div>` : ""}
+      ${fromIgnition && !isFinite(a.thresholdPModel) ? `<div class="s muted">파라메트릭 층은 문턱을 내지 못했습니다 (H${a.chosenOrder})</div>` : ""}
       ${preferTangent && t1ok ? `<div class="s muted">파라메트릭 t₁ = ${fmt(a.thresholdP, 4)} W (제약 접촉 — 참고값)</div>` : ""}
       ${preferTangent && !t1ok ? `<div class="s tag-Low">파라메트릭 층은 문턱을 내지 못했습니다 (H${a.chosenOrder})</div>` : ""}
       ${!preferTangent && tg ? `<div class="s muted">접선-교점 대조: ${fmt(tg.P, 4)} W</div>` : ""}
@@ -43255,15 +44446,15 @@ ${bsCard}${poolCard}${occCard}${xoCard}
       if (!f) return "";
       const d2 = f.aicc - ref;
       const sel = Number(o2) === bb.chosenOrder;
-      return `<tr class="${sel && bb.preferred ? "sel" : ""}"><td>BS${o2} (쌍안정${o2 === "1" ? " + 포화" : ""})</td>
+      return `<tr class="${sel && bb.preferred ? "sel" : ""}"><td>BS${o2} (bistable${o2 === "1" ? " + 포화" : ""})</td>
         <td class="num">${fmt(f.aicc, 5)}</td><td class="num">${d2 < 0 ? fmt(d2, 3) : "+" + fmt(d2, 3)}</td><td class="num">${f.k}</td></tr>`;
     }).join("");
   })() : "");
   const noiseLine = `노이즈 모델 (${esc(a.noise.source)}): Var(I) = (${fmt(a.noise.a0, 3)})² + ${fmt(a.noise.a1, 3)}·I + (${fmt(a.noise.a2, 4)}·I)²`;
-  const diagLine = `잔차 runs-test p=${fmt(d.runsP, 3)} · χ²_red=${fmt(d.chi2red, 3)} · 사용점 ${d.nUsed}/${d.nTotal}` +
+  const diagLine = `residual runs-test p=${fmt(d.runsP, 3)} · χ²_red=${fmt(d.chi2red, 3)} · 사용점 ${d.nUsed}/${d.nTotal}` +
     (d.outliers && d.outliers.length ? ` · <span class="tag-Low">outlier ${d.outliers.length}개 자동 제외</span>` : "") +
     ` · 스플라인 edf=${fmt(a.spline.edf, 3)}`;
-  const qComp = `품질 구성: 적합성 ${fmt(q.components.adequacy, 3)} · 식별성 ${fmt(q.components.identifiability, 3)} · 데이터 커버리지 ${fmt(q.components.coverage, 3)} · 층간 일치 ${fmt(q.components.agreement, 3)}`;
+  const qComp = `품질 구성: 적합성 ${fmt(q.components.adequacy, 3)} · identifiability ${fmt(q.components.identifiability, 3)} · 데이터 커버리지 ${fmt(q.components.coverage, 3)} · 층간 일치 ${fmt(q.components.agreement, 3)}`;
   const notes = [
     `모델: I(P) = B + 10^h(log₁₀P), h는 smooth-hinge 체인 (H0⊂H1⊂H2 중첩 · AICc+절약 가드 ΔAICc>4)`,
     `s(P)는 파라메트릭 해석해와 단조 P-spline(GCV) 미분 두 경로로 독립 추정 → 상호 검증 (차이 ${fmt(a.agreement.sMaxGapPct, 3)}%)`,
@@ -43276,7 +44467,7 @@ ${bsCard}${poolCard}${occCard}${xoCard}
     <div class="small muted" style="margin-top:8px;">${noiseLine}</div>
     <div class="small muted">${diagLine}</div>
     <div class="small muted">${qComp}</div>
-    ${a.bistable && a.bistable.preferred ? `<div class="small muted">품질 지수와 위 진단값은 <b>H 족 적합</b>에 대한 것입니다 — 이 데이터에서는 쌍안정 서술이 더 지지되므로(ΔAICc ${fmt(a.bistable.aiccVsH, 5)}) 낮은 점수는 'H 족이 이 데이터에 맞지 않는다'는 뜻으로 읽으십시오.</div>` : ""}
+    ${a.bistable && a.bistable.preferred ? `<div class="small muted">품질 지수와 위 진단값은 <b>H 족 적합</b>에 대한 것입니다 — 이 데이터에서는 bistable 서술이 더 지지되므로(ΔAICc ${fmt(a.bistable.aiccVsH, 5)}) 낮은 점수는 'H 족이 이 데이터에 맞지 않는다'는 뜻으로 읽으십시오.</div>` : ""}
     <details style="margin-top:10px;"><summary class="small muted" style="cursor:pointer;">방법 노트</summary>
      <ul class="notes">${notes.map((n) => `<li>${n}</li>`).join("")}</ul></details>`;
 }
@@ -43394,7 +44585,11 @@ function summaryText(rec) {
   const ci = (pair) => boot && pair && isFinite(pair[0]) ? ` [${fmt(pair[0], 4)}, ${fmt(pair[1], 4)}]` : "";
   const lines = [
     `INNO Prism power-scan fit (PrismFit ${a.version}) — ${rec.name}`,
-    `REPORTED PA = ${a.paGridLimited ? ">= " : ""}${fmt(a.paReport, 4)} (${a.paSource === "jump" ? `unresolved jump, dlog10P=${fmt(a.paJump.dlogP, 3)}` : "resolved front"}; agg=${a._aggUsed || "mean"})`,
+    `REPORTED PA = ${a.paSource === "lower-bound" || a.paGridLimited ? ">= " : ""}${fmt(a.paReport, 4)} (${
+      a.paSource === "jump" ? `unresolved jump, dlog10P=${fmt(a.paJump.dlogP, 3)}`
+      : a.paSource === "lower-bound" ? `MODEL-FREE LOWER BOUND (secant), dlog10P=${fmt(a.paReportDlogP, 3)}`
+      : a.paSource === "unresolved" ? `UNIDENTIFIED — not a point estimate (${(a.boundHits || []).map((b) => b.param).join(",") || a.sMaxEdge || "?"})`
+      : "resolved front"}; agg=${a._aggUsed || "mean"})`,
     `branch=${a._branchUsed} · model=H${a.chosenOrder} (${orderLabel(a)})`,
     `s_max = ${fmt(a.sMax, 4)}${a.sMaxIsLowerBound ? " (lower bound, edge-censored)" : ""}${ci(boot && boot.ci.sMax)} @ P=${fmt(a.sMaxAtP, 4)} W`,
     `threshold t1 = ${isFinite(a.thresholdP) ? fmt(a.thresholdP, 5) + " W" : "n/a"}${ci(boot && boot.ci.threshold)}${isFinite(kd) && isFinite(a.thresholdP) ? ` = ${(() => { const u = activeDensityUnit(); return fmt(a.thresholdP * kd / u.div, 5) + " " + u.name; })()}` : ""}`,
@@ -43969,7 +45164,7 @@ function renderRiseResults(rec, a, boot) {
   if (r && r.ok) {
     const f = r.free;
     const cards = [];
-    cards.push(`<div class="card hero"><div class="k">상승시간 t₁₀₋₉₀${r.unresolvedFast ? " (상한)" : ""}</div>
+    cards.push(`<div class="card hero"><div class="k">상승시간 t₁₀₋₉₀${r.unresolvedFast ? " (upper bound)" : ""}</div>
       <div class="v">${r.unresolvedFast ? "&lt; " : ""}${fmtTCI(f.t1090, ci, "t1090")}</div>
       <div class="s">10%→90% 도달 (모델프리·isotonic)</div></div>`);
     cards.push(`<div class="card"><div class="k">t(1−1/e)</div><div class="v">${fmtTCI(f.t1e, ci, "t1e")}</div><div class="s">63.2% 도달</div></div>`);
@@ -44212,7 +45407,7 @@ function renderDarkResults(rec, d, a) {
         <td class="num">${r.fit && isFinite(r.fit.params.beta) ? fmt(r.fit.params.beta, 3) : "–"}</td>
         <td class="num">${fmt(r.I0eff || r.I0, 4)} → ${fmt(r.Iend, 4)}</td></tr>`;
     }).join("") + `</table></div>
-  <div class="small muted" style="margin-top:6px;">β&lt;1 (신장지수 KWW) = 불균일 앙상블 다크닝 · onset이 PA 임계 부근이면 avalanche 개체군 매개 손상, 완만한 멱법칙 증가면 직접 다광자 과정 시사 · Power scan 측정 시 이 onset 미만/짧은 dwell로 다크닝 왜곡 회피</div>`;
+  <div class="small muted" style="margin-top:6px;">β&lt;1 (신장지수 KWW) = 불균일 앙상블 다크닝 · onset가 PA 임계 부근이면 avalanche 개체군 매개 손상, 완만한 멱법칙 증가면 직접 다광자 과정 시사 · Power scan 측정 시 이 onset 미만/짧은 dwell로 다크닝 왜곡 회피</div>`;
   el.innerHTML = html;
 }
 
@@ -44284,7 +45479,7 @@ function detectionDiagnosticHtml(rec) {
   } else if (d.type === "power_apd" || d.type === "power_emccd") {
     bits.push(`<b>판정 근거</b>: 표준 경로 <span class="mono">measurement/power_scan/…</span> 정확 일치`);
   } else if (d.type === "generic") {
-    bits.push(`<span class="tag-Low">Power scan으로 인식되려면</span> 하나의 <span class="mono">measurement/&lt;그룹&gt;</span> 안에` +
+    bits.push(`<span class="tag-Low">Power scan로 인식되려면</span> 하나의 <span class="mono">measurement/&lt;그룹&gt;</span> 안에` +
       ` ① 이름에 <span class="mono">power</span>가 든 배열(측정점 n개)과` +
       ` ② 선두 차원이 같은 <span class="mono">count/rate/intensity/spectra</span> 계열 신호 배열이 필요합니다.` +
       ` 검출기 접두사·그룹명·<span class="mono">_raw</span> 유무는 자유입니다` +
@@ -44374,7 +45569,7 @@ async function runBatch() {
       results.push({ rec, a });
       const q = a.quality;
       row = `<tr><td>${esc(rec.name)}</td><td>${rec.det.type === "power_apd" ? "APD" : "EMCCD"}</td>
-        <td class="num"><b>${a.paGridLimited ? "≥" : ""}${fmt(a.paReport, 4)}</b></td>
+        <td class="num"><b>${a.paSource === "lower-bound" || a.paGridLimited ? "≥" : ""}${fmt(a.paReport, 4)}</b>${a.paSource === "unresolved" ? '<span class="tag-Poor" title="unidentified — point estimate 아님">?</span>' : ""}</td>
         <td>H${a.chosenOrder}</td>
         <td class="num">${fmt(a.sMax, 4)}${a.sMaxIsLowerBound ? "↑" : ""}</td>
         <td class="num">${a.paJump ? fmt(a.paJump.slope, 4) : "–"}</td>
@@ -44443,7 +45638,7 @@ async function runBatch() {
   setProgress(1); setTimeout(() => setProgress(null), 300);
   $("#batch-status").textContent = `완료 — Power scan ${results.length}/${targets.length}` +
     (riseTargets.length ? ` · Rise ${riseResults.length}/${riseTargets.length}` : "") +
-    ` · s_max 뒤 ↑ 표시는 edge-censored 하한값`;
+    ` · s_max 뒤 ↑ 표시는 edge-censored lower bound`;
   const csvBtn = $("#batch-csv");
   csvBtn.disabled = !results.length;
   csvBtn.addEventListener("click", () => {
@@ -44471,6 +45666,10 @@ function saveSettings() {
 function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem("innoPrismSettings") || "null");
+    // v3.8 — 레이어 기본값이 '최소'로 바뀌었다. 옛 저장본은 v2.6 기본값(residual·제외점·
+    // bistable·점멸 전부 켜짐)을 그대로 들고 있어 좁은 화면에서 라벨이 겹친다.
+    // 세대가 낮으면 **한 번만** 새 기본값으로 이관한다(이후 사용자가 켠 것은 그대로 유지된다).
+    if (s && typeof s === "object" && (s.layersV || 0) < 2) { delete s.layers; s.layersV = 2; }
     if (s && typeof s === "object") Object.assign(App.settings, s);
   } catch (e) {}
 }
