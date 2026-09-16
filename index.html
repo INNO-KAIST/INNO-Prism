@@ -42674,7 +42674,7 @@ function openCalibModal() {
       </details>
       <div class="flex small" style="margin-top:8px;">
         <button id="cb-img" class="small">빔 이미지 열기 (PNG/JPG/BMP)</button>
-        <input id="cb-img-input" type="file" accept="image/*" style="display:none">
+        <input id="cb-img-input" type="file" accept="image/*,.bmp,.BMP,.png,.PNG,.tif,.tiff,.TIF,.TIFF" style="display:none">
         <label class="ctl"><span>밀도 정의</span><select id="cb-mode">
           <option value="peak">Peak irradiance I₀=2P/(π·wx·wy) (권장·논문 표준)</option>
           <option value="e2avg">1/e² 면적 내 평균 (86.5% power)</option>
@@ -42875,7 +42875,7 @@ function openCalibModal() {
   const addBtnEl = back.querySelector("#cb-pair-add"), delBtnEl = back.querySelector("#cb-pair-del");
   if (addBtnEl) addBtnEl.addEventListener("click", () => setPairRows(c.pairRows + 1));
   if (delBtnEl) delBtnEl.addEventListener("click", () => setPairRows(c.pairRows - 1));
-  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda, #cb-umpx").forEach((el) => el.addEventListener("change", upd));
+  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda, #cb-umpx, #cb-gamma").forEach((el) => el.addEventListener("change", upd));
   fillObjSelect();
   back.querySelector("#cb-obj").addEventListener("change", () => {
     const i = Number(back.querySelector("#cb-obj").value);
@@ -43095,6 +43095,9 @@ function openCalibModal() {
        * 배경(pedestal)은 감마 *이전*에 들어간 것으로 본다 — 표시 LUT 는 프레임
        * 전체에 걸리므로 암레벨도 같이 인코딩되기 때문이다. 따라서 절대 화소값을
        * 그대로 거듭제곱하고 배경은 빼지 않는다(배경 제거는 하류에서 한다). */
+      const gamEl = back.querySelector("#cb-gamma");
+      const gamDom = gamEl && gamEl.value !== "" ? Number(gamEl.value) : NaN;
+      if (isFinite(gamDom) && gamDom > 1) c.displayGamma = gamDom;   // 리스너 누락에 의존하지 않는다
       const gam = (isFinite(c.displayGamma) && c.displayGamma > 1) ? c.displayGamma : 1;
       if (gam !== 1) {
         for (let i = 0; i < grayFull.length; i++) {
@@ -43108,14 +43111,15 @@ function openCalibModal() {
       const w = Math.floor(W0 / f), h = Math.floor(H0 / f);
       const gray = new Float64Array(w * h);
       let nAnn = 0;
+      /* 비닝은 **grayFull 에서** 한다 — idata 를 다시 읽으면 위에서 되돌린 감마가
+       * 반영되지 않는다(실제로 그 버그를 냈다). 그리고 감마 복원 *뒤에* 평균해야
+       * 맞다: 비선형으로 인코딩된 값을 먼저 평균하면 그 평균은 물리량이 아니다. */
       for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
         let sum = 0, cnt = 0;
         for (let dy = 0; dy < f; dy++) for (let dx = 0; dx < f; dx++) {
-          const pi = (y * f + dy) * W0 + (x * f + dx);
-          if (annMask[pi]) continue; // 주석 픽셀 제외
-          const i4 = pi * 4;
-          sum += 0.2126 * idata[i4] + 0.7152 * idata[i4 + 1] + 0.0722 * idata[i4 + 2];
-          cnt++;
+          const v = grayFull[(y * f + dy) * W0 + (x * f + dx)];
+          if (!isFinite(v)) continue;   // 주석(NaN) 픽셀 제외
+          sum += v; cnt++;
         }
         if (cnt > 0) gray[y * w + x] = sum / cnt;
         else { gray[y * w + x] = NaN; nAnn++; } // bin 전체가 주석 → 피팅 제외
