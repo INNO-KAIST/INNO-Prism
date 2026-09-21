@@ -94,6 +94,7 @@ label.ctl > span { padding-left: 1px; }
 .badge.histogram { background: #9085e9; color: #1a1a19; }
 .badge.rise_time { background: #7a5fd0; }
 .badge.darkening { background: #8a4b6e; }
+.badge.imaging { background: #2f8f8f; }
 .badge.generic { background: #55554f; }
 .badge.error { background: var(--bad); }
 #drop-hint {
@@ -286,6 +287,13 @@ a { color: var(--accent); }
   border-color: rgba(201,133,0,0.45); background: rgba(201,133,0,0.10); color: #e0bf7a;
 }
 
+/* --- widefield imaging viewer (v3.14) --- */
+#im-wrap canvas { image-rendering: pixelated; }
+#im-ovl text { paint-order: stroke; stroke: rgba(0,0,0,.65); stroke-width: 2px; }
+#im-frame { accent-color: #3987e5; }
+#det-table, #cmp-out { max-height: 420px; overflow: auto; }
+select[multiple] { background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 3px; }
+
 </style>
 </head>
 <body>
@@ -293,7 +301,7 @@ a { color: var(--accent); }
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.12.1</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.14.0</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -41084,8 +41092,15 @@ function detectType(file) {
   if (tree.some((n) => n.kind === "group" && n.path === "measurement/darkening_measurement/trace_counts")) {
     return { type: "darkening", label: "Photodarkening", darkGroup: "measurement/darkening_measurement", tree };
   }
-  if (tree.some((n) => n.path === `${KEYS.EMCCD_READOUT}/spectrum`)) {
-    return { type: "emccd_readout", label: "EMCCD spectrum", tree };
+  // EMCCD readout — 경로를 고정하지 않는다(측정 이름이 셋업마다 다르다: emccd_readout ·
+  // andor_ccd_readout · …). 그리고 **shape 로 분기한다**: 1D 면 스펙트럼이지만 2D 면
+  // 이미지이므로 여기서 잡지 않고 아래 imaging 판정으로 내려보낸다.
+  const specNode = tree.find((n) => n.kind === "dataset" &&
+    /^measurement\/[^/]+\/spectrum$/.test(n.path) &&
+    (n.shape || []).filter((s) => s > 1).length === 1);
+  if (specNode) {
+    return { type: "emccd_readout", label: "EMCCD spectrum", tree,
+      readoutGroup: specNode.path.slice(0, specNode.path.lastIndexOf("/")) };
   }
   // TCSPC / decay histogram: group with time_array + time_histogram
   const histGroups = {};
@@ -41145,6 +41160,15 @@ function detectType(file) {
         return { type: "rise_time", label: "Rise time (pulse response)", riseGroup: g, tree };
       }
     }
+  }
+  // 카메라 이미지 — **맨 마지막에** 둔다. 2D 스캔 맵도 (Ny, Nx) 이므로 구조만으로는
+  // 구분되지 않는다. 전용 스키마를 전부 통과한 뒤에야 잡아야 기존 판정이 안 흔들린다.
+  const img = findImagingGroup(file, tree);
+  if (img) {
+    return {
+      type: "imaging", imaging: img, tree,
+      label: img.kind === "stack" ? `이미지 스택 · ${img.n} 프레임` : "카메라 이미지",
+    };
   }
   return { type: "generic", label: "H5 data", tree };
 }
@@ -41378,10 +41402,12 @@ function extractPowerScanEMCCD(file, det) {
     wls: Array.from(wls.data, Number),
   };
 }
-function extractEmccdReadout(file) {
-  const base = KEYS.EMCCD_READOUT;
+function extractEmccdReadout(file, group) {
+  const base = group || KEYS.EMCCD_READOUT;
   const spectrum = readDataset(file, `${base}/spectrum`);
-  const wl = readDataset(file, `${base}/wavelengths`);
+  // 파장축 이름은 셋업마다 다르다: wavelengths(구) · wls(신) · wavelength
+  const wl = readDataset(file, `${base}/wavelengths`) || readDataset(file, `${base}/wls`) ||
+             readDataset(file, `${base}/wavelength`);
   const pixels = readDataset(file, `${base}/pixels`);
   const image = readDataset(file, `${base}/image`);
   const settings = safeGet(file, `${base}/settings`);
@@ -41606,6 +41632,224 @@ function readForPreview(file, path, sliceIdx) {
   return { kind: "2d", z: zRows, ny, nx, sliced: true };
 }
 
+/* --------------------------- imaging (widefield) --------------------------- */
+/**
+ * 카메라 이미지 측정 탐지 — **이름이 아니라 구조로** 판정한다.
+ *
+ * ScopeFoundry 측정 이름은 셋업마다 다르다 (andor_ccd_readout · time_trace_on_off ·
+ * emccd_readout · …). 공통점은 한 measurement 그룹 안에
+ *     (N, Ny, Nx) 3D 스택   또는   (Ny, Nx) 2D 프레임
+ * 이 들어 있고 두 공간축이 모두 충분히 크다는 것뿐이므로, 그것만 본다.
+ *
+ * **`spectrum` 이라는 이름이 붙어도 shape 가 2D 면 이미지다.** andor_ccd_readout 은
+ * readout_mode=Image 일 때 1024×1024 프레임을 `spectrum` 에 저장한다. 이름만 보고
+ * 1D 스펙트럼 뷰어로 보내면 이미지 한 장이 1,048,576 점짜리 꺾은선이 된다.
+ *
+ * 반환: {group, path, kind:"stack"|"frame", n, ny, nx, timePath}
+ */
+function findImagingGroup(file, tree) {
+  const MIN = 32;
+  let best = null;
+  for (const n of tree) {
+    if (n.kind !== "dataset" || !/^measurement\//.test(n.path)) continue;
+    const sh = (n.shape || []).filter((s) => s > 1);
+    let kind = null, nF = 1, ny = 0, nx = 0;
+    if (sh.length === 3 && sh[1] >= MIN && sh[2] >= MIN) { kind = "stack"; nF = sh[0]; ny = sh[1]; nx = sh[2]; }
+    else if (sh.length === 2 && sh[0] >= MIN && sh[1] >= MIN) { kind = "frame"; ny = sh[0]; nx = sh[1]; }
+    if (!kind) continue;
+    const i = n.path.lastIndexOf("/");
+    const group = n.path.slice(0, i), leaf = n.path.slice(i + 1);
+    let timePath = null;
+    if (kind === "stack") {
+      // **잎 이름만** 본다. 전체 경로로 검사하면 그룹명(time_trace_on_off)이 걸려서
+      // index_array 가 시간축으로 뽑히고 진짜 time_array 가 밀려난다.
+      const cand = tree.filter((m) => m.kind === "dataset" && m.path.indexOf(group + "/") === 0 &&
+        (m.shape || []).length === 1 && m.shape[0] === nF &&
+        /(^|_)times?(_|$)|(^|_)t$/i.test(m.path.slice(group.length + 1)));
+      if (cand.length) timePath = cand[0].path;
+    }
+    const score = (kind === "stack" ? 20 : 0) + (timePath ? 5 : 0) +
+      (/image|frame|movie|stack|camera|ccd/i.test(leaf) ? 4 : 0) +
+      (/spectrum/i.test(leaf) ? 2 : 0) + Math.min(Math.log10(ny * nx), 8);
+    if (!best || score > best.score) best = { score, group, path: n.path, kind, n: nF, ny, nx, timePath };
+  }
+  return best;
+}
+function numOrNull(v) { const x = Number(v); return isFinite(x) ? x : null; }
+/**
+ * HDF5 불리언 속성 → JS 삼치(true/false/null).
+ *
+ * HDF5 에는 고유한 bool 형이 없어서 ScopeFoundry 는 enum/uint8 로 쓴다. h5wasm 은
+ * 그것을 **숫자 1/0** (또는 길이 1 배열, 드물게 "True"/"b'True'" 문자열)로 돌려준다.
+ * `v === true` 로 비교하면 **항상 거짓**이 되어, 연결된 장비를 미연결로 읽는다.
+ * 값이 없거나 해석 불가면 null 을 돌려준다 — false 로 단정하지 않는다.
+ */
+function attrBool(v) {
+  if (v === true || v === false) return v;
+  if (v == null) return null;
+  if (Array.isArray(v)) return v.length ? attrBool(v[0]) : null;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "bigint") return v !== 0n;
+  if (typeof v === "string") {
+    const t = v.replace(/^b?['"]|['"]$/g, "").trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(t)) return true;
+    if (["false", "0", "no", "off"].includes(t)) return false;
+  }
+  return null;
+}
+/**
+ * 프레임 **한 장만** 읽는다 (하이퍼슬랩).
+ * (N, 1024, 1024) float32 는 프레임당 4 MB 다. 스택 전체를 올리면 프레임 수가
+ * 조금만 늘어도 브라우저 탭이 죽는다. slice 를 지원하지 않는 빌드에서만 전수 읽기로
+ * 후퇴한다.
+ */
+function readImageFrame(file, im, i) {
+  const d = safeGet(file, im.path);
+  if (!isDataset(d)) return null;
+  const ny = im.ny, nx = im.nx, npx = ny * nx;
+  let flat = null;
+  if (im.kind === "stack") {
+    const k = Math.max(0, Math.min(im.n - 1, i | 0));
+    const sh = Array.from(d.shape || []);
+    try {
+      const ranges = []; let seen = 0;
+      for (const s of sh) {
+        if (s === 1) { ranges.push([0, 1]); continue; }
+        ranges.push(seen === 0 ? [k, k + 1] : [0, s]);
+        seen++;
+      }
+      flat = d.slice(ranges);
+    } catch (e) { flat = null; }
+    if (!flat || flat.length < npx) {
+      const all = readDataset(file, im.path);
+      if (!all) return null;
+      const off = k * npx;
+      flat = all.data.subarray ? all.data.subarray(off, off + npx) : all.data.slice(off, off + npx);
+    }
+  } else {
+    const all = readDataset(file, im.path);
+    if (!all) return null;
+    flat = all.data;
+  }
+  const out = new Float32Array(npx);
+  for (let j = 0; j < npx; j++) out[j] = Number(flat[j]);
+  return out;
+}
+/** 이미징 측정의 축·설정·보조배열·카메라 정보. 프레임 화소는 포함하지 않는다. */
+function extractImaging(file, det) {
+  const im = det.imaging;
+  const out = { group: im.group, path: im.path, kind: im.kind, n: im.n, ny: im.ny, nx: im.nx, time: null, aux: {} };
+  if (im.timePath) {
+    const t = readDataset(file, im.timePath);
+    if (t) { out.time = Array.from(t.data, Number); out.timePath = im.timePath; }
+  }
+  const s = safeGet(file, im.group + "/settings");
+  out.settings = s ? attrsOf(s) : {};
+  // 파장축 후보: 길이가 가로축과 같은 1D 배열 (분광 모드일 때만 의미 있음)
+  const wl = (det.tree || []).find((n) => n.kind === "dataset" && n.path.indexOf(im.group + "/") === 0 &&
+    (n.shape || []).length === 1 && n.shape[0] === im.nx && /wl|wave|lambda/i.test(n.path));
+  // 같은 그룹의 나머지 1D 배열 — 상태 기록 후보 (index_array · index_turn_on_array …).
+  // 파장축은 상태 후보가 아니므로 뺀다.
+  for (const n of (det.tree || [])) {
+    if (n.kind !== "dataset" || n.path.indexOf(im.group + "/") !== 0) continue;
+    if (n.path === im.path || n.path === im.timePath) continue;
+    if (wl && n.path === wl.path) continue;
+    if ((n.shape || []).length !== 1 || n.shape[0] > 4096) continue;
+    const r = readDataset(file, n.path);
+    if (r) out.aux[n.path.slice(im.group.length + 1)] = Array.from(r.data, Number);
+  }
+  if (wl) {
+    const r = readDataset(file, wl.path);
+    if (r) {
+      const a = Array.from(r.data, Number);
+      // 0,1,2,… 면 파장이 아니라 픽셀 번호다 (wl_calib='pixels')
+      const isIndex = a.length > 2 && a.every((v, j) => v === j);
+      out.wl = { path: wl.path, values: a, isIndex };
+    }
+  }
+  out.camera = extractCameraMeta(file);
+  out.hardware = extractHardwareSummary(file);
+  return out;
+}
+/**
+ * 카메라 설정 — hardware/* 중 "카메라로 보이는" 그룹에서 노출·게인·온도·ROI 를 모은다.
+ * 장비 이름(andor_ccd · emccd · pixis …)을 고정하지 않는다. 같은 파일에 카메라
+ * 그룹이 여럿 있을 수 있으므로(연결 안 된 것 포함) 점수가 가장 높은 하나만 쓴다.
+ */
+function extractCameraMeta(file) {
+  const hw = safeGet(file, "hardware");
+  if (!hw || !isGroup(hw)) return null;
+  let keys = [];
+  try { keys = hw.keys(); } catch (e) { return null; }
+  const cands = [];
+  for (const k of keys) {
+    const s = safeGet(file, "hardware/" + k + "/settings");
+    if (!s) continue;
+    const a = attrsOf(s);
+    const score = (a.exposure_time != null ? 3 : 0) + (a.em_gain != null ? 2 : 0) +
+      (a.ccd_shape != null || a.readout_shape != null ? 2 : 0) +
+      (a.temperature != null ? 1 : 0);
+    if (score < 4) continue;
+    cands.push({ score, name: k, a, connected: attrBool(a.connected) === true });
+  }
+  if (!cands.length) return null;
+  // **연결된 후보가 하나라도 있으면 연결 안 된 것은 버린다.** ScopeFoundry 는 앱에
+  // 등록된 하드웨어를 전부 h5 에 적으므로, 이 측정에 쓰이지 않은 카메라 그룹이
+  // 그대로 남아 있을 수 있다(실측 파일에 속성 151개짜리 미연결 카메라가 있었다).
+  // 연결 상태를 무시하면 쓰지도 않은 장비의 설정을 측정 조건으로 읽게 된다.
+  const live = cands.filter((c) => c.connected);
+  const pool = live.length ? live : cands;
+  pool.sort((x, y) => y.score - x.score);
+  const best = pool[0];
+  const a = best.a;
+  return {
+    name: best.name, connected: best.connected,
+    nCandidates: cands.length,
+    rejected: cands.filter((c) => c !== best).map((c) => ({ name: c.name, connected: c.connected })),
+    exposure: numOrNull(a.exposure_time), emGain: numOrNull(a.em_gain),
+    temperature: numOrNull(a.temperature), tempStatus: a.temp_status != null ? String(a.temp_status) : null,
+    readoutMode: a.readout_mode != null ? String(a.readout_mode) : null,
+    outputAmp: numOrNull(a.output_amp),
+    hbin: numOrNull(a.roi_img_hbin), vbin: numOrNull(a.roi_img_vbin),
+    shape: Array.isArray(a.readout_shape) ? a.readout_shape.map(Number)
+      : (Array.isArray(a.ccd_shape) ? a.ccd_shape.map(Number) : null),
+    all: a,
+  };
+}
+
+/**
+ * hardware/ 그룹의 **연결 현황** 요약.
+ *
+ * ScopeFoundry 는 h5 에 그 앱에 등록된 하드웨어를 **전부** 적는다. 측정에 쓰이지 않은
+ * 장비, 심지어 그 방에 없는 장비의 설정까지 그대로 남는다. 그래서 이름만 보고
+ * "이 측정은 이 장비를 썼다"고 읽으면 틀린다 — 실측 파일에서 한 파워휠 항목은
+ * `connected=False` 인 데다 **존재하지도 않는 서보**를 참조하고 있었다.
+ * 이 함수는 연결 상태를 그대로 노출해 그 오독을 막는다. 판단은 하지 않는다.
+ */
+function extractHardwareSummary(file) {
+  const hw = safeGet(file, "hardware");
+  if (!hw || !isGroup(hw)) return null;
+  let keys = [];
+  try { keys = hw.keys(); } catch (e) { return null; }
+  const rows = [];
+  for (const k of keys) {
+    const s = safeGet(file, "hardware/" + k + "/settings");
+    const a = s ? attrsOf(s) : {};
+    rows.push({
+      name: k,
+      connected: attrBool(a.connected),
+      nAttrs: Object.keys(a).length,
+      port: a.port != null ? String(a.port) : null,
+    });
+  }
+  rows.sort((x, y) => (Number(y.connected === true) - Number(x.connected === true)) || x.name.localeCompare(y.name));
+  return {
+    rows,
+    nConnected: rows.filter((r) => r.connected === true).length,
+    nDisconnected: rows.filter((r) => r.connected === false).length,
+  };
+}
+
 /** Gather key metadata for display: excitation wavelength, sample name, etc. */
 function extractMeta(file) {
   const meta = {};
@@ -41625,7 +41869,7 @@ function extractMeta(file) {
       const s = safeGet(file, `hardware/${hw}/settings`);
       if (s) {
         const a = attrsOf(s);
-        if (a.laser_state === "ON" || a.laser_state === true) {
+        if (a.laser_state === "ON" || attrBool(a.laser_state) === true) {
           meta.laser = { name: hw, wavelength: a.wavelength ? String(a.wavelength) : "?", current: a.target_current };
           break;
         }
@@ -41645,6 +41889,888 @@ return {
   extractPowerScanAPD, extractPowerScanEMCCD, extractEmccdReadout, extractPLE,
   extract2DMaps, readForPreview, extractMeta, findPleGroup, safeGet,
   extractHistogram, scanAxes, extractPATrace, findPowerScanGroup, extractRiseTime, extractWaveScan, extractDarkening,
+  findImagingGroup, readImageFrame, extractImaging, extractCameraMeta, extractHardwareSummary, attrBool,
+};
+});
+
+</script>
+<!-- widefield imaging numeric layer -->
+<script>
+/* =============================================================================
+ * INNO Prism — widefield imaging numeric layer  (v3.14)
+ *
+ * 카메라 프레임(단일/스택)에 대한 **DOM 없는 순수 수치 계층**.
+ * 화면 그리기는 app.js 가 하고, 여기서는 값만 만든다 (Node 에서 그대로 검사 가능).
+ *
+ * 설계 원칙 — 이 파일 전체를 관통한다:
+ *  1) 파일이 기록하지 않은 것을 추론으로 채우지 않는다. 상태(빔 on/off)가 파일에
+ *     없으면 "없다"고 말하고, 가설은 **근거와 함께 가설로** 내놓는다.
+ *  2) 전체가 함께 움직인 변화(common mode)와 한 입자만 움직인 변화(independent)를
+ *     먼저 분리한다. 이 구분 없이 "스위칭"이라고 부르면 초점 이탈·빔 요동·시야 이동이
+ *     전부 단일입자 현상으로 둔갑한다. 허위 경보는 침묵보다 나쁘다.
+ *  3) 물리 해석(활성화인가 억제인가)을 수치에 박지 않는다. 지표는 부호중립으로
+ *     정의하고(양방향 비 + Michelson), 이름표는 표시 계층에서만 붙인다.
+ * ========================================================================== */
+"use strict";
+(function (root, factory) {
+  const api = factory();
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  else root.PrismImg = api;
+})(typeof self !== "undefined" ? self : this, function () {
+
+/* ------------------------------ basic stats ------------------------------- */
+function quantileSorted(s, q) {
+  const n = s.length;
+  if (!n) return NaN;
+  if (n === 1) return s[0];
+  const p = (n - 1) * q, lo = Math.floor(p), hi = Math.ceil(p);
+  return lo === hi ? s[lo] : s[lo] + (p - lo) * (s[hi] - s[lo]);
+}
+function quantile(arr, q) { return quantileSorted(Array.from(arr).sort((a, b) => a - b), q); }
+function median(arr) { return quantile(arr, 0.5); }
+
+/** 로버스트 배경·잡음. MAD → σ 는 정규분포 가정 환산계수 1.4826.
+ *  밝은 점이 섞여 있어도 중앙값·MAD 는 거의 흔들리지 않으므로 표준편차 대신 쓴다.
+ *  큰 이미지는 stride 표본만 본다(1024² 전수 정렬은 표시 반응성을 해친다). */
+function robustStats(img, maxSamples) {
+  const N = img.length, want = maxSamples || 60000;
+  const step = Math.max(1, Math.floor(N / want));
+  const s = [];
+  for (let i = 0; i < N; i += step) { const v = img[i]; if (isFinite(v)) s.push(v); }
+  s.sort((a, b) => a - b);
+  const med = quantileSorted(s, 0.5);
+  const dev = new Array(s.length);
+  for (let i = 0; i < s.length; i++) dev[i] = Math.abs(s[i] - med);
+  dev.sort((a, b) => a - b);
+  const mad = quantileSorted(dev, 0.5);
+  return { median: med, mad, sigma: mad * 1.4826, n: s.length, step };
+}
+function percentiles(img, qs, maxSamples) {
+  const N = img.length, want = maxSamples || 60000;
+  const step = Math.max(1, Math.floor(N / want));
+  const s = [];
+  for (let i = 0; i < N; i += step) { const v = img[i]; if (isFinite(v)) s.push(v); }
+  s.sort((a, b) => a - b);
+  return qs.map((q) => quantileSorted(s, q));
+}
+
+/* ------------------------------ image ops --------------------------------- */
+/** 분리형 가우시안 평활. 반경은 3σ 에서 끊는다(꼬리 기여 <0.3%). */
+function gaussBlur(src, nx, ny, sigma) {
+  const r = Math.max(1, Math.ceil(3 * sigma));
+  const k = new Float32Array(2 * r + 1);
+  let s = 0;
+  for (let i = -r; i <= r; i++) { const v = Math.exp(-(i * i) / (2 * sigma * sigma)); k[i + r] = v; s += v; }
+  for (let i = 0; i < k.length; i++) k[i] /= s;
+  const tmp = new Float32Array(nx * ny), out = new Float32Array(nx * ny);
+  for (let y = 0; y < ny; y++) {
+    const row = y * nx;
+    for (let x = 0; x < nx; x++) {
+      let acc = 0;
+      for (let i = -r; i <= r; i++) {
+        let xx = x + i; if (xx < 0) xx = -xx; if (xx >= nx) xx = 2 * nx - 2 - xx;
+        acc += k[i + r] * src[row + xx];
+      }
+      tmp[row + x] = acc;
+    }
+  }
+  for (let x = 0; x < nx; x++) {
+    for (let y = 0; y < ny; y++) {
+      let acc = 0;
+      for (let i = -r; i <= r; i++) {
+        let yy = y + i; if (yy < 0) yy = -yy; if (yy >= ny) yy = 2 * ny - 2 - yy;
+        acc += k[i + r] * tmp[yy * nx + x];
+      }
+      out[y * nx + x] = acc;
+    }
+  }
+  return out;
+}
+/** 원소별 최대 누적 — 프레임을 하나씩 읽으며 호출한다(스택 전체를 메모리에 안 올림). */
+function accMax(acc, frame) {
+  if (!acc) return Float32Array.from(frame);
+  for (let i = 0; i < acc.length; i++) if (frame[i] > acc[i]) acc[i] = frame[i];
+  return acc;
+}
+function accSum(acc, frame) {
+  if (!acc) return Float32Array.from(frame);
+  for (let i = 0; i < acc.length; i++) acc[i] += frame[i];
+  return acc;
+}
+function scaleInPlace(a, f) { for (let i = 0; i < a.length; i++) a[i] *= f; return a; }
+
+/* ------------------------------ spot finding ------------------------------ */
+/**
+ * 입자(회절한계 점) 검출.
+ *   평활 → 국소최대 → **모양 판별** → 최소간격 강제 → 광속(flux)순 절단
+ *
+ * ── 왜 σ 문턱만으로는 안 되는가 (이 카메라 자료에서 실측한 사실) ────────────
+ * EM gain 이 걸린 프레임의 화소 분포는 정규분포가 **전혀** 아니다. 증폭된 단일광자
+ * 사건이 화소 하나짜리 스파이크로 찍혀 꼬리가 극단적으로 두껍다.
+ * 실측(1024², 평활 σ=1.5): 중앙값+6σ 초과 4,961 px · +15σ 초과 1,220 px ·
+ * +30σ 초과 735 px. 정규분포라면 +6σ 조차 0개여야 한다.
+ * 그러므로 문턱을 아무리 올려도 스파이크는 남는다 — **문턱이 아니라 모양으로** 가른다.
+ *
+ * ── 모양 판별: shape = 조리개합 / 봉우리 ──────────────────────────────────
+ * 회절한계 점은 PSF 폭에 걸쳐 여러 화소가 함께 밝다 → 합/봉우리 ≫ 1.
+ * 단일광자 스파이크는 밝은 화소가 하나뿐이다 → 합/봉우리 ≈ 1.
+ * 실측 분포(후보 166개): 스파이크 중앙값 1.94 · p90 3.83 / 실제 입자 5.6–17.0.
+ * 기본 문턱 4.0 은 두 무리 사이에 있다. **기각 개수를 항상 함께 반환**하므로
+ * 문턱이 과하면 사용자가 즉시 알아채고 낮출 수 있다.
+ *
+ * ── 검출 기준 이미지 (호출자가 고른다) ────────────────────────────────────
+ * mean projection  — 스파이크가 1/N 로 줄어 가장 깨끗. 스택의 기본값.
+ * max projection   — 한 프레임에만 켜진 입자도 잡지만 스파이크도 전부 모은다.
+ * 단일 프레임       — 그 프레임에서 꺼져 있던 입자는 ROI 목록에서 통째로 빠진다.
+ * 어느 쪽도 공짜가 아니므로 기본값을 강요하지 않고 개수를 나란히 보여 준다.
+ */
+function detectSpots(img, nx, ny, opt) {
+  const o = Object.assign({ smooth: 1.5, k: 8, minSep: 6, maxSpots: 60, edge: 4,
+    shapeMin: 4.0, apR: 3 }, opt || {});
+  const sm = gaussBlur(img, nx, ny, o.smooth);
+  const st = robustStats(sm);
+  const rawBg = robustStats(img).median;
+  const thr = st.median + o.k * st.sigma;
+  const w = Math.max(1, Math.round(o.minSep / 2));
+  const cand = [];
+  for (let y = o.edge; y < ny - o.edge; y++) {
+    for (let x = o.edge; x < nx - o.edge; x++) {
+      const v = sm[y * nx + x];
+      if (!(v > thr)) continue;
+      let isMax = true;
+      for (let dy = -w; dy <= w && isMax; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= ny) continue;
+        for (let dx = -w; dx <= w; dx++) {
+          const xx = x + dx; if (xx < 0 || xx >= nx) continue;
+          if (dx === 0 && dy === 0) continue;
+          const u = sm[yy * nx + xx];
+          if (u > v || (u === v && (yy * nx + xx) < (y * nx + x))) { isMax = false; break; }
+        }
+      }
+      if (!isMax) continue;
+      // 모양 판별은 **원본** 프레임에서 한다 (평활은 스파이크를 PSF 처럼 퍼뜨린다)
+      let flux = 0, rpk = -Infinity;
+      const R = o.apR, R2 = R * R;
+      for (let dy = -R; dy <= R; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= ny) continue;
+        for (let dx = -R; dx <= R; dx++) {
+          if (dx * dx + dy * dy > R2) continue;
+          const xx = x + dx; if (xx < 0 || xx >= nx) continue;
+          const u = img[yy * nx + xx] - rawBg;
+          flux += u;
+          if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1 && u > rpk) rpk = u;
+        }
+      }
+      const shape = rpk > 0 ? flux / rpk : 0;
+      cand.push({ x, y, peak: v - st.median, snr: (v - st.median) / (st.sigma || 1), flux, shape });
+    }
+  }
+  const nCandidates = cand.length;
+  const passed = cand.filter((c) => c.shape >= o.shapeMin);
+  const nRejectedShape = nCandidates - passed.length;
+  // 광속순으로 고른다 — 봉우리는 PSF 폭에 따라 흔들리지만 조리개합은 물리량이다
+  passed.sort((a, b) => b.flux - a.flux);
+  const keep = [];
+  for (const c of passed) {
+    if (keep.length >= o.maxSpots) break;
+    let ok = true;
+    for (const q of keep) {
+      const dx = q.x - c.x, dy = q.y - c.y;
+      if (dx * dx + dy * dy < o.minSep * o.minSep) { ok = false; break; }
+    }
+    if (ok) keep.push(c);
+  }
+  // 무게중심으로 위치 정밀화 (평활 이미지, 배경 제거 후)
+  for (const c of keep) {
+    const r = Math.max(2, Math.round(o.minSep / 2));
+    let sw = 0, sx = 0, sy = 0;
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+      const xx = c.x + dx, yy = c.y + dy;
+      if (xx < 0 || yy < 0 || xx >= nx || yy >= ny) continue;
+      const v = sm[yy * nx + xx] - st.median;
+      if (v <= 0) continue;
+      sw += v; sx += v * xx; sy += v * yy;
+    }
+    if (sw > 0) { c.xc = sx / sw; c.yc = sy / sw; } else { c.xc = c.x; c.yc = c.y; }
+  }
+  return {
+    spots: keep, threshold: thr, background: st.median, sigma: st.sigma, rawBackground: rawBg,
+    nCandidates, nRejectedShape, nPassed: passed.length,
+    nDropped: Math.max(0, passed.length - keep.length), params: o,
+  };
+}
+
+/* ------------------------------ photometry -------------------------------- */
+/**
+ * 조리개 + 환형배경 광도측정.
+ *   S = Σ_aperture − n_ap · median(annulus)
+ *
+ * 배경은 평균이 아니라 **중앙값**으로 뺀다. 고리 안에 이웃 입자 꼬리나 우주선(cosmic
+ * ray)이 걸리면 평균은 끌려가고 중앙값은 버틴다.
+ *
+ * sigmaLow 는 **잡음의 하한**이다. 고리 화소의 산포만 반영하므로 밝은 화소의
+ * 산탄잡음(EM gain 이 걸리면 초과잡음까지)은 들어 있지 않다. 판정에 쓸 때는
+ * 하한임을 반드시 함께 보고한다 — 이걸 실제 σ 로 쓰면 유의성이 부풀려진다.
+ */
+function photometry(img, nx, ny, rois, opt) {
+  const o = Object.assign({ r: 3, rin: 5, rout: 9 }, opt || {});
+  const out = [];
+  const r2 = o.r * o.r, rin2 = o.rin * o.rin, rout2 = o.rout * o.rout;
+  for (const roi of rois) {
+    const cx = Math.round(roi.xc != null ? roi.xc : roi.x);
+    const cy = Math.round(roi.yc != null ? roi.yc : roi.y);
+    let sum = 0, nap = 0, peak = -Infinity;
+    const ring = [];
+    for (let dy = -o.rout; dy <= o.rout; dy++) {
+      const yy = cy + dy; if (yy < 0 || yy >= ny) continue;
+      for (let dx = -o.rout; dx <= o.rout; dx++) {
+        const xx = cx + dx; if (xx < 0 || xx >= nx) continue;
+        const d2 = dx * dx + dy * dy;
+        const v = img[yy * nx + xx];
+        if (d2 <= r2) { sum += v; nap++; if (v > peak) peak = v; }
+        else if (d2 >= rin2 && d2 <= rout2) ring.push(v);
+      }
+    }
+    const bg = ring.length ? median(ring) : 0;
+    let mad = 0;
+    if (ring.length > 4) {
+      const dev = ring.map((v) => Math.abs(v - bg)).sort((a, b) => a - b);
+      mad = quantileSorted(dev, 0.5);
+    }
+    const sigPix = mad * 1.4826;
+    out.push({
+      sum: sum - bg * nap, raw: sum, bg, nap, nring: ring.length,
+      peak: isFinite(peak) ? peak - bg : NaN,
+      sigmaLow: sigPix * Math.sqrt(nap),   // 하한 — 조리개 안 산탄잡음 미포함
+      clipped: nap === 0,
+    });
+  }
+  return out;
+}
+
+/* ------------------------------ blank noise ------------------------------- */
+/**
+ * 빈 자리 조리개 측광의 산포 = 그 프레임에서 **측광 1회의 실제 잡음**.
+ *
+ * 고리 배경의 MAD(photometry 의 sigmaLow)는 하한일 뿐이다 — EM gain 초과잡음도,
+ * 배경의 공간 구조도 들어 있지 않다. 그래서 잡음을 모형으로 세우는 대신, 같은
+ * 프레임의 **아무것도 없는 자리**에 같은 조리개를 놓고 실제로 재 본다.
+ * 가정이 없으므로 게인·증폭 통계를 몰라도 된다.
+ *
+ * 난수는 고정 씨앗 LCG 를 쓴다 — 같은 파일을 두 번 열면 같은 값이 나와야 한다.
+ */
+function blankNoise(img, nx, ny, rois, opt) {
+  const o = Object.assign({ r: 3, rin: 5, rout: 9, nSample: 240, seed: 20260921, clear: 16 }, opt || {});
+  let s = o.seed >>> 0;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  const pad = o.rout + 2;
+  const pts = [];
+  let guard = 0;
+  while (pts.length < o.nSample && guard++ < o.nSample * 20) {
+    const x = pad + Math.floor(rnd() * (nx - 2 * pad));
+    const y = pad + Math.floor(rnd() * (ny - 2 * pad));
+    let near = false;
+    for (const q of rois) {
+      const dx = (q.xc != null ? q.xc : q.x) - x, dy = (q.yc != null ? q.yc : q.y) - y;
+      if (dx * dx + dy * dy < o.clear * o.clear) { near = true; break; }
+    }
+    if (!near) pts.push({ x, y });
+  }
+  if (pts.length < 20) return { sigma: NaN, n: pts.length, why: "빈 자리 표본이 부족합니다" };
+  const ph = photometry(img, nx, ny, pts, { r: o.r, rin: o.rin, rout: o.rout });
+  const v = ph.map((p) => p.sum).filter(isFinite);
+  const med = median(v);
+  const dev = v.map((x) => Math.abs(x - med)).sort((a, b) => a - b);
+  return { sigma: quantileSorted(dev, 0.5) * 1.4826, median: med, n: v.length };
+}
+
+/* --------------------- common mode vs independent ------------------------- */
+/**
+ * 시야 전체가 함께 움직인 변화와 한 입자만 움직인 변화를 나눈다.
+ * **이 분리 없이 "스위칭"이라 부르면 초점 이탈·빔 요동·시야 이동이 전부 단일입자
+ * 현상으로 둔갑한다.**
+ *
+ *   ref_i  = 상위 절반 프레임의 평균            (입자 i 의 "켜진 수준")
+ *   u_ik   = S_ik / ref_i                       (입자별 정규화 트레이스)
+ *   g_k    = median_i u_ik                      (공통모드 — 시야 전체의 배율)
+ *   E_ik   = g_k · ref_i                        (공통모드만으로 기대되는 값)
+ *
+ * 전부가 같은 비율로 꺼지면 g 가 그것을 흡수해 S ≈ E 가 되어 **공통모드**로,
+ * 한 입자만 꺼지면 g 는 그대로이고 그 입자만 S ≪ E 가 되어 **개별**로 분류된다.
+ *
+ * ── 관측 가능성 게이트 (v3.12 에서 확립한 원칙의 재적용) ────────────────────
+ * **E_ik 가 잡음 아래면 그 점은 아무것도 구분하지 못한다.** 시야 전체가 꺼진
+ * 프레임에서는 모든 ROI 가 잡음 위를 떠다니므로 비(比)를 계산하면 잡음/잡음이
+ * 되어 |log₂| 가 2 oct 씩 튀고, 그 결과 "전체가 함께 꺼졌는데 개별 스위칭 5건"
+ * 같은 허위 경보가 나온다(실측 110553 에서 실제로 나왔다).
+ * 그래서 E_ik > kSig·σ_blank 인 점만 판정에 쓰고, 나머지는 `unidentified` 로
+ * 남긴다 — 값을 숨기지 않고 기각 사유와 함께 노출한다.
+ *
+ * ── 잡음 모형 ──────────────────────────────────────────────────────────────
+ *   noise(E) = √( σ_blank² + (relScatter·E)² )
+ * σ_blank 는 같은 프레임의 빈 자리에서 실측하고(blankNoise), relScatter 는
+ * 관측 가능한 점들의 상대 잔차 산포에서 직접 잰다. 둘 다 데이터에서 나오므로
+ * EM gain 통계를 가정하지 않는다.
+ *
+ * ROI 가 3개 미만이면 median 이 의미를 잃는다 → 분리하지 않고 사유를 반환한다.
+ */
+function commonMode(traces, opt) {
+  const o = Object.assign({ kSig: 3, relFloor: 0.15, sigmaBlank: null }, opt || {});
+  const nRoi = traces.length, nF = nRoi ? traces[0].length : 0;
+  const res = { nRoi, nF, ok: false, why: "" };
+  if (nRoi < 3) { res.why = `ROI 가 ${nRoi}개뿐입니다 — 공통모드를 정의하려면 최소 3개가 필요합니다`; return res; }
+  if (nF < 2) { res.why = "프레임이 1장뿐입니다 — 비교할 상대가 없습니다"; return res; }
+  const sb = [];
+  for (let k = 0; k < nF; k++) {
+    const v = Array.isArray(o.sigmaBlank) ? o.sigmaBlank[k] : o.sigmaBlank;
+    sb.push(isFinite(v) && v > 0 ? v : NaN);
+  }
+  const haveBlank = sb.every((v) => isFinite(v));
+  const ref = [], u = [];
+  for (let i = 0; i < nRoi; i++) {
+    const s = Array.from(traces[i], Number);
+    const srt = s.slice().sort((a, b) => b - a);
+    const top = Math.max(1, Math.ceil(nF / 2));
+    let m = 0; for (let j = 0; j < top; j++) m += srt[j];
+    m /= top;
+    ref.push(m);
+    u.push(s.map((v) => (m > 0 ? v / m : NaN)));
+  }
+  const usable = [];
+  for (let i = 0; i < nRoi; i++) if (isFinite(ref[i]) && ref[i] > 0) usable.push(i);
+  if (usable.length < 3) { res.why = "기준 수준(ref)이 정의되는 ROI 가 3개 미만입니다"; return res; }
+  const g = [];
+  for (let k = 0; k < nF; k++) {
+    const col = [];
+    for (const i of usable) { const v = u[i][k]; if (isFinite(v)) col.push(v); }
+    g.push(col.length ? median(col) : NaN);
+  }
+  // 기대값과 관측 가능성
+  const exp = [], obs = [];
+  for (let i = 0; i < nRoi; i++) {
+    const e = [], ob = [];
+    for (let k = 0; k < nF; k++) {
+      const E = isFinite(g[k]) && isFinite(ref[i]) ? g[k] * ref[i] : NaN;
+      e.push(E);
+      ob.push(isFinite(E) && (!haveBlank || E > o.kSig * sb[k]));
+    }
+    exp.push(e); obs.push(ob);
+  }
+  // 상대 산포 — 관측 가능한 점에서만 (잡음 구간이 섞이면 산포가 부풀고 문턱이 무의미해진다)
+  const rel = [];
+  for (const i of usable) for (let k = 0; k < nF; k++) {
+    if (!obs[i][k]) continue;
+    const E = exp[i][k];
+    if (!(E > 0)) continue;
+    rel.push((traces[i][k] - E) / E);
+  }
+  const relMed = rel.length ? median(rel) : 0;
+  const relScatter = rel.length > 3
+    ? Math.max(o.relFloor, quantile(rel.map((v) => Math.abs(v - relMed)), 0.5) * 1.4826)
+    : o.relFloor;
+  const flags = [];
+  let nObsTotal = 0;
+  for (let i = 0; i < nRoi; i++) {
+    let worst = 0, worstK = -1, nObs = 0, worstRatio = NaN;
+    for (let k = 0; k < nF; k++) {
+      if (!obs[i][k]) continue;
+      nObs++; nObsTotal++;
+      const E = exp[i][k], S = traces[i][k];
+      const noise = Math.sqrt((haveBlank ? sb[k] * sb[k] : 0) + Math.pow(relScatter * E, 2));
+      const z = noise > 0 ? Math.abs(S - E) / noise : 0;
+      if (z > worst) { worst = z; worstK = k; worstRatio = E > 0 ? S / E : NaN; }
+    }
+    flags.push({
+      roi: i, nObservable: nObs, maxZ: nObs ? worst : NaN, atFrame: worstK, ratioAtWorst: worstRatio,
+      // **관측 가능한 점이 2개 미만이면 "변화 없음"이라고 말할 수 없다.** 비교할
+      // 상대가 없는 것을 consistent 로 적으면 침묵해야 할 자리에서 결론을 내는 셈이다.
+      verdict: nObs < 2 ? "unidentified" : (worst > o.kSig ? "independent" : "consistent"),
+      independent: nObs >= 2 && worst > o.kSig,
+    });
+  }
+  const gf = g.filter((v) => isFinite(v) && v > 0);
+  res.ok = true;
+  res.g = g; res.u = u; res.ref = ref; res.exp = exp; res.observable = obs; res.flags = flags;
+  res.sigmaBlank = sb; res.haveBlank = haveBlank; res.relScatter = relScatter;
+  res.kSig = o.kSig; res.usable = usable;
+  res.nObservable = nObsTotal; res.nPoints = nRoi * nF;
+  res.commonSwing = gf.length ? Math.max.apply(null, gf) / Math.min.apply(null, gf) : NaN;
+  res.nIndependent = flags.filter((f) => f.verdict === "independent").length;
+  res.nUnidentified = flags.filter((f) => f.verdict === "unidentified").length;
+  // 전체가 함께 움직였는가 — g 의 진폭이 개별 잔차 문턱을 크게 넘는가
+  res.commonDominant = isFinite(res.commonSwing) && res.commonSwing > 1 + 3 * relScatter;
+  return res;
+}
+
+/* ---------------------- modulation depth & selectivity --------------------- */
+/**
+ * 입자별 변조 깊이.
+ *
+ * darkening ↔ recovery 실험에서 가장 직접적인 양은 "이 입자가 몇 배로 오르내렸는가"다.
+ * 그런데 꺼진 쪽이 잡음 아래로 내려가면 비의 분모가 정해지지 않는다 — 그때는
+ * 분모를 잡음 문턱으로 막고 **하한으로** 보고한다(`isLowerBound`).
+ * 0 으로 나눠 무한대를 적거나, 측정되지 않은 작은 값을 그대로 쓰는 것은 둘 다 거짓이다.
+ */
+function modulationDepth(traces, sigmaBlank, opt) {
+  const o = Object.assign({ kSig: 3 }, opt || {});
+  const sb = Array.isArray(sigmaBlank) ? sigmaBlank : null;
+  const floorOf = (k) => {
+    const v = sb ? sb[k] : sigmaBlank;
+    return isFinite(v) && v > 0 ? o.kSig * v : NaN;
+  };
+  return traces.map((t) => {
+    let maxS = -Infinity, minS = Infinity, kMax = -1, kMin = -1;
+    for (let k = 0; k < t.length; k++) {
+      const v = t[k];
+      if (!isFinite(v)) continue;
+      if (v > maxS) { maxS = v; kMax = k; }
+      if (v < minS) { minS = v; kMin = k; }
+    }
+    const fl = floorOf(kMin);
+    const lowFloored = isFinite(fl) ? Math.max(minS, fl) : minS;
+    const isLowerBound = isFinite(fl) && minS < fl;
+    const depth = lowFloored > 0 ? maxS / lowFloored : NaN;
+    const hiFl = floorOf(kMax);
+    return {
+      maxS, minS, kMax, kMin, depth, isLowerBound,
+      // 위쪽이 잡음 위에 있어야 변조를 논할 수 있다
+      significant: isFinite(hiFl) ? maxS > hiFl : null,
+      floor: fl,
+    };
+  });
+}
+/**
+ * 공간 선택성 — **초점 빔 실험의 핵심 질문**에 답한다:
+ * 표적 입자 하나만 반응했는가, 아니면 주변도 함께 반응했는가.
+ *
+ * 초점 빔이 한 입자만 때렸다면 표적의 변조 깊이가 주변보다 압도적으로 커야 하고,
+ * 반응하지 않은 **가장 가까운 이웃까지의 거리**가 그 빔의 유효 반경 상한이 된다.
+ * 반대로 깊이가 거리에 따라 완만히 줄면 빔이 샜거나 초점이 넓다는 뜻이다.
+ *
+ * 거리는 화소 단위다 — µm/px 환산이 파일에 없으므로 여기서 지어내지 않는다.
+ */
+function selectivity(rois, depths, targetIdx, opt) {
+  const o = Object.assign({ quietMax: 2.0 }, opt || {});
+  const px = (r) => (r.xc != null ? r.xc : r.x), py = (r) => (r.yc != null ? r.yc : r.y);
+  if (targetIdx == null || !rois[targetIdx]) return { ok: false, why: "표적 ROI 가 지정되지 않았습니다" };
+  const tx = px(rois[targetIdx]), ty = py(rois[targetIdx]);
+  const rows = rois.map((r, i) => ({
+    roi: i, dist: Math.hypot(px(r) - tx, py(r) - ty),
+    depth: depths[i] ? depths[i].depth : NaN,
+    isLowerBound: depths[i] ? depths[i].isLowerBound : false,
+    isTarget: i === targetIdx,
+  })).sort((a, b) => a.dist - b.dist);
+  const others = rows.filter((r) => !r.isTarget && isFinite(r.depth));
+  const tgt = rows.find((r) => r.isTarget);
+  const quiet = others.filter((r) => r.depth <= o.quietMax);
+  const loud = others.filter((r) => r.depth > o.quietMax);
+  const maxOther = others.length ? Math.max.apply(null, others.map((r) => r.depth)) : NaN;
+  return {
+    ok: true, rows, target: tgt, nOthers: others.length,
+    maxOtherDepth: maxOther,
+    ratioToOthers: isFinite(maxOther) && maxOther > 0 ? tgt.depth / maxOther : NaN,
+    nearestQuiet: quiet.length ? quiet[0] : null,
+    nearestLoud: loud.length ? loud[0] : null,
+    quietMax: o.quietMax,
+    // 거리에 따른 추세: 가까운 절반과 먼 절반의 깊이 중앙값 비교
+    trend: (() => {
+      if (others.length < 4) return null;
+      const half = Math.floor(others.length / 2);
+      const near = median(others.slice(0, half).map((r) => r.depth));
+      const far = median(others.slice(half).map((r) => r.depth));
+      return { near, far, splitAt: others[half].dist, graded: near > far * 1.5 };
+    })(),
+  };
+}
+/** 변조가 가장 큰 ROI — 표적 자동 제안용. 판정이 아니라 **제안**이다. */
+function suggestTarget(depths) {
+  let best = -1, bd = -Infinity;
+  depths.forEach((d, i) => {
+    if (!d || !isFinite(d.depth)) return;
+    if (d.significant === false) return;
+    if (d.depth > bd) { bd = d.depth; best = i; }
+  });
+  return best >= 0 ? { index: best, depth: bd } : null;
+}
+
+/* --------------------------- state assignment ----------------------------- */
+/**
+ * "어느 프레임이 빔 on 인가" — 세 경로를 **각각 근거와 함께** 반환한다. 고르지 않는다.
+ *
+ *  (1) file    : 파일이 상태를 기록했는가
+ *  (2) cadence : 프레임 간격이 두 값으로 교대하는가 (교대 = 한 주기에 두 위상)
+ *  (3) levels  : 프레임 밝기가 두 준위로 갈라지는가
+ *
+ * 셋이 어긋나면 그것 자체가 결과다. 예컨대 간격은 A·B·A 를 가리키는데 밝기는
+ * 첫 프레임만 밝다면, 그건 "상태가 아니라 비가역적 소실(퇴색·초점이탈·이동)"을
+ * 시사한다 — 여기서 하나를 임의로 채택하면 그 정보가 사라진다.
+ */
+function stateEvidence(input) {
+  const { n, time, aux, level, settings } = input;
+  const ev = { n, file: null, schedule: null, cadence: null, levels: null, agree: null };
+
+  // (0) 측정 설정 구조 — 파일이 직접 적어 둔 값에서 나온다(추정이 아니다).
+  //     ScopeFoundry time_trace_on_off 은 주기당 두 조작을 수행하므로
+  //     프레임 수 n = 2·num_cycle + 1 이면 "첫 장 = 기준 상태, 이후 두 조작이 교대"가
+  //     **산술적으로 확인된다.** 이 경우 첫 프레임은 어느 상태도 아니므로 제외한다 —
+  //     기준 프레임을 한쪽 상태에 억지로 넣으면 그쪽 평균이 오염된다.
+  const nc = settings && settings.num_cycle != null ? Number(settings.num_cycle) : NaN;
+  if (isFinite(nc) && nc >= 1 && n === 2 * nc + 1) {
+    const assign = new Array(n).fill(-1);
+    for (let k = 1; k < n; k++) assign[k] = (k % 2 === 1) ? 0 : 1;
+    ev.schedule = {
+      assign, numCycle: nc, strength: "구조 일치",
+      note: `설정의 num_cycle = ${nc} 이고 프레임이 ${n}장 = 2×${nc}+1 입니다 — ` +
+        `첫 장은 조작 전 기준이고 이후 두 조작이 교대합니다. 어느 쪽이 어떤 조작인지는 파일에 없습니다.`,
+    };
+  } else if (isFinite(nc) && nc >= 1) {
+    ev.scheduleNote = `설정의 num_cycle = ${nc} 인데 프레임이 ${n}장입니다 (2×${nc}+1 = ${2 * nc + 1} 아님) — ` +
+      `주기 구조를 프레임 수로 확인할 수 없습니다.`;
+  } else {
+    ev.scheduleNote = "측정 설정에 num_cycle 이 없습니다 — 주기 구조를 확인할 수 없습니다.";
+  }
+
+  // (1) 파일 기록
+  const notes = [];
+  if (aux) for (const key of Object.keys(aux)) {
+    const a = aux[key];
+    if (!Array.isArray(a) && !ArrayBuffer.isView(a)) continue;
+    const arr = Array.from(a, Number);
+    if (arr.length !== n) { notes.push(`${key}: 길이 ${arr.length} ≠ 프레임 ${n}`); continue; }
+    const uniq = Array.from(new Set(arr));
+    if (uniq.length < 2) { notes.push(`${key}: 값이 ${uniq.length === 1 ? String(uniq[0]) : "없음"} 하나뿐`); continue; }
+    if (uniq.length === n && arr.every((v, i) => v === arr[0] + i)) { notes.push(`${key}: 단순 일련번호`); continue; }
+    if (uniq.length === 2) {
+      const lo = Math.min.apply(null, uniq);
+      ev.file = { assign: arr.map((v) => (v === lo ? 0 : 1)), from: key, strength: "확정" };
+      break;
+    }
+    notes.push(`${key}: 서로 다른 값 ${uniq.length}개 — 2상태로 볼 수 없음`);
+  }
+  if (!ev.file) ev.fileNotes = notes;
+
+  // (2) 간격 교대
+  if (time && time.length === n && n >= 3) {
+    const dt = [];
+    for (let i = 1; i < n; i++) dt.push(time[i] - time[i - 1]);
+    const even = dt.filter((_, i) => i % 2 === 0), odd = dt.filter((_, i) => i % 2 === 1);
+    if (even.length && odd.length) {
+      const me = mean(even), mo = mean(odd);
+      const spread = Math.max(spreadOf(even), spreadOf(odd));
+      const gap = Math.abs(me - mo);
+      const rel = gap / Math.max(1e-9, (me + mo) / 2);
+      const strong = gap > 3 * spread && rel > 0.05;
+      const weak = rel > 0.05;
+      if (weak) {
+        ev.cadence = {
+          assign: Array.from({ length: n }, (_, i) => i % 2),
+          dtEven: me, dtOdd: mo, spread, rel,
+          strength: strong ? (even.length > 1 && odd.length > 1 ? "강함" : "약함 (각 위상 1구간뿐)") : "약함",
+          note: `프레임 간격이 ${fmtN(me)} s 와 ${fmtN(mo)} s 로 교대합니다 (차이 ${(rel * 100).toFixed(1)}%)`,
+        };
+      } else {
+        ev.cadenceNote = `프레임 간격이 균일합니다 (${fmtN(me)} s) — 교대 구조의 근거가 없습니다`;
+      }
+    }
+  } else if (!time) ev.cadenceNote = "시간축이 없습니다";
+
+  // (3) 준위 분리
+  if (level && level.length === n && n >= 3) {
+    const v = Array.from(level, Number).filter(isFinite);
+    if (v.length === n && v.every((x) => x > 0)) {
+      const lg = v.map((x) => Math.log2(x));
+      const idx = lg.map((x, i) => [x, i]).sort((a, b) => a[0] - b[0]);
+      let bestGap = -Infinity, cutAt = -1;
+      const gaps = [];
+      for (let i = 1; i < n; i++) { const gp = idx[i][0] - idx[i - 1][0]; gaps.push(gp); if (gp > bestGap) { bestGap = gp; cutAt = i; } }
+      // 최대 간격을 **나머지 간격들과** 비교한다. 나머지에 자기 자신을 포함시키면
+      // 프레임이 적을 때 비가 구조적으로 눌려서(n=3 이면 최대 2.0) 진짜 이봉분포도
+      // 문턱을 못 넘는다.
+      const others = gaps.filter((_, gi) => gi !== cutAt - 1).sort((a, b) => a - b);
+      const medGap = others.length ? quantileSorted(others, 0.5) : 0;
+      const ratio = medGap > 0 ? bestGap / medGap : Infinity;
+      if (cutAt > 0 && bestGap > 0.3 && ratio > 3) {
+        const assign = new Array(n).fill(0);
+        for (let i = cutAt; i < n; i++) assign[idx[i][1]] = 1;  // 1 = 밝은 쪽
+        ev.levels = { assign, gap: bestGap, ratio, strength: ratio > 6 ? "강함" : "보통",
+          note: `프레임 밝기가 두 준위로 갈라집니다 (간격 ${bestGap.toFixed(2)} oct, 다음 간격의 ${ratio.toFixed(1)}배)` };
+      } else {
+        ev.levelsNote = `프레임 밝기가 두 준위로 갈라지지 않습니다 (최대 간격 ${isFinite(bestGap) ? bestGap.toFixed(2) : "–"} oct, 다음 간격의 ${isFinite(ratio) ? ratio.toFixed(1) : "–"}배)`;
+      }
+    } else ev.levelsNote = "밝기 기준값에 0 이하/비유한 값이 있어 준위 분리를 적용할 수 없습니다";
+  }
+
+  // 가설 간 일치 여부
+  const hyps = [["file", ev.file], ["schedule", ev.schedule], ["cadence", ev.cadence], ["levels", ev.levels]].filter((h) => h[1]);
+  if (hyps.length >= 2) {
+    const pairs = [];
+    for (let i = 0; i < hyps.length; i++) for (let j = i + 1; j < hyps.length; j++) {
+      const a = hyps[i][1].assign, b = hyps[j][1].assign;
+      // 한쪽이 제외(-1)로 둔 프레임은 비교 대상이 아니다 — 기준 프레임 유무만 다른
+      // 두 가설을 "불일치"로 적으면 실제 충돌과 구별되지 않는다.
+      let same = 0, flip = 0, cmp = 0;
+      for (let k = 0; k < n; k++) {
+        if (a[k] < 0 || b[k] < 0) continue;
+        cmp++;
+        if (a[k] === b[k]) same++; else flip++;
+      }
+      pairs.push({ a: hyps[i][0], b: hyps[j][0], nCompared: cmp, agree: cmp > 0 && Math.max(same, flip) === cmp });
+    }
+    ev.agree = pairs;
+    ev.conflict = pairs.some((p) => !p.agree);
+  }
+  return ev;
+}
+function mean(a) { let s = 0; for (const v of a) s += v; return s / a.length; }
+function spreadOf(a) { if (a.length < 2) return 0; return Math.max.apply(null, a) - Math.min.apply(null, a); }
+function fmtN(v) { return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2); }
+
+/* ------------------------------- contrast --------------------------------- */
+/**
+ * 두 상태 대비 — **부호중립**. 어느 쪽이 "켜짐"인지 모르는 채로도 쓸 수 있어야 한다.
+ *   ratioAB = A/B,  ratioBA = B/A     (둘 다 보고한다)
+ *   michelson = (A−B)/(A+B) ∈ [−1, 1]  (대칭·유계 — 방향 해석 없이 크기 비교 가능)
+ * 활성화 구조냐 억제 구조냐는 여기서 정하지 않는다. 이름표는 표시 계층의 몫이다.
+ */
+function contrast(traces, assign, opt) {
+  const o = Object.assign({}, opt || {});
+  const nRoi = traces.length, nF = nRoi ? traces[0].length : 0;
+  const idxA = [], idxB = [];
+  for (let k = 0; k < nF; k++) { if (assign[k] === 0) idxA.push(k); else if (assign[k] === 1) idxB.push(k); }
+  const rows = [];
+  for (let i = 0; i < nRoi; i++) {
+    const a = idxA.map((k) => traces[i][k]).filter(isFinite);
+    const b = idxB.map((k) => traces[i][k]).filter(isFinite);
+    const mA = a.length ? mean(a) : NaN, mB = b.length ? mean(b) : NaN;
+    const sA = a.length > 1 ? sd(a) : NaN, sB = b.length > 1 ? sd(b) : NaN;
+    rows.push({
+      roi: i, nA: a.length, nB: b.length, meanA: mA, meanB: mB, sdA: sA, sdB: sB,
+      ratioAB: mB !== 0 ? mA / mB : NaN,
+      ratioBA: mA !== 0 ? mB / mA : NaN,
+      michelson: (mA + mB) !== 0 ? (mA - mB) / (mA + mB) : NaN,
+      log2AB: mA > 0 && mB > 0 ? Math.log2(mA / mB) : NaN,
+    });
+  }
+  const mich = rows.map((r) => r.michelson).filter(isFinite);
+  const summary = {
+    nRoi, nA: idxA.length, nB: idxB.length,
+    michelsonMedian: mich.length ? median(mich) : NaN,
+    michelsonIQR: mich.length > 3 ? quantile(mich, 0.75) - quantile(mich, 0.25) : NaN,
+    michelsonMin: mich.length ? Math.min.apply(null, mich) : NaN,
+    michelsonMax: mich.length ? Math.max.apply(null, mich) : NaN,
+    // 방향이 입자마다 갈리는가 — 갈린다면 "전체가 한 방향으로 스위칭"이라는 서술은 틀렸다
+    mixedDirection: mich.length ? (mich.some((v) => v > 0.1) && mich.some((v) => v < -0.1)) : false,
+  };
+  return { rows, summary, idxA, idxB };
+}
+function sd(a) { const m = mean(a); let s = 0; for (const v of a) s += (v - m) * (v - m); return Math.sqrt(s / (a.length - 1)); }
+
+/* ------------------------- FOV matching (registration) -------------------- */
+/**
+ * 띠통과(band-pass) 상호상관으로 두 프레임 사이의 **이동량**을 구한다.
+ *
+ * ── 왜 원본 화소 상관은 못 쓰는가 ──────────────────────────────────────────
+ * EM gain 이 걸린 프레임은 산탄잡음이 지배해서, **같은 자리끼리도** 원본 상관계수가
+ * 0.07 밖에 안 나온다(실측). 잡음은 상관되지 않으면서 정규화 분모만 키우기 때문이다.
+ *
+ * ── 왜 띠통과가 필요한가 ───────────────────────────────────────────────────
+ * 평활만 하면 조명 포락선(램프·빔의 넓은 밝기 분포)이 상관을 지배한다. 서로 다른
+ * 자리끼리도 포락선이 겹쳐 peak 0.43 이 나왔다. σ=1.5 와 σ=8 의 차(DoG)로
+ * **PSF 크기의 구조만** 남기면 포락선 기여가 사라진다.
+ *
+ * ── 반환값을 이분법으로 쓰지 말 것 ─────────────────────────────────────────
+ * 실측에서 "다른 자리"로 보였던 두 묶음은 사실 ~65 px 이동한 **부분 겹침**이었다
+ * (상관 0.14–0.17 @ (65,−5), 엉뚱한 이동에서는 0.00). 그래서 이 함수는 "같은
+ * 자리인가"를 판정하지 않는다 — 이동량과 그 신뢰도(PSR)만 준다. 입자별로 상대가
+ * 있는지는 transferRois 가 ROI 단위로 따로 따진다.
+ *
+ * 2단 탐색: bin 축소 격자(전역) → 원해상도 미세 탐색(ROI 주변 상자만).
+ */
+function bandpass(img, nx, ny, s1, s2) {
+  const a = gaussBlur(img, nx, ny, s1 || 1.5), b = gaussBlur(img, nx, ny, s2 || 8);
+  const out = new Float32Array(img.length);
+  for (let i = 0; i < out.length; i++) out[i] = a[i] - b[i];
+  return out;
+}
+function binDown(a, nx, ny, bin) {
+  const bx = Math.floor(nx / bin), by = Math.floor(ny / bin), out = new Float32Array(bx * by);
+  for (let y = 0; y < by; y++) for (let x = 0; x < bx; x++) {
+    let s = 0;
+    for (let j = 0; j < bin; j++) for (let i = 0; i < bin; i++) s += a[(y * bin + j) * nx + x * bin + i];
+    out[y * bx + x] = s / (bin * bin);
+  }
+  return { a: out, nx: bx, ny: by };
+}
+function corrAt(A, B, nx, ny, dx, dy, box) {
+  const y0 = Math.max(box ? box.y0 : 0, Math.max(0, -dy));
+  const y1 = Math.min(box ? box.y1 : ny, Math.min(ny, ny - dy));
+  const x0 = Math.max(box ? box.x0 : 0, Math.max(0, -dx));
+  const x1 = Math.min(box ? box.x1 : nx, Math.min(nx, nx - dx));
+  let s = 0, na = 0, nb = 0;
+  for (let y = y0; y < y1; y++) {
+    const ra = y * nx, rb = (y + dy) * nx;
+    for (let x = x0; x < x1; x++) { const u = A[ra + x], v = B[rb + x + dx]; s += u * v; na += u * u; nb += v * v; }
+  }
+  return s / (Math.sqrt(na * nb) || 1e-9);
+}
+function registerShift(imgA, imgB, nx, ny, opt) {
+  const o = Object.assign({ maxShift: 64, bin: 4, s1: 1.5, s2: 8, roisA: null, margin: 40, psrMin: 6 }, opt || {});
+  const A = bandpass(imgA, nx, ny, o.s1, o.s2), B = bandpass(imgB, nx, ny, o.s1, o.s2);
+  const ba = binDown(A, nx, ny, o.bin), bb = binDown(B, nx, ny, o.bin);
+  const m = Math.max(1, Math.round(o.maxShift / o.bin));
+  const surf = [];
+  for (let dy = -m; dy <= m; dy++) for (let dx = -m; dx <= m; dx++)
+    surf.push({ dx, dy, c: corrAt(ba.a, bb.a, ba.nx, ba.ny, dx, dy, null) });
+  surf.sort((p, q) => q.c - p.c);
+  const top = surf[0];
+  const side = surf.filter((r) => Math.hypot(r.dx - top.dx, r.dy - top.dy) > 3);
+  const sm = side.length ? side.reduce((a, r) => a + r.c, 0) / side.length : 0;
+  const ssd = side.length ? Math.sqrt(side.reduce((a, r) => a + (r.c - sm) * (r.c - sm), 0) / side.length) : 0;
+  const psr = ssd > 0 ? (top.c - sm) / ssd : NaN;
+  let box = null;
+  if (o.roisA && o.roisA.length) {
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (const r of o.roisA) {
+      const x = r.xc != null ? r.xc : r.x, y = r.yc != null ? r.yc : r.y;
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+    }
+    box = { x0: Math.max(0, Math.floor(x0 - o.margin)), x1: Math.min(nx, Math.ceil(x1 + o.margin)),
+      y0: Math.max(0, Math.floor(y0 - o.margin)), y1: Math.min(ny, Math.ceil(y1 + o.margin)) };
+  }
+  const cx = top.dx * o.bin, cy = top.dy * o.bin, w = o.bin + 2;
+  let best = { c: -Infinity, dx: cx, dy: cy };
+  for (let dy = cy - w; dy <= cy + w; dy++) for (let dx = cx - w; dx <= cx + w; dx++) {
+    const c = corrAt(A, B, nx, ny, dx, dy, box);
+    if (c > best.c) best = { c, dx, dy };
+  }
+  const nulls = [[120, 120], [-150, 90], [200, -60], [90, -200]]
+    .map(([dx, dy]) => corrAt(A, B, nx, ny, dx, dy, box)).filter(isFinite);
+  const nullMean = nulls.length ? nulls.reduce((a, b) => a + b, 0) / nulls.length : 0;
+  const ok = isFinite(psr) && psr >= o.psrMin;
+  return {
+    dx: best.dx, dy: best.dy, peak: best.c, coarsePeak: top.c, psr, sideMean: sm, sideSd: ssd,
+    nullLevel: nullMean, box, ok,
+    why: ok ? "" : `이동량을 확정할 수 없습니다 — 상관 봉우리가 배경 대비 ${isFinite(psr) ? psr.toFixed(1) : "–"}σ 로 기준 ${o.psrMin}σ 에 못 미칩니다. 겹치는 영역이 없거나 이동량이 ±${o.maxShift} px 를 넘습니다.`,
+  };
+}
+/**
+ * ROI 를 다른 프레임으로 옮기고 **입자별로** 상대가 실제로 있는지 따진다.
+ * 전역 "같은 자리인가" 판정 하나로 뭉뚱그리지 않는 이유: 시야가 조금만 이동해도
+ * 일부 입자만 넘어오고 일부는 밖으로 나간다. 그 경계를 흐리면 "사라진 입자"와
+ * "화면 밖으로 나간 입자"가 구별되지 않는다.
+ */
+function transferRois(rois, shift, imgB, nx, ny, opt) {
+  const o = Object.assign({ r: 3, rin: 5, rout: 9, kSig: 3, sigmaBlank: null }, opt || {});
+  const moved = rois.map((r) => ({
+    xc: (r.xc != null ? r.xc : r.x) + shift.dx,
+    yc: (r.yc != null ? r.yc : r.y) + shift.dy,
+  }));
+  const inside = moved.map((p) => p.xc >= o.rout && p.yc >= o.rout && p.xc < nx - o.rout && p.yc < ny - o.rout);
+  const probe = moved.map((p, i) => (inside[i] ? p : { xc: o.rout, yc: o.rout }));
+  const ph = photometry(imgB, nx, ny, probe, { r: o.r, rin: o.rin, rout: o.rout });
+  const sig = isFinite(o.sigmaBlank) && o.sigmaBlank > 0 ? o.sigmaBlank : NaN;
+  return rois.map((r, i) => ({
+    roi: i, x: moved[i].xc, y: moved[i].yc, inside: inside[i],
+    sum: inside[i] ? ph[i].sum : NaN,
+    snr: inside[i] && isFinite(sig) ? ph[i].sum / sig : NaN,
+    detected: inside[i] && isFinite(sig) ? ph[i].sum > o.kSig * sig : null,
+    note: inside[i] ? "" : "이동 후 화면 밖 — 없어진 것이 아니라 시야를 벗어났습니다",
+  }));
+}
+
+/**
+ * 두 이미지가 **같은 자리인지** 입자 배치(별자리)로 판정하고, 맞다면 정수 이동량을 준다.
+ *
+ * 상관계수로 판정하면 안 된다 — EM gain 이 걸린 프레임은 산탄잡음이 지배해서
+ * 같은 자리끼리도 r ≈ 0.07 밖에 안 나온다(실측). 반면 입자 좌표는 잡음에 강하다.
+ *
+ * 후보 이동량은 "A 의 밝은 점 하나 ↔ B 의 밝은 점 하나" 쌍에서만 만들고, 각 후보에
+ * 대해 tol 안에서 짝이 맞는 점 수(inlier)를 센다. inlier 가 minInliers 미만이면
+ * **판정 보류**로 돌려준다 — 다른 자리를 억지로 겹쳐 비교하는 것이 이 기능에서
+ * 나올 수 있는 최악의 허위 경보다.
+ */
+function matchConstellation(spotsA, spotsB, opt) {
+  const o = Object.assign({ tol: 2.5, maxShift: 80, topK: 12, minInliers: 3 }, opt || {});
+  const A = spotsA.slice(0, Math.max(o.topK, 4)), B = spotsB.slice(0, Math.max(o.topK, 4));
+  const px = (s) => (s.xc != null ? s.xc : s.x), py = (s) => (s.yc != null ? s.yc : s.y);
+  let best = { dx: 0, dy: 0, inliers: 0, rms: NaN };
+  for (const a of A) for (const b of B) {
+    const dx = px(b) - px(a), dy = py(b) - py(a);
+    if (Math.abs(dx) > o.maxShift || Math.abs(dy) > o.maxShift) continue;
+    let inl = 0, se = 0;
+    for (const p of spotsA) {
+      const tx = px(p) + dx, ty = py(p) + dy;
+      let bd = Infinity;
+      for (const q of spotsB) {
+        const ex = px(q) - tx, ey = py(q) - ty;
+        const d = ex * ex + ey * ey;
+        if (d < bd) bd = d;
+      }
+      if (bd <= o.tol * o.tol) { inl++; se += bd; }
+    }
+    if (inl > best.inliers) best = { dx, dy, inliers: inl, rms: inl ? Math.sqrt(se / inl) : NaN };
+  }
+  best.nA = spotsA.length; best.nB = spotsB.length;
+  best.ok = best.inliers >= o.minInliers;
+  best.minInliers = o.minInliers;
+  best.why = best.ok ? "" :
+    `같은 자리로 볼 근거가 부족합니다 — 겹치는 입자 ${best.inliers}개 (기준 ${o.minInliers}개 이상). 다른 시야이거나 이동량이 ±${o.maxShift} px 를 넘습니다.`;
+  return best;
+}
+
+/* ------------------------------ difference -------------------------------- */
+/**
+ * 차영상. 두 프레임(또는 두 상태 평균)의 차 + σ 단위 환산.
+ *
+ * σ 는 **같은 상태 프레임쌍의 차**에서만 경험적으로 잰다. 같은 상태 프레임이
+ * 두 장 미만이면 σ 를 만들 근거가 없으므로 null 을 돌려주고 σ 모드를 막는다.
+ * 여기서 광자전달 모형을 가정해 σ 를 지어내면, EM gain 초과잡음(이론상 √2 배,
+ * 실제 게인에 따라 다름) 때문에 유의성이 체계적으로 부풀려진다.
+ */
+function difference(imgA, imgB) {
+  const n = imgA.length, out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = imgA[i] - imgB[i];
+  const st = robustStats(out);
+  return { img: out, median: st.median, sigma: st.sigma };
+}
+/** 같은 상태 프레임쌍의 차로 화소 잡음 σ 를 잰다. 차의 σ 를 √2 로 나눈다. */
+function noiseFromPair(imgA, imgB) {
+  const d = difference(imgA, imgB);
+  return d.sigma / Math.SQRT2;
+}
+
+/* ------------------------------ display prep ------------------------------ */
+/** 표시용 0–255 환산. mode: lin | log | sqrt. lo/hi 는 원본 단위. */
+function scaleToBytes(img, lo, hi, mode) {
+  const n = img.length, out = new Uint8ClampedArray(n);
+  const span = hi - lo;
+  if (!(span > 0)) return out;
+  if (mode === "log") {
+    const d = Math.log1p(span);
+    for (let i = 0; i < n; i++) { const v = img[i] - lo; out[i] = v <= 0 ? 0 : 255 * Math.log1p(v) / d; }
+  } else if (mode === "sqrt") {
+    const d = Math.sqrt(span);
+    for (let i = 0; i < n; i++) { const v = img[i] - lo; out[i] = v <= 0 ? 0 : 255 * Math.sqrt(v) / d; }
+  } else {
+    for (let i = 0; i < n; i++) out[i] = 255 * (img[i] - lo) / span;
+  }
+  return out;
+}
+/** 발산 표시용: −m..+m 을 0..255 로, 0 이 128 에 오도록. */
+function scaleDiverging(img, m) {
+  const n = img.length, out = new Uint8ClampedArray(n);
+  if (!(m > 0)) return out;
+  for (let i = 0; i < n; i++) out[i] = 128 + 127 * Math.max(-1, Math.min(1, img[i] / m));
+  return out;
+}
+
+return {
+  quantile, median, robustStats, percentiles,
+  gaussBlur, accMax, accSum, scaleInPlace,
+  detectSpots, photometry, blankNoise,
+  commonMode, stateEvidence, contrast, modulationDepth, selectivity, suggestTarget,
+  matchConstellation, registerShift, transferRois, bandpass, difference, noiseFromPair,
+  scaleToBytes, scaleDiverging,
 };
 });
 
@@ -41700,6 +42826,14 @@ const App = {
     areaBasisUserSet: false,      // true면 사용자가 직접 고른 값 — 기본값 변경 시 덮어쓰지 않는다
     lensDbUrl: null,              // 공용 렌즈 목록 Firebase RTDB URL (빌드 내장값보다 우선)
     lambdaNm: 1064,               // 여기 파장 (회절 한계 대조용)
+    /* v3.13 — 빔 이미지를 찍을 때 광로에 끼워둔 dichroic 과, 그 빔이 대표하는
+     * 측정 채널. 서로 다른 dichroic 으로 찍은 빔은 **서로 다른 빔**이다(투과 파면·
+     * 위치·크기가 모두 다르다). 그런데 보정값은 한 벌만 저장되므로, 한 채널에서
+     * 얻은 A_peak 를 다른 채널 측정에 그대로 쓰는 사고가 조용히 일어난다
+     * (실제로 600 DMSP 빔 면적으로 NIR 문턱을 계산해 1.38배 틀린 적이 있다).
+     * 값만 저장하면 막을 수 없으므로 **출처를 기록하고 파일명과 대조**한다. */
+    dichroic: "",                 // 자유 입력 라벨 (예: "950 DMSP")
+    beamChannel: "",              // "" = 미기록 | Blue | NIR | UV | VIS
     enabled: false,
     // ---- INNO Ledger 연동 (설계 확정본 §4 항목4 · Phase 7) ----
     ledger: { projectId: "", apiKey: "", uid: "" },  // Firestore 접속 정보 (PC별 설정값, lensDbUrl와 동일 패턴)
@@ -41886,7 +43020,7 @@ function removeFile(id) {
 }
 
 /* ------------------------------ file list --------------------------------- */
-const TYPE_ORDER = { power_apd: 0, power_emccd: 1, emccd_readout: 2, ple: 3, scan2d: 4, histogram: 5, generic: 6 };
+const TYPE_ORDER = { power_apd: 0, power_emccd: 1, emccd_readout: 2, imaging: 3, ple: 4, scan2d: 5, histogram: 6, generic: 7 };
 /* ------------------------------ 파일 정렬 --------------------------------- */
 /** 자연(숫자 인식) 정렬 — "파일2" < "파일10". 사전식 정렬은 문자 단위로 비교해
  *  "1, 10, 11, 2, 21"처럼 늘어놓으므로 측정 시퀀스 파일에서 특히 혼란스럽다.
@@ -41982,6 +43116,7 @@ function renderAll() {
     case "histogram": return renderHistogram(rec);
     case "rise_time": return renderRiseTime(rec);
     case "darkening": return renderDarkening(rec);
+    case "imaging": return renderImaging(rec);
     default: return renderGeneric(rec);
   }
 }
@@ -42038,7 +43173,7 @@ function localFitTxt(a) {
       (<code>localFitHeadline: true</code> 로 열 수 있습니다).</div>`}</div>`;
 }
 function viewTabLabel(rec) {
-  return { power_apd: "분석 · Power scan", power_emccd: "분석 · Power scan", emccd_readout: "스펙트럼", ple: "PLE 맵", scan2d: "2D 맵", histogram: "히스토그램", rise_time: "분석 · Rise time", darkening: "분석 · Darkening", generic: "미리보기" }[rec.det.type] || "보기";
+  return { power_apd: "분석 · Power scan", power_emccd: "분석 · Power scan", emccd_readout: "스펙트럼", ple: "PLE 맵", scan2d: "2D 맵", histogram: "히스토그램", rise_time: "분석 · Rise time", darkening: "분석 · Darkening", imaging: "이미징 · 단일입자", generic: "미리보기" }[rec.det.type] || "보기";
 }
 
 /* --------------------------- beam calibration ----------------------------- */
@@ -42410,6 +43545,67 @@ function calibMetricsStale(c) {
   if (gam !== st.displayGamma) diffs.push(`감마 ${st.displayGamma} → ${gam}`);
   if (bs && st.basis && bs.src !== st.basis) diffs.push(`면적 기준 ${st.basis} → ${bs.src}`);
   return diffs.length ? { why: diffs.join(" · ") } : null;
+}
+/* ---------------- v3.13 · dichroic ↔ 측정 채널 가드 -----------------------
+ * 파워밀도는 A_peak 로 나눈 값이므로, 빔 면적이 틀리면 결과 전체가 그 비율만큼
+ * 조용히 틀린다. 그리고 그 "틀림"은 그래프 어디에도 나타나지 않는다 — 모양은
+ * 그대로이고 축 숫자만 바뀌기 때문이다. 유일하게 남는 방어선은 **보정의 출처를
+ * 기록해 두고 측정 파일과 대조하는 것**이다.
+ * 파일명에서 채널을 읽어내되, 확신할 수 없으면(후보 0개 또는 2개 이상) 판정을
+ * 보류한다 — 틀린 경고는 진짜 경고를 무시하게 만들기 때문에 침묵보다 나쁘다. */
+const CALIB_CHANNELS = [
+  { key: "Blue", label: "Blue", re: /(?:^|[_\-\s])blue(?:$|[_\-\s.])/i },
+  { key: "NIR", label: "NIR", re: /(?:^|[_\-\s])nir(?:$|[_\-\s.])/i },
+  { key: "UV", label: "UV", re: /(?:^|[_\-\s])uv(?:$|[_\-\s.])/i },
+  { key: "VIS", label: "VIS/Green", re: /(?:^|[_\-\s])(?:vis|green)(?:$|[_\-\s.])/i },
+];
+function channelLabel(key) {
+  const ch = CALIB_CHANNELS.find((q) => q.key === key);
+  return ch ? ch.label : (key || "");
+}
+/** 파일명에서 측정 채널을 판정. 확신할 수 없으면 null. */
+function detectFileChannel(name) {
+  if (!name) return null;
+  const hits = CALIB_CHANNELS.filter((ch) => ch.re.test(String(name)));
+  return hits.length === 1 ? hits[0].key : null;
+}
+/** 지금 적용 중인 빔 보정이 이 파일의 채널과 맞는가.
+ *  state: "match" | "mismatch" | "unset"(보정에 채널 미기록) | "unknown"(파일명 판정 불가) */
+function calibChannelCheck(rec) {
+  const beamCh = App.calib.beamChannel || null;
+  const fileCh = detectFileChannel(rec && rec.name);
+  let state;
+  if (!beamCh) state = "unset";
+  else if (!fileCh) state = "unknown";
+  else state = beamCh === fileCh ? "match" : "mismatch";
+  return { state, beamCh, fileCh, dichroic: App.calib.dichroic || "" };
+}
+/** 파워 스캔 화면 상단 배너. 경고할 것이 없으면 "" 를 돌려준다. */
+function calibChannelBannerHtml(rec) {
+  if (!densityActive()) return "";           // 파워밀도를 안 쓰면 면적이 결과에 안 들어간다
+  const q = calibChannelCheck(rec);
+  const src = q.dichroic ? `${esc(q.dichroic)}` : "(dichroic 미기록)";
+  if (q.state === "mismatch") {
+    return `<div class="panel" style="border:2px solid var(--bad,#c0392b);background:rgba(192,57,43,0.08);">
+      <b class="tag-Poor">채널 불일치 — 파워밀도를 그대로 쓰지 마세요</b>
+      <div class="small" style="margin-top:4px;">
+        지금 적용된 빔 보정은 <b>${esc(channelLabel(q.beamCh))}</b> 채널 빔 <span class="muted">[${src}]</span> 인데,
+        이 파일은 <b>${esc(channelLabel(q.fileCh))}</b> 채널로 보입니다
+        <span class="muted">(${esc(rec && rec.name ? rec.name : "")})</span>.<br>
+        dichroic 이 다르면 시료 위 빔 자체가 다르므로 A<sub>peak</sub> 도 다릅니다 —
+        보고값이 <b>면적비만큼</b> 틀립니다. 해당 채널로 찍은 빔 이미지로 다시 보정하세요.
+      </div></div>`;
+  }
+  if (q.state === "unset") {
+    const guess = q.fileCh ? ` 파일명은 <b>${esc(channelLabel(q.fileCh))}</b> 채널로 보입니다.` : "";
+    return `<div class="panel" style="border:1px solid var(--warn,#b7791f);background:rgba(183,121,31,0.07);">
+      <b class="tag-Low">빔 보정에 dichroic·채널 기록이 없습니다</b>
+      <div class="small muted" style="margin-top:4px;">
+        지금 파워밀도는 마지막으로 피팅한 빔 이미지의 면적을 씁니다 — 그 빔이 어느 채널 것인지 앱은 알 수 없습니다.${guess}
+        보정 모달에서 기록해 두면 다음부터 이 대조를 자동으로 합니다.
+      </div></div>`;
+  }
+  return "";
 }
 function densityFactor() {
   if (!App.calib.enabled) return NaN;
@@ -42978,7 +44174,17 @@ function openCalibModal() {
           <span>표시 감마 보정 γ</span>
           <input id="cb-gamma" type="number" step="0.05" min="1" max="4" style="width:96px"
                  placeholder="1 = 없음" value="${isFinite(c.displayGamma) && c.displayGamma > 1 ? c.displayGamma : ""}"></label>
+        <label class="ctl" title="이 빔 이미지를 찍을 때 광로에 끼워둔 dichroic. 라벨 그대로 적으면 됩니다 (예: 950 DMSP).">
+          <span>빔 촬영 dichroic</span>
+          <input id="cb-dichroic" type="text" style="width:130px" placeholder="예: 950 DMSP" value="${esc(c.dichroic || "")}"></label>
+        <label class="ctl" title="이 빔이 대표하는 측정 채널. 기록해 두면 파일명과 자동 대조해 다른 채널 데이터에 이 보정을 쓰는 것을 막습니다.">
+          <span>빔 채널</span>
+          <select id="cb-channel">
+            <option value="">미기록</option>
+            ${CALIB_CHANNELS.map((q) => `<option value="${q.key}"${c.beamChannel === q.key ? " selected" : ""}>${q.label}</option>`).join("")}
+          </select></label>
       </div>
+      <div id="cb-ch-note" class="small" style="margin-top:6px;"></div>
       <div id="cb-beam-status" class="small muted" style="margin-top:6px;">${c.metrics ? "" : "이미지를 열면 자동으로 피팅됩니다."}</div>
       <div id="cb-beam-chart" class="chart" style="height:340px;display:${c.beam ? "" : "none"};"></div>
       <div id="cb-beam-out" class="small mono" style="margin-top:6px;"></div></div>
@@ -43023,6 +44229,10 @@ function openCalibModal() {
     c.umPerPxMeasured = (umEl && umEl.value !== "" && Number(umEl.value) > 0) ? Number(umEl.value) : null;
     const gmEl = back.querySelector("#cb-gamma");
     c.displayGamma = (gmEl && gmEl.value !== "" && Number(gmEl.value) > 1) ? Number(gmEl.value) : 1;
+    const dicEl = back.querySelector("#cb-dichroic");
+    if (dicEl) c.dichroic = String(dicEl.value || "").trim();
+    const chEl = back.querySelector("#cb-channel");
+    if (chEl) c.beamChannel = chEl.value || "";
     c.densityMode = back.querySelector("#cb-mode").value;
     const basisSel = back.querySelector("#cb-basis");
     if (basisSel && basisSel.value !== c.areaBasis) { c.areaBasis = basisSel.value; c.areaBasisUserSet = true; }
@@ -43091,6 +44301,27 @@ function openCalibModal() {
     if (umEl2 && document.activeElement !== umEl2) umEl2.value = isFinite(c.umPerPxMeasured) ? c.umPerPxMeasured : "";
     const gmEl2 = back.querySelector("#cb-gamma");
     if (gmEl2 && document.activeElement !== gmEl2) gmEl2.value = (isFinite(c.displayGamma) && c.displayGamma > 1) ? c.displayGamma : "";
+    const dicEl2 = back.querySelector("#cb-dichroic");
+    if (dicEl2 && document.activeElement !== dicEl2) dicEl2.value = c.dichroic || "";
+    const chEl2 = back.querySelector("#cb-channel");
+    if (chEl2 && document.activeElement !== chEl2) chEl2.value = c.beamChannel || "";
+    const chNote = back.querySelector("#cb-ch-note");
+    if (chNote) {
+      const rec0 = App.files.find((f) => f.id === App.activeId);
+      const fileCh = detectFileChannel(rec0 && rec0.name);
+      if (!c.beamChannel) {
+        chNote.innerHTML = `<span class="muted">빔 채널을 기록하면 파일명과 자동 대조해 "다른 dichroic 으로 찍은 빔 면적" 사고를 막습니다.`
+          + (fileCh ? ` 지금 열려 있는 파일은 <b>${esc(channelLabel(fileCh))}</b> 채널로 보입니다.` : "") + `</span>`;
+      } else if (fileCh && fileCh !== c.beamChannel) {
+        chNote.innerHTML = `<span class="tag-Poor">불일치</span> 이 빔은 <b>${esc(channelLabel(c.beamChannel))}</b>`
+          + (c.dichroic ? ` <span class="muted">[${esc(c.dichroic)}]</span>` : "")
+          + ` 인데 열려 있는 파일은 <b>${esc(channelLabel(fileCh))}</b> 입니다 — 이 보정을 그 파일에 쓰면 파워밀도가 면적비만큼 틀립니다.`;
+      } else {
+        chNote.innerHTML = `<span class="muted">빔 채널 <b>${esc(channelLabel(c.beamChannel))}</b>`
+          + (c.dichroic ? ` · dichroic <b>${esc(c.dichroic)}</b>` : " · dichroic 미기록")
+          + (fileCh ? ` · 열려 있는 파일과 일치` : ` · 열려 있는 파일에서는 채널을 판정할 수 없음`) + `</span>`;
+      }
+    }
     if (c.beam) drawBeamChart();
   };
   const drawBeamChart = () => {
@@ -43166,7 +44397,7 @@ function openCalibModal() {
   const addBtnEl = back.querySelector("#cb-pair-add"), delBtnEl = back.querySelector("#cb-pair-del");
   if (addBtnEl) addBtnEl.addEventListener("click", () => setPairRows(c.pairRows + 1));
   if (delBtnEl) delBtnEl.addEventListener("click", () => setPairRows(c.pairRows - 1));
-  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda, #cb-umpx, #cb-gamma").forEach((el) => el.addEventListener("change", upd));
+  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda, #cb-umpx, #cb-gamma, #cb-dichroic, #cb-channel").forEach((el) => el.addEventListener("change", upd));
   fillObjSelect();
   back.querySelector("#cb-obj").addEventListener("change", () => {
     const i = Number(back.querySelector("#cb-obj").value);
@@ -43501,6 +44732,10 @@ function exportCalibSession() {
     // v3.11 — 되돌린 표시 감마. 1 이면 보정하지 않은 것. 이 값 없이는 아래 빔 수치를
     // 재현할 수 없으므로 반드시 함께 기록한다.
     displayGamma: (isFinite(Number(c.displayGamma)) && Number(c.displayGamma) > 1) ? Number(c.displayGamma) : 1,
+    // v3.13 — 이 빔이 어느 dichroic·채널의 것인지. 이것 없이는 면적값을 다른 채널에
+    // 잘못 쓰는 것을 나중에 확인할 방법이 없다.
+    dichroic: c.dichroic || null,
+    beamChannel: c.beamChannel || null,
     areaBasis: c.areaBasis, areaBasisUsed: (calibBasisSigma() || {}).src || null,
     densityMode: c.densityMode,
     beam: c.beam ? {
@@ -43616,6 +44851,7 @@ function renderPowerScan(rec) {
   const isEmccd = rec.det.type === "power_emccd";
   const s = App.settings;
   $("#view").innerHTML = `
+  ${calibChannelBannerHtml(rec)}
   <div class="panel">
     <div class="controls-row">
       <label class="ctl"><span>분석 branch</span>
@@ -45013,10 +46249,49 @@ function renderEmccdReadout(rec) {
     downloadText(rec.name.replace(/\.h5$/i, "") + "_spectrum.csv", rowsToCsv(rows), "text/csv");
   });
 }
+/** hardware/ 연결 현황. **이름을 광학계로 읽지 말라**는 경고가 본체다. */
+function imgHardwareHtml(d) {
+  const h = d.hardware;
+  if (!h || !h.rows.length) return "";
+  const cam = d.camera;
+  const badge = (r) => r.connected === true ? '<span class="tag-High">연결됨</span>'
+    : r.connected === false ? '<span class="muted">연결 안 됨</span>' : '<span class="muted">기록 없음</span>';
+  const rows = h.rows.map((r) => `<tr${cam && r.name === cam.name ? ' style="background:rgba(57,135,229,.10)"' : ""}>
+    <td class="mono">${esc(r.name)}${cam && r.name === cam.name ? " <b>← 이 측정의 카메라</b>" : ""}</td>
+    <td>${badge(r)}</td><td class="mono">${r.nAttrs}</td><td class="mono muted">${r.port ? esc(r.port) : ""}</td></tr>`).join("");
+  const rej = cam && cam.rejected && cam.rejected.length
+    ? `<div class="s muted">카메라 후보가 ${cam.nCandidates}개였고 연결된 것을 택했습니다 —
+        제외: ${cam.rejected.map((x) => `<span class="mono">${esc(x.name)}</span>(${x.connected ? "연결됨" : "미연결"})`).join(", ")}.</div>`
+    : "";
+  return `<details style="margin-top:8px;"><summary class="small">하드웨어 연결 현황 (${h.nConnected} 연결 · ${h.nDisconnected} 미연결)</summary>
+    <div class="s" style="margin-top:6px;"><b>이름만 보고 이 측정의 광학계라고 읽지 마십시오.</b>
+      ScopeFoundry 는 앱에 등록된 하드웨어를 <b>전부</b> h5 에 적습니다 — 이 측정에 쓰이지 않은 장비,
+      다른 방의 구성, 실물이 없는 항목까지 설정이 그대로 남습니다.
+      <b>연결 안 된 항목의 설정값은 이 측정에 대해 아무것도 말해 주지 않습니다.</b></div>
+    <table class="res" style="margin-top:6px;"><thead><tr><th>hardware</th><th>연결</th><th>속성 수</th><th>port</th></tr></thead>
+      <tbody>${rows}</tbody></table>${rej}</details>`;
+}
 function attrsHtml(attrs) {
   const keys = Object.keys(attrs || {});
   if (!keys.length) return `<span class="muted">속성 없음</span>`;
-  return keys.sort().map((k) => `${esc(k)} = ${esc(JSON.stringify(attrs[k]))}`).join("<br>");
+  return keys.sort().map((k) => `${esc(k)} = ${esc(attrValueText(attrs[k]))}`).join("<br>");
+}
+/** h5wasm 는 HDF5 int64 속성을 **BigInt** 로 돌려준다. JSON.stringify 는 BigInt 에서
+ *  TypeError 를 던지므로(ScopeFoundry 의 num_cycle 등이 int64 다) 직접 문자열화한다.
+ *  긴 배열은 앞부분만 보이고 길이를 밝힌다 — 속성 상자가 한 줄로 화면을 밀지 않도록. */
+function attrValueText(v) {
+  if (typeof v === "bigint") return String(v);
+  if (v === null || v === undefined) return String(v);
+  if (ArrayBuffer.isView(v)) v = Array.from(v);
+  if (Array.isArray(v)) {
+    const head = v.slice(0, 12).map(attrValueText).join(", ");
+    return v.length > 12 ? `[${head}, … ] (${v.length}개)` : `[${head}]`;
+  }
+  if (typeof v === "object") {
+    try { return JSON.stringify(v, (kk, vv) => (typeof vv === "bigint" ? String(vv) : vv)); }
+    catch (e) { return String(v); }
+  }
+  return typeof v === "string" ? `"${v}"` : String(v);
 }
 
 /* ------------------------------ PLE view ---------------------------------- */
@@ -45788,7 +47063,7 @@ function detectionDiagnosticHtml(rec) {
   const leaf = (x) => x ? esc(x.path.split("/").pop()) + ` <span class="t-shape">[${x.shape.join("×")}]</span>` : "–";
   const label = { power_apd: "Power scan · APD", power_emccd: "Power scan · EMCCD", ple: "PLE", scan2d: "2D 스캔",
     histogram: "TCSPC", rise_time: "Rise time", darkening: "Photodarkening", emccd_readout: "EMCCD 스펙트럼",
-    generic: "인식 실패 (범용 미리보기)" }[d.type] || d.type;
+    imaging: "카메라 이미지 (widefield)", generic: "인식 실패 (범용 미리보기)" }[d.type] || d.type;
   const bits = [`<b>측정 유형</b>: ${esc(label)} <span class="muted">(${d.type})</span>`];
   if (d.ps) {
     bits.push(`<b>판정 근거</b>: 구조 탐지 — 그룹 <span class="mono">${esc(d.ps.group)}</span>` +
@@ -45796,6 +47071,14 @@ function detectionDiagnosticHtml(rec) {
     bits.push(`&nbsp;&nbsp;power 배열: <span class="mono">${leaf(d.ps.powerRaw || d.ps.power1)}</span>` +
       ` · 신호 배열: <span class="mono">${leaf(d.ps.sigRaw || d.ps.sig1)}</span>` +
       (d.ps.wl ? ` · 파장축: <span class="mono">${leaf(d.ps.wl)}</span>` : ""));
+  } else if (d.type === "imaging") {
+    const im = d.imaging;
+    bits.push(`<b>판정 근거</b>: 구조 탐지 — <span class="mono">${esc(im.path)}</span> 가 ` +
+      (im.kind === "stack" ? `3D 스택 [${im.n}×${im.ny}×${im.nx}]` : `2D 프레임 [${im.ny}×${im.nx}]`) +
+      ` 이고 두 공간축이 모두 32 px 이상입니다`);
+    bits.push(`&nbsp;&nbsp;<span class="muted">측정 이름(<span class="mono">${esc(im.group.split("/").pop())}</span>)이나 데이터셋 이름은 판정에 쓰지 않았습니다 —
+      같은 이름(<span class="mono">spectrum</span>)이 셋업에 따라 1D 스펙트럼이기도 하고 2D 이미지이기도 하기 때문입니다.</span>`);
+    if (im.timePath) bits.push(`&nbsp;&nbsp;시간축: <span class="mono">${esc(im.timePath)}</span>`);
   } else if (d.type === "power_apd" || d.type === "power_emccd") {
     bits.push(`<b>판정 근거</b>: 표준 경로 <span class="mono">measurement/power_scan/…</span> 정확 일치`);
   } else if (d.type === "generic") {
@@ -46037,6 +47320,1064 @@ function boot() {
   ensureH5().then(() => toast("INNO Prism 준비 완료 — .h5 파일을 열어주세요", 2000)).catch((e) => toast("HDF5 엔진 초기화 실패: " + e.message, 6000));
 }
 document.addEventListener("DOMContentLoaded", boot);
+
+/* ========================= widefield imaging viewer ========================= */
+/* v3.14 — 카메라 프레임(단일/스택) 뷰어.
+ *
+ * 이 뷰어가 답하려는 질문은 "이미지가 예쁘게 보이는가"가 아니라
+ *   ① 어느 입자가, ② 언제, ③ 전체와 함께 변했는가 아니면 혼자 변했는가
+ * 이다. 그래서 화면 구성도 그 순서를 따른다: 이미지 → ROI → 트레이스 →
+ * 공통모드 분리 → 상태 배정 → 대비 → 차영상 → 파일 간 비교.
+ *
+ * 물리 해석(활성화냐 억제냐)은 수치에 박지 않는다. 지표는 부호중립으로 계산하고,
+ * 이름표만 사용자가 고른 프리셋으로 바꾼다. 같은 측정 방식이 두 물리에 다 쓰이므로
+ * 뷰어를 둘로 나누지 않고 하나로 두되, 방향을 단정하지 않는 쪽을 기본값으로 둔다.
+ */
+
+/* ------------------------------ colormaps --------------------------------- */
+const IMG_CMAPS = {
+  Grey: [[0, 0, 0], [255, 255, 255]],
+  Viridis: [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]],
+  Turbo: [[48, 18, 59], [50, 166, 236], [122, 250, 137], [250, 186, 51], [122, 4, 3]],
+  Hot: [[0, 0, 0], [180, 0, 0], [255, 140, 0], [255, 255, 160], [255, 255, 255]],
+  Ice: [[3, 5, 26], [18, 58, 122], [40, 140, 190], [140, 210, 230], [255, 255, 255]],
+};
+const IMG_DIVERGING = [[33, 102, 172], [103, 169, 207], [247, 247, 247], [239, 138, 98], [178, 24, 43]];
+function buildLut(stops) {
+  const lut = new Uint8Array(256 * 3);
+  const n = stops.length - 1;
+  for (let i = 0; i < 256; i++) {
+    const t = (i / 255) * n, k = Math.min(n - 1, Math.floor(t)), f = t - k;
+    for (let c = 0; c < 3; c++) lut[i * 3 + c] = Math.round(stops[k][c] + f * (stops[k + 1][c] - stops[k][c]));
+  }
+  return lut;
+}
+const LUT_CACHE = {};
+function lutFor(name) { return LUT_CACHE[name] || (LUT_CACHE[name] = buildLut(name === "__div" ? IMG_DIVERGING : (IMG_CMAPS[name] || IMG_CMAPS.Grey))); }
+
+/* ------------------------------ frame cache -------------------------------- */
+/** 프레임은 요청한 것만 읽고 최대 MAXCACHE 장만 들고 있는다.
+ *  1024² float32 = 4 MB/장이므로 스택 전체 보관은 프레임 수가 조금만 늘어도 위험하다. */
+const IMG_MAXCACHE = 12;
+function imgState(rec) {
+  if (rec.cache.imgState) return rec.cache.imgState;
+  const d = PrismH5.extractImaging(rec.h5, rec.det);
+  const st = {
+    d, frames: new Map(), order: [],
+    // 표시 기본값 — EM gain 프레임은 증폭된 단일광자 스파이크가 화면을 뒤덮어서
+    // 원본 그대로 두면 입자가 눈에 안 들어온다. **표시에만** 평활을 걸고(수치에는
+    // 절대 쓰지 않는다) 하한을 중앙값 근처로 올린다.
+    frame: 0, cmap: "Grey", scale: "sqrt", pLo: 50, pHi: 99.95, dispSmooth: 1.0,
+    showRoi: true, source: "frame",
+    rois: [], detInfo: null, basis: d.n > 1 ? "mean" : "frame",
+    detOpt: { smooth: 1.5, k: 8, shapeMin: 4.0, minSep: 6, maxSpots: 40, apR: 3 },
+    photOpt: { r: 3, rin: 5, rout: 9 },
+    traces: null, blank: null, cm: null, evidence: null,
+    assign: null, assignFrom: null, labels: "neutral",
+    traceMode: "raw", diffA: 0, diffB: d.n > 1 ? 1 : 0, diffSigma: false,
+    target: null, targetAuto: false, quietMax: 2.0,
+    view: null, compare: null,
+  };
+  rec.cache.imgState = st;
+  return st;
+}
+function imgFrame(rec, i) {
+  const st = imgState(rec);
+  const k = Math.max(0, Math.min(st.d.n - 1, i | 0));
+  if (st.frames.has(k)) return st.frames.get(k);
+  const f = PrismH5.readImageFrame(rec.h5, rec.det.imaging, k);
+  if (!f) return null;
+  st.frames.set(k, f); st.order.push(k);
+  while (st.order.length > IMG_MAXCACHE) { const old = st.order.shift(); if (old !== k) st.frames.delete(old); }
+  return f;
+}
+/** mean / max 투영 — 프레임을 하나씩 읽어 누적한다 (전체를 동시에 들지 않는다). */
+function imgProjection(rec, kind) {
+  const st = imgState(rec);
+  const key = "proj_" + kind;
+  if (st[key]) return st[key];
+  let acc = null;
+  for (let i = 0; i < st.d.n; i++) {
+    const f = imgFrame(rec, i);
+    if (!f) continue;
+    acc = kind === "max" ? PrismImg.accMax(acc, f) : PrismImg.accSum(acc, f);
+  }
+  if (acc && kind === "mean") PrismImg.scaleInPlace(acc, 1 / st.d.n);
+  st[key] = acc;
+  return acc;
+}
+/** 현재 화면에 그릴 이미지 배열 */
+function imgCurrent(rec) {
+  const st = imgState(rec);
+  if (st.source === "mean") return imgProjection(rec, "mean");
+  if (st.source === "max") return imgProjection(rec, "max");
+  return imgFrame(rec, st.frame);
+}
+function imgBasisImage(rec) {
+  const st = imgState(rec);
+  if (st.basis === "mean") return imgProjection(rec, "mean");
+  if (st.basis === "max") return imgProjection(rec, "max");
+  return imgFrame(rec, st.frame);
+}
+
+/* ------------------------------- main view --------------------------------- */
+function renderImaging(rec) {
+  const st = imgState(rec);
+  const d = st.d, stack = d.n > 1;
+  const cam = d.camera;
+  const camBits = cam ? [
+    `<b>${esc(cam.name)}</b>${cam.connected === false ? ' <span class="tag-Low">미연결</span>' : ""}`,
+    cam.exposure != null ? `노출 ${fmt(cam.exposure, 3)} s` : null,
+    cam.emGain != null ? `EM gain ${cam.emGain}` : null,
+    cam.temperature != null ? `${cam.temperature} °C${cam.tempStatus ? " (" + esc(cam.tempStatus) + ")" : ""}` : null,
+    cam.readoutMode ? `readout ${esc(cam.readoutMode)}` : null,
+    cam.hbin && cam.vbin ? `binning ${cam.hbin}×${cam.vbin}` : null,
+  ].filter(Boolean).join(" · ") : "";
+
+  const wlNote = d.wl && d.wl.isIndex
+    ? `<div class="s muted">이 파일의 <span class="mono">${esc(d.wl.path.split("/").pop())}</span> 는 0,1,2,… 즉 <b>픽셀 번호</b>이지 파장이 아닙니다
+        (<span class="mono">wl_calib = pixels</span>). 분광 보정이 걸리지 않은 상태이므로 가로축을 파장으로 읽지 마십시오.</div>`
+    : "";
+  const nameNote = /spectrum$/.test(d.path) && d.kind === "frame"
+    ? `<div class="s muted">데이터셋 이름은 <span class="mono">spectrum</span> 이지만 shape 가 ${d.ny}×${d.nx} 인 <b>2D 이미지</b>입니다
+        (readout_mode = Image). 이름이 아니라 shape 로 판정했습니다.</div>`
+    : "";
+
+  $("#view").innerHTML = `
+  <div class="panel"><h3>이미지 <span class="muted small">${esc(d.path)} · ${d.ny}×${d.nx}${stack ? ` · ${d.n} 프레임` : ""}</span></h3>
+    <div class="flex small" style="margin-bottom:6px;flex-wrap:wrap;">
+      <label class="ctl"><span>표시</span><select id="im-src">
+        <option value="frame">프레임</option>
+        ${stack ? '<option value="mean">mean projection</option><option value="max">max projection</option>' : ""}
+      </select></label>
+      <label class="ctl"><span>컬러맵</span><select id="im-cmap">${Object.keys(IMG_CMAPS).map((k) => `<option${k === st.cmap ? " selected" : ""}>${k}</option>`).join("")}</select></label>
+      <label class="ctl"><span>밝기 스케일</span><select id="im-scale">
+        <option value="lin">linear</option><option value="sqrt" selected>sqrt</option><option value="log">log</option></select></label>
+      <label class="ctl"><span>하한 %</span><input id="im-plo" type="number" step="0.1" value="${st.pLo}" style="width:72px"></label>
+      <label class="ctl"><span>상한 %</span><input id="im-phi" type="number" step="0.01" value="${st.pHi}" style="width:78px"></label>
+      <label class="ctl"><span>표시 평활 σ</span><select id="im-smooth">
+        <option value="0">없음 (원본 화소)</option>
+        <option value="1" selected>1.0</option><option value="1.5">1.5</option><option value="2">2.0</option></select></label>
+      <label class="ctl"><span>ROI 표시</span><select id="im-roi"><option value="1">표시</option><option value="0">숨김</option></select></label>
+      <span class="right flex">
+        <button id="im-reset" class="small">줌 초기화</button>
+        <button id="im-png" class="small">PNG</button>
+      </span>
+    </div>
+    ${stack ? `<div class="flex small" style="margin-bottom:6px;align-items:center;gap:8px;">
+      <span style="min-width:64px">프레임</span>
+      <input id="im-frame" type="range" min="0" max="${d.n - 1}" value="${st.frame}" style="flex:1">
+      <span id="im-frame-lab" class="mono" style="min-width:190px"></span>
+      <button id="im-play" class="small">▶ 재생</button>
+    </div>` : ""}
+    <div id="im-wrap" style="position:relative;background:#0d0d0c;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+      <canvas id="im-canvas" style="display:block;width:100%;cursor:crosshair;"></canvas>
+      <svg id="im-ovl" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;"></svg>
+    </div>
+    <div class="flex small" style="margin-top:6px;">
+      <span id="im-readout" class="mono muted">커서 = 좌표·원본 화소값 · 휠 = 확대 · 드래그 = 이동 · 더블클릭 = 초기화 · Shift+클릭 = ROI 추가/삭제</span>
+      <span id="im-stats" class="mono right"></span>
+    </div>
+    ${nameNote}${wlNote}
+  </div>
+
+  <div class="panel"><h3>입자(ROI) 검출</h3>
+    <div class="flex small" style="margin-bottom:6px;flex-wrap:wrap;">
+      ${stack ? `<label class="ctl"><span>검출 기준</span><select id="det-basis">
+        <option value="mean"${st.basis === "mean" ? " selected" : ""}>mean projection</option>
+        <option value="max"${st.basis === "max" ? " selected" : ""}>max projection</option>
+        <option value="frame"${st.basis === "frame" ? " selected" : ""}>현재 프레임</option></select></label>` : ""}
+      <label class="ctl"><span>평활 σ (px)</span><input id="det-smooth" type="number" step="0.1" value="${st.detOpt.smooth}" style="width:70px"></label>
+      <label class="ctl"><span>문턱 k·σ</span><input id="det-k" type="number" step="0.5" value="${st.detOpt.k}" style="width:70px"></label>
+      <label class="ctl"><span>모양 문턱</span><input id="det-shape" type="number" step="0.5" value="${st.detOpt.shapeMin}" style="width:70px"></label>
+      <label class="ctl"><span>최소 간격 (px)</span><input id="det-sep" type="number" step="1" value="${st.detOpt.minSep}" style="width:80px"></label>
+      <label class="ctl"><span>최대 개수</span><input id="det-max" type="number" step="5" value="${st.detOpt.maxSpots}" style="width:80px"></label>
+      <label class="ctl"><span>조리개 r (px)</span><input id="det-apr" type="number" step="1" value="${st.photOpt.r}" style="width:80px"></label>
+      <span class="right flex"><button id="det-run" class="small">검출</button><button id="det-clear" class="small">ROI 전체 지우기</button></span>
+    </div>
+    <div id="det-note" class="small"></div>
+    <div id="det-table" style="margin-top:6px;"></div>
+  </div>
+
+  ${stack ? `
+  <div class="panel"><h3>ROI 트레이스</h3>
+    <div class="flex small" style="margin-bottom:6px;">
+      <label class="ctl"><span>표시</span><select id="tr-mode">
+        <option value="raw">원본 flux</option>
+        <option value="norm">ROI 기준 정규화 (S/ref)</option>
+        <option value="resid">공통모드 제거 후 잔차 (S/E)</option></select></label>
+      <label class="ctl"><span>가로축</span><select id="tr-x"><option value="time">시간 (s)</option><option value="index">프레임 번호</option></select></label>
+      <span class="right"><button id="tr-csv" class="small">CSV</button></span>
+    </div>
+    <div id="chart-tr" class="chart chart-mid"></div>
+    <div id="tr-note" class="small muted"></div>
+  </div>
+
+  <div class="panel"><h3>공통모드 분리 <span class="muted small">전체가 함께 변했는가 · 한 입자만 변했는가</span></h3>
+    <div id="cm-body"></div>
+  </div>
+
+  <div class="panel"><h3>변조 깊이 · 공간 선택성 <span class="muted small">표적만 반응했는가</span></h3>
+    <div id="sel-body"></div>
+  </div>
+
+  <div class="panel"><h3>상태 배정 <span class="muted small">어느 프레임이 어떤 조작 뒤인가</span></h3>
+    <div id="state-body"></div>
+  </div>
+
+  <div class="panel"><h3>두 상태 대비</h3>
+    <div id="contrast-body"></div>
+  </div>
+
+  <div class="panel"><h3>차영상</h3>
+    <div class="flex small" style="margin-bottom:6px;flex-wrap:wrap;">
+      <label class="ctl"><span>기준 A</span><select id="df-a"></select></label>
+      <label class="ctl"><span>빼는 값 B</span><select id="df-b"></select></label>
+      <label class="ctl"><span>단위</span><select id="df-unit">
+        <option value="counts">counts</option><option value="sigma">σ (같은 상태 프레임쌍에서 실측)</option></select></label>
+      <span class="right"><button id="df-run" class="small">차영상 계산</button></span>
+    </div>
+    <div id="df-note" class="small muted"></div>
+    <div id="df-wrap" style="position:relative;background:#0d0d0c;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-top:6px;display:none;">
+      <canvas id="df-canvas" style="display:block;width:100%;"></canvas>
+    </div>
+  </div>` : ""}
+
+  <div class="panel"><h3>다른 파일과 비교 <span class="muted small">같은 자리 반복 촬영 — 정합 후 ROI 전이</span></h3>
+    <div id="cmp-body"></div>
+  </div>
+
+  <div class="panel"><h3>취득 설정</h3>
+    ${camBits ? `<div class="s" style="margin-bottom:6px;">${camBits}</div>` : ""}
+    <div class="attr-box mono small">${attrsHtml(d.settings)}</div>
+    ${imgHardwareHtml(d)}
+  </div>`;
+
+  imgBindImage(rec);
+  imgBindDetect(rec);
+  if (stack) { imgBindTrace(rec); imgBindDiff(rec); }
+  imgFillCompare(rec);
+  imgRedraw(rec);
+  if (!st.rois.length) imgRunDetect(rec, true);
+  else imgRefreshAnalysis(rec);
+}
+
+/* ------------------------------ image canvas ------------------------------- */
+function imgRedraw(rec) {
+  const st = imgState(rec), d = st.d;
+  const img = imgCurrent(rec);
+  const cv = $("#im-canvas");
+  if (!img || !cv) return;
+  // **표시 전용** 평활. 측광·검출·차영상은 전부 원본 화소로 계산한다 —
+  // 여기서 만든 배열은 화면 밖으로 나가지 않는다.
+  let shown = img;
+  if (st.dispSmooth > 0) {
+    const key = `${st.source}:${st.frame}:${st.dispSmooth}`;
+    if (st._smKey !== key) { st._smImg = PrismImg.gaussBlur(img, d.nx, d.ny, st.dispSmooth); st._smKey = key; }
+    shown = st._smImg;
+  }
+  const [lo, hi] = PrismImg.percentiles(shown, [st.pLo / 100, st.pHi / 100]);
+  const bytes = PrismImg.scaleToBytes(shown, lo, hi === lo ? lo + 1 : hi, st.scale);
+  const lut = lutFor(st.cmap);
+  let off = st._off;
+  if (!off || off.width !== d.nx || off.height !== d.ny) {
+    off = st._off = document.createElement("canvas");
+    off.width = d.nx; off.height = d.ny;
+  }
+  const octx = off.getContext("2d");
+  const idata = octx.createImageData(d.nx, d.ny);
+  const px = idata.data;
+  for (let i = 0, j = 0; i < bytes.length; i++, j += 4) {
+    const b = bytes[i] * 3;
+    px[j] = lut[b]; px[j + 1] = lut[b + 1]; px[j + 2] = lut[b + 2]; px[j + 3] = 255;
+  }
+  octx.putImageData(idata, 0, 0);
+  // view rect (zoom/pan)
+  if (!st.view) st.view = { x: 0, y: 0, w: d.nx, h: d.ny };
+  const v = st.view;
+  const wrapW = $("#im-wrap").clientWidth || 700;
+  const dispH = Math.round(wrapW * (v.h / v.w));
+  cv.width = wrapW; cv.height = dispH;
+  const ctx = cv.getContext("2d");
+  ctx.imageSmoothingEnabled = v.w > wrapW;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(off, v.x, v.y, v.w, v.h, 0, 0, cv.width, cv.height);
+  // stats + frame label
+  const stt = PrismImg.robustStats(img);
+  $("#im-stats").textContent = `원본 배경 ${fmt(stt.median, 5)} · σ(MAD) ${fmt(stt.sigma, 3)}` +
+    ` · 표시범위 ${fmt(lo, 5)}–${fmt(hi, 5)}${st.dispSmooth > 0 ? ` (평활 σ=${st.dispSmooth} 적용된 화면 기준)` : ""}`;
+  const fl = $("#im-frame-lab");
+  if (fl) {
+    const t = d.time && isFinite(d.time[st.frame]) ? `t = ${fmt(d.time[st.frame], 4)} s` : "시간 기록 없음";
+    fl.textContent = st.source === "frame" ? `#${st.frame} · ${t}` : `(${st.source} projection 표시 중)`;
+  }
+  imgDrawOverlay(rec);
+}
+function imgDrawOverlay(rec) {
+  const st = imgState(rec), d = st.d, svg = $("#im-ovl");
+  if (!svg) return;
+  if (!st.showRoi || !st.rois.length) { svg.innerHTML = ""; return; }
+  const v = st.view, cv = $("#im-canvas");
+  const sx = cv.width / v.w, sy = cv.height / v.h;
+  svg.setAttribute("viewBox", `0 0 ${cv.width} ${cv.height}`);
+  const verd = st.cm && st.cm.ok ? st.cm.flags : null;
+  const color = (i) => {
+    if (!verd) return "#8fd0ff";
+    const f = verd[i];
+    if (!f) return "#8fd0ff";
+    return f.verdict === "independent" ? "#ffb020" : (f.verdict === "unidentified" ? "#77776f" : "#8fd0ff");
+  };
+  const r = st.photOpt.r * Math.max(sx, 0.01);
+  svg.innerHTML = st.rois.map((p, i) => {
+    const cx = ((p.xc != null ? p.xc : p.x) - v.x) * sx, cy = ((p.yc != null ? p.yc : p.y) - v.y) * sy;
+    if (cx < -20 || cy < -20 || cx > cv.width + 20 || cy > cv.height + 20) return "";
+    const c = color(i);
+    const rr = Math.max(4, r);
+    // 표적 ROI 는 이중 원으로 표시 — 선택성 표의 기준점이 어디인지 그림에서 바로 보이게
+    const tgt = i === st.target
+      ? `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${(rr + 4).toFixed(1)}" fill="none" stroke="#ffb020" stroke-width="1.1" stroke-dasharray="3 2"/>` : "";
+    return tgt + `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${rr.toFixed(1)}" fill="none" stroke="${c}" stroke-width="1.3"/>` +
+      `<text x="${(cx + rr + 5).toFixed(1)}" y="${(cy - 3).toFixed(1)}" fill="${c}" font-size="10" font-family="monospace">${i}</text>`;
+  }).join("");
+}
+function imgBindImage(rec) {
+  const st = imgState(rec), d = st.d;
+  const set = (id, ev, fn) => { const e = $(id); if (e) e.addEventListener(ev, fn); };
+  set("#im-src", "change", (e) => { st.source = e.target.value; imgRedraw(rec); });
+  set("#im-cmap", "change", (e) => { st.cmap = e.target.value; imgRedraw(rec); });
+  set("#im-scale", "change", (e) => { st.scale = e.target.value; imgRedraw(rec); });
+  set("#im-plo", "change", (e) => { st.pLo = Number(e.target.value); imgRedraw(rec); });
+  set("#im-phi", "change", (e) => { st.pHi = Number(e.target.value); imgRedraw(rec); });
+  set("#im-smooth", "change", (e) => { st.dispSmooth = Number(e.target.value); st._smKey = null; imgRedraw(rec); });
+  set("#im-roi", "change", (e) => { st.showRoi = e.target.value === "1"; imgDrawOverlay(rec); });
+  set("#im-reset", "click", () => { st.view = { x: 0, y: 0, w: d.nx, h: d.ny }; imgRedraw(rec); });
+  set("#im-frame", "input", (e) => {
+    st.frame = Number(e.target.value);
+    if (st.source !== "frame") { st.source = "frame"; $("#im-src").value = "frame"; }
+    imgRedraw(rec);
+  });
+  set("#im-png", "click", () => {
+    const cv = $("#im-canvas");
+    cv.toBlob((b) => downloadBlob(rec.name.replace(/\.h5$/i, "") + `_${st.source === "frame" ? "f" + st.frame : st.source}.png`, b));
+  });
+  set("#im-play", "click", () => {
+    if (st._timer) { clearInterval(st._timer); st._timer = null; $("#im-play").textContent = "▶ 재생"; return; }
+    $("#im-play").textContent = "■ 정지";
+    st._timer = setInterval(() => {
+      const el = $("#im-frame");
+      if (!el) { clearInterval(st._timer); st._timer = null; return; }
+      st.frame = (st.frame + 1) % d.n; st.source = "frame";
+      el.value = st.frame; $("#im-src").value = "frame";
+      imgRedraw(rec);
+    }, 600);
+  });
+  const cv = $("#im-canvas");
+  if (!cv) return;
+  const toImg = (ev) => {
+    const r = cv.getBoundingClientRect(), v = st.view;
+    return { x: v.x + (ev.clientX - r.left) / r.width * v.w, y: v.y + (ev.clientY - r.top) / r.height * v.h };
+  };
+  cv.addEventListener("mousemove", (ev) => {
+    if (st._drag) {
+      const r = cv.getBoundingClientRect(), v = st.view;
+      const dx = (ev.clientX - st._drag.cx) / r.width * v.w, dy = (ev.clientY - st._drag.cy) / r.height * v.h;
+      v.x = Math.max(0, Math.min(d.nx - v.w, st._drag.vx - dx));
+      v.y = Math.max(0, Math.min(d.ny - v.h, st._drag.vy - dy));
+      imgRedraw(rec);
+      return;
+    }
+    const p = toImg(ev);
+    const img = imgCurrent(rec);
+    const ix = Math.floor(p.x), iy = Math.floor(p.y);
+    if (img && ix >= 0 && iy >= 0 && ix < d.nx && iy < d.ny)
+      $("#im-readout").textContent = `x=${ix} y=${iy} · 원본 화소값 ${fmt(img[iy * d.nx + ix], 6)}`;
+  });
+  cv.addEventListener("mousedown", (ev) => {
+    if (ev.shiftKey) { imgToggleRoi(rec, toImg(ev)); return; }
+    st._drag = { cx: ev.clientX, cy: ev.clientY, vx: st.view.x, vy: st.view.y };
+    cv.style.cursor = "grabbing";
+  });
+  window.addEventListener("mouseup", () => { if (st._drag) { st._drag = null; cv.style.cursor = "crosshair"; } });
+  cv.addEventListener("dblclick", () => { st.view = { x: 0, y: 0, w: d.nx, h: d.ny }; imgRedraw(rec); });
+  cv.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const p = toImg(ev), v = st.view;
+    const f = ev.deltaY < 0 ? 0.8 : 1.25;
+    const nw = Math.max(24, Math.min(d.nx, v.w * f)), nh = Math.max(24, Math.min(d.ny, v.h * f));
+    v.x = Math.max(0, Math.min(d.nx - nw, p.x - (p.x - v.x) * (nw / v.w)));
+    v.y = Math.max(0, Math.min(d.ny - nh, p.y - (p.y - v.y) * (nh / v.h)));
+    v.w = nw; v.h = nh;
+    imgRedraw(rec);
+  }, { passive: false });
+}
+function imgToggleRoi(rec, p) {
+  const st = imgState(rec);
+  const sep = st.detOpt.minSep;
+  const i = st.rois.findIndex((q) => Math.hypot((q.xc != null ? q.xc : q.x) - p.x, (q.yc != null ? q.yc : q.y) - p.y) < sep);
+  if (i >= 0) st.rois.splice(i, 1);
+  else st.rois.push({ x: Math.round(p.x), y: Math.round(p.y), xc: p.x, yc: p.y, manual: true, shape: NaN, flux: NaN });
+  imgInvalidate(rec);
+  imgRefreshAnalysis(rec);
+  imgDrawOverlay(rec);
+}
+function imgInvalidate(rec) {
+  const st = imgState(rec);
+  st.traces = null; st.blank = null; st.cm = null; st.evidence = null; st.compare = null;
+  if (st.targetAuto) st.target = null;   // 자동 제안이었다면 새 ROI 집합에서 다시 제안
+}
+
+/* ------------------------------ detection ---------------------------------- */
+function imgBindDetect(rec) {
+  const st = imgState(rec);
+  const set = (id, fn) => { const e = $(id); if (e) e.addEventListener("change", fn); };
+  set("#det-basis", (e) => { st.basis = e.target.value; });
+  set("#det-smooth", (e) => { st.detOpt.smooth = Number(e.target.value); });
+  set("#det-k", (e) => { st.detOpt.k = Number(e.target.value); });
+  set("#det-shape", (e) => { st.detOpt.shapeMin = Number(e.target.value); });
+  set("#det-sep", (e) => { st.detOpt.minSep = Number(e.target.value); });
+  set("#det-max", (e) => { st.detOpt.maxSpots = Number(e.target.value); });
+  set("#det-apr", (e) => { st.photOpt.r = Number(e.target.value); st.photOpt.rin = st.photOpt.r + 2; st.photOpt.rout = st.photOpt.r + 6; });
+  $("#det-run").addEventListener("click", () => imgRunDetect(rec, false));
+  $("#det-clear").addEventListener("click", () => {
+    st.rois = []; st.detInfo = null; imgInvalidate(rec);
+    imgRefreshAnalysis(rec); imgDrawOverlay(rec);
+  });
+}
+function imgRunDetect(rec, quiet) {
+  const st = imgState(rec), d = st.d;
+  const base = imgBasisImage(rec);
+  if (!base) { toast("검출 기준 이미지를 읽지 못했습니다"); return; }
+  const r = PrismImg.detectSpots(base, d.nx, d.ny, st.detOpt);
+  st.rois = r.spots.map((s) => Object.assign({}, s));
+  st.detInfo = r;
+  imgInvalidate(rec);
+  imgRefreshAnalysis(rec);
+  imgDrawOverlay(rec);
+  if (!quiet) toast(`ROI ${st.rois.length}개 검출`);
+}
+function imgDetNoteHtml(rec) {
+  const st = imgState(rec), r = st.detInfo;
+  if (!r) return `<span class="muted">아직 검출하지 않았습니다.</span>`;
+  const basisTxt = { mean: "mean projection", max: "max projection", frame: `프레임 #${st.frame}` }[st.basis] || st.basis;
+  return `
+  <div>기준 <b>${esc(basisTxt)}</b> · 국소최대 후보 <b>${r.nCandidates}</b>개 →
+    모양 문턱(${fmt(r.params.shapeMin, 2)})으로 <b class="tag-Low">${r.nRejectedShape}개 기각</b> →
+    최소간격·개수 제한으로 ${r.nDropped}개 제외 → <b>ROI ${st.rois.length}개</b></div>
+  <div class="s muted">EM gain 이 걸린 프레임에서는 증폭된 <b>단일광자 사건이 화소 하나짜리 스파이크</b>로 찍혀
+    화소 분포의 꼬리가 정규분포보다 훨씬 두껍습니다 — 이 자료에서도 중앙값+30σ 를 넘는 화소가 수백 개였습니다.
+    그래서 σ 문턱만으로는 스파이크가 걸러지지 않고, <b>모양</b>(조리개합 ÷ 봉우리)으로 가릅니다.
+    회절한계 입자는 여러 화소가 함께 밝아 이 값이 크고(실측 5.6–17), 스파이크는 1 근처입니다.
+    <b>어두운 입자가 빠진 것 같으면 모양 문턱을 낮추십시오</b> — 대신 스파이크가 섞여 들어옵니다.</div>`;
+}
+function imgRoiTableHtml(rec) {
+  const st = imgState(rec);
+  if (!st.rois.length) return `<div class="s muted">ROI 가 없습니다. 「검출」을 누르거나 이미지에서 Shift+클릭으로 직접 추가하십시오.</div>`;
+  const cm = st.cm, tr = st.traces, d = st.d;
+  const verdTxt = (i) => {
+    if (!cm || !cm.ok) return `<span class="muted">–</span>`;
+    const f = cm.flags[i];
+    if (f.verdict === "independent") return `<span class="tag-Low">개별 거동</span> <span class="muted">(z=${fmt(f.maxZ, 3)} @f${f.atFrame})</span>`;
+    if (f.verdict === "unidentified") return `<span class="muted">판정 불가 (관측가능 ${f.nObservable}/${d.n})</span>`;
+    return `<span class="tag-High">공통모드와 일치</span> <span class="muted">(z≤${fmt(f.maxZ, 3)})</span>`;
+  };
+  const rows = st.rois.map((p, i) => {
+    const t = tr ? tr[i] : null;
+    const nDet = t && st.blank ? t.filter((v, k) => v > 3 * st.blank[k]).length : null;
+    return `<tr>
+      <td>${i}</td>
+      <td class="mono">${fmt(p.xc != null ? p.xc : p.x, 5)}, ${fmt(p.yc != null ? p.yc : p.y, 5)}</td>
+      <td class="mono">${p.manual ? '<span class="muted">수동</span>' : fmt(p.shape, 3)}</td>
+      <td class="mono">${t ? fmt(Math.max.apply(null, t), 5) : (isFinite(p.flux) ? fmt(p.flux, 5) : "–")}</td>
+      ${d.n > 1 ? `<td class="mono">${nDet != null ? `${nDet}/${d.n}` : "–"}</td><td>${verdTxt(i)}</td>` : ""}
+    </tr>`;
+  }).join("");
+  return `<table class="res"><thead><tr><th>#</th><th>x, y (px)</th><th>shape</th><th>${d.n > 1 ? "최대 flux" : "flux"}</th>
+    ${d.n > 1 ? "<th>검출 프레임</th><th>판정</th>" : ""}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/* --------------------------- analysis refresh ------------------------------ */
+function imgEnsureTraces(rec) {
+  const st = imgState(rec), d = st.d;
+  if (st.traces || !st.rois.length) return;
+  const traces = st.rois.map(() => []);
+  const blank = [];
+  for (let k = 0; k < d.n; k++) {
+    const f = imgFrame(rec, k);
+    if (!f) { traces.forEach((t) => t.push(NaN)); blank.push(NaN); continue; }
+    const ph = PrismImg.photometry(f, d.nx, d.ny, st.rois, st.photOpt);
+    ph.forEach((p, i) => traces[i].push(p.sum));
+    const bn = PrismImg.blankNoise(f, d.nx, d.ny, st.rois, st.photOpt);
+    blank.push(bn.sigma);
+  }
+  st.traces = traces; st.blank = blank;
+  if (d.n > 1) {
+    st.cm = PrismImg.commonMode(traces, { sigmaBlank: blank });
+    st.evidence = PrismImg.stateEvidence({
+      n: d.n, time: d.time, aux: d.aux, settings: d.settings,
+      level: st.cm && st.cm.ok ? st.cm.g : null,
+    });
+  }
+}
+function imgRefreshAnalysis(rec) {
+  const st = imgState(rec);
+  imgEnsureTraces(rec);
+  $("#det-note").innerHTML = imgDetNoteHtml(rec);
+  $("#det-table").innerHTML = imgRoiTableHtml(rec);
+  if (st.d.n > 1) {
+    imgDrawTraces(rec);
+    $("#cm-body").innerHTML = imgCommonModeHtml(rec);
+    $("#sel-body").innerHTML = imgSelectivityHtml(rec);
+    imgBindSelectivity(rec);
+    $("#state-body").innerHTML = imgStateHtml(rec);
+    imgBindState(rec);
+    $("#contrast-body").innerHTML = imgContrastHtml(rec);
+    imgBindContrast(rec);
+    imgFillDiffSelects(rec);
+  }
+  imgFillCompare(rec);
+  imgDrawOverlay(rec);
+}
+
+/* ------------------------------- traces ------------------------------------ */
+function imgBindTrace(rec) {
+  const st = imgState(rec);
+  $("#tr-mode").addEventListener("change", (e) => { st.traceMode = e.target.value; imgDrawTraces(rec); });
+  $("#tr-x").addEventListener("change", () => imgDrawTraces(rec));
+  $("#tr-csv").addEventListener("click", () => imgTraceCsv(rec));
+}
+function imgDrawTraces(rec) {
+  const st = imgState(rec), d = st.d, el = $("#chart-tr");
+  if (!el) return;
+  imgEnsureTraces(rec);
+  if (!st.traces || !st.traces.length) {
+    el.innerHTML = ""; $("#tr-note").textContent = "ROI 가 없습니다.";
+    Plotly.purge(el);
+    return;
+  }
+  const useTime = ($("#tr-x") || {}).value !== "index" && d.time && d.time.length === d.n;
+  const x = useTime ? d.time : Array.from({ length: d.n }, (_, i) => i);
+  const cm = st.cm;
+  const mode = st.traceMode;
+  const traces = st.rois.map((p, i) => {
+    let y = st.traces[i];
+    if (mode === "norm" && cm && cm.ok) y = y.map((v) => v / cm.ref[i]);
+    else if (mode === "resid" && cm && cm.ok) y = y.map((v, k) => (cm.exp[i][k] > 0 ? v / cm.exp[i][k] : NaN));
+    const indep = cm && cm.ok && cm.flags[i].verdict === "independent";
+    return {
+      x, y, mode: "lines+markers", name: `#${i}`,
+      line: { width: indep ? 2.4 : 1.2, color: indep ? "#ffb020" : undefined },
+      marker: { size: indep ? 7 : 5 },
+      hovertemplate: `#${i}<br>%{x}<br>%{y:.5g}<extra></extra>`,
+    };
+  });
+  if (mode !== "resid" && cm && cm.ok) {
+    traces.push({
+      x, y: mode === "norm" ? cm.g : cm.g.map((v, k) => v * PrismImg.median(cm.ref)),
+      mode: "lines", name: "공통모드 g", line: { color: "#e8ecff", width: 2.6, dash: "dot" },
+      hovertemplate: "공통모드 g=%{y:.4g}<extra></extra>",
+    });
+  }
+  const ylab = { raw: "조리개 flux (counts)", norm: "S / ref (ROI 기준 정규화)", resid: "S / E (공통모드 제거 후)" }[mode];
+  newPlot(el, traces, {
+    xaxis: Object.assign(baseLayout().xaxis, { title: { text: useTime ? "시간 (s)" : "프레임 번호" } }),
+    yaxis: Object.assign(baseLayout().yaxis, { title: { text: ylab } }),
+    showlegend: true,
+  });
+  const notes = [];
+  if (mode === "resid") notes.push("잔차 1.0 = 공통모드만으로 설명됨. 1 에서 크게 벗어난 점이 개별 거동입니다.");
+  if (st.blank && st.blank.every(isFinite))
+    notes.push(`프레임별 측광 잡음 σ(빈 자리 실측) = ${st.blank.map((v) => fmt(v, 3)).join(" · ")} counts`);
+  $("#tr-note").innerHTML = notes.join(" · ");
+}
+function imgTraceCsv(rec) {
+  const st = imgState(rec), d = st.d;
+  imgEnsureTraces(rec);
+  const head = ["frame", "time_s", "sigma_blank"];
+  st.rois.forEach((p, i) => head.push(`roi${i}_x`, `roi${i}_y`, `roi${i}_flux`));
+  const rows = [head];
+  for (let k = 0; k < d.n; k++) {
+    const r = [k, d.time ? d.time[k] : "", st.blank ? st.blank[k] : ""];
+    st.rois.forEach((p, i) => r.push(fmt(p.xc != null ? p.xc : p.x, 6), fmt(p.yc != null ? p.yc : p.y, 6), st.traces[i][k]));
+    rows.push(r);
+  }
+  downloadText(rec.name.replace(/\.h5$/i, "") + "_roi_traces.csv", rowsToCsv(rows), "text/csv");
+}
+
+/* --------------------------- common mode panel ----------------------------- */
+function imgCommonModeHtml(rec) {
+  const st = imgState(rec), d = st.d, cm = st.cm;
+  const intro = `<div class="s muted" style="margin-bottom:6px;">
+    시야 전체가 같은 비율로 변한 성분(<b>공통모드</b> g)을 먼저 떼어 내고, 한 입자만의 변화는 잔차에 남깁니다.
+    <b>공통모드는 "기기 탓"이라는 뜻이 아닙니다</b> — 전역 변화의 원인은 둘 다 가능합니다:
+    기기 쪽(초점 이탈·빔 요동·시야 이동·셔터)과 시료 쪽(widefield 조사 자체가 시야의 모든 입자를
+    함께 변화시키는 경우). <b>파일만으로는 이 둘을 구분할 수 없습니다.</b> 구분하려면 조사하지 않은
+    영역을 함께 찍거나, 조사 세기를 바꿔 가며 반복해야 합니다.
+    다만 어느 쪽이든 <b>그 변화를 단일입자 스위칭이라고 부를 수는 없다</b>는 점은 같고,
+    이 분리는 그것을 막기 위한 것입니다.
+  </div>`;
+  if (!cm) return intro + `<div class="s muted">ROI 가 필요합니다.</div>`;
+  if (!cm.ok) return intro + `<div class="s">분리하지 않았습니다 — ${esc(cm.why)}.</div>`;
+  const gRow = cm.g.map((v, k) => `<td class="mono">${fmt(v, 4)}</td>`).join("");
+  const obsRow = cm.g.map((v, k) => {
+    const n = cm.flags.reduce((a, f, i) => a + (cm.observable[i][k] ? 1 : 0), 0);
+    return `<td class="mono">${n}/${cm.nRoi}</td>`;
+  }).join("");
+  const indep = cm.flags.filter((f) => f.verdict === "independent");
+  const unid = cm.flags.filter((f) => f.verdict === "unidentified");
+  const verdict = cm.commonDominant
+    ? `<div class="s"><b class="tag-Low">시야 전체가 함께 변했습니다</b> — 공통모드 진폭 ${fmt(cm.commonSwing, 4)}배
+        (최대 g ÷ 최소 g). 표적 하나만 조작하는 측정이었다면 이 결과는 <b>의도와 다릅니다</b>:
+        겨냥하지 않은 입자들까지 함께 변했다는 뜻이므로, 조작이 국소적이지 않았거나 시야 전체가
+        같은 영향을 받았거나(예: widefield 조사 자체) 기기 조건이 바뀐 것입니다.
+        개별 입자의 변화는 이 전역 변화 위에 얹혀 있으니 따로 떼어 읽어야 합니다.</div>`
+    : `<div class="s"><b class="tag-High">시야 전체 수준은 거의 일정합니다</b> — 공통모드 진폭 ${fmt(cm.commonSwing, 4)}배.
+        따라서 아래 개별 거동은 전역 요인으로 설명되지 않습니다.</div>`;
+  const gate = `<div class="s muted">관측 가능성 게이트: 기대값 E = g·ref 가 잡음(${fmt(cm.kSig, 2)}σ) 아래인 점은
+    <b>아무것도 구분하지 못하므로</b> 판정에서 뺐습니다 — 전체 ${cm.nPoints}점 중 <b>${cm.nObservable}점</b>만 사용.
+    (이 게이트가 없으면 시야가 통째로 꺼진 프레임에서 잡음÷잡음 이 2 oct 씩 튀어 "개별 스위칭" 허위 경보가 납니다.)</div>`;
+  const noise = `<div class="s muted">잡음 = √(σ_blank² + (${fmt(cm.relScatter, 3)}·E)²).
+    σ_blank 는 각 프레임의 <b>빈 자리에 같은 조리개를 놓고 실측</b>한 값이고, 상대항 ${fmt(cm.relScatter, 3)} 은
+    관측 가능한 점들의 잔차 산포에서 직접 잰 값입니다 — EM gain 통계를 가정하지 않습니다.</div>`;
+  return intro + verdict + `
+  <table class="res" style="margin:8px 0;"><thead><tr><th>프레임</th>${cm.g.map((v, k) => `<th>${k}</th>`).join("")}</tr></thead>
+    <tbody><tr><td>공통모드 g</td>${gRow}</tr><tr><td>관측 가능 ROI</td>${obsRow}</tr></tbody></table>
+  <div class="s">개별 거동 <b>${indep.length}</b>개 · 판정 불가 <b>${unid.length}</b>개 · 공통모드와 일치 ${cm.nRoi - indep.length - unid.length}개</div>
+  ${indep.length ? `<ul class="s" style="margin:4px 0 0 18px;">${indep.map((f) =>
+    `<li>ROI <b>#${f.roi}</b> — 프레임 ${f.atFrame} 에서 기대값의 <b>${fmt(f.ratioAtWorst, 3)}배</b> (z = ${fmt(f.maxZ, 3)}, 문턱 ${fmt(cm.kSig, 2)})</li>`).join("")}</ul>` : ""}
+  ${unid.length ? `<div class="s muted" style="margin-top:4px;">판정 불가: ${unid.map((f) => `#${f.roi}(관측가능 ${f.nObservable}/${d.n})</span>`).join(", ")}
+    — 비교할 수 있는 프레임이 2장 미만이라 "변화 없음"이라고도 말할 수 없습니다.</div>` : ""}
+  ${gate}${noise}`;
+}
+
+/* ---------------------------- state assignment ----------------------------- */
+const IMG_LABELSETS = {
+  neutral: { name: "중립", a: "상태 A", b: "상태 B", note: "물리 방향을 가정하지 않습니다." },
+  activation: { name: "활성화 (조작이 발광을 살림)", a: "activation ON", b: "activation OFF", note: "조작이 가해졌을 때 발광이 살아나는 구조로 읽습니다." },
+  depletion: { name: "억제 (조작이 발광을 끔)", a: "depletion OFF", b: "depletion ON", note: "조작이 가해졌을 때 발광이 억제되는 구조로 읽습니다." },
+  darkrec: { name: "darkening / recovery", a: "recovery 후", b: "darkening 후",
+    note: "한 조작이 입자를 어둡게 하고 다른 조작이 되살리는 구조로 읽습니다. 어느 프레임이 어느 쪽인지는 파일에 없으므로 배정이 맞는지 트레이스로 확인하십시오." },
+};
+function imgStateHtml(rec) {
+  const st = imgState(rec), d = st.d, ev = st.evidence;
+  const head = `<div class="s muted" style="margin-bottom:6px;">
+    <b>이 파일은 어느 프레임이 빔 on 인지 기록하지 않을 수 있습니다.</b> 그래서 배정을 자동으로 고르지 않고,
+    네 경로의 근거를 나란히 보여 준 뒤 채택은 사용자가 합니다. 첫 프레임이 <b>조작 전 기준</b>이면
+    어느 상태도 아니므로 제외(–)합니다 — 기준 프레임을 한쪽에 억지로 넣으면 그쪽 평균이 오염됩니다.
+    근거들이 서로 어긋나면 그 자체가 결과입니다 —
+    예컨대 간격은 A·B·A 를 가리키는데 밝기는 첫 프레임만 밝다면 "상태"가 아니라 <b>비가역적 소실</b>
+    (퇴색·초점 이탈·이동)을 시사합니다.</div>`;
+  if (!ev) return head + `<div class="s muted">ROI 와 트레이스가 필요합니다.</div>`;
+  const row = (title, h, noteKey) => {
+    if (!h) return `<tr><td>${title}</td><td class="muted" colspan="3">${esc(ev[noteKey] || "근거 없음")}</td></tr>`;
+    return `<tr><td>${title}</td><td>${esc(h.strength || "–")}</td>
+      <td class="s">${esc(h.note || h.from || "")}</td>
+      <td class="mono">${h.assign.map((v) => (v === 0 ? "A" : "B")).join(" ")}
+        <button class="small" data-adopt="${title}">채택</button></td></tr>`;
+  };
+  const schedRow = ev.schedule
+    ? `<tr><td>측정 설정 구조</td><td>${esc(ev.schedule.strength)}</td><td class="s">${esc(ev.schedule.note)}</td>
+        <td class="mono">${ev.schedule.assign.map((v) => (v < 0 ? "–" : v === 0 ? "A" : "B")).join(" ")}
+        <button class="small" data-adopt="측정 설정 구조">채택</button></td></tr>`
+    : `<tr><td>측정 설정 구조</td><td class="muted">없음</td><td class="s muted" colspan="2">${esc(ev.scheduleNote || "num_cycle 설정이 없습니다")}</td></tr>`;
+  const fileRow = ev.file
+    ? `<tr><td>파일 기록</td><td>확정</td><td class="s mono">${esc(ev.file.from)}</td>
+        <td class="mono">${ev.file.assign.map((v) => (v === 0 ? "A" : "B")).join(" ")} <button class="small" data-adopt="파일 기록">채택</button></td></tr>`
+    : `<tr><td>파일 기록</td><td class="muted">없음</td><td class="s muted" colspan="2">${(ev.fileNotes || []).map(esc).join(" / ") || "상태 배열이 없습니다"}</td></tr>`;
+  const conflict = ev.conflict
+    ? `<div class="s"><b class="tag-Low">근거들이 서로 어긋납니다.</b> 하나를 임의로 채택하면 그 불일치가 사라집니다 —
+        무엇이 어긋났는지 확인한 뒤 고르십시오.</div>`
+    : (ev.agree ? `<div class="s"><span class="tag-High">근거들이 서로 일치합니다.</span></div>` : "");
+  const cur = st.assign
+    ? `<div class="s" style="margin-top:6px;">현재 배정: <span class="mono">${st.assign.map((v) => (v === 0 ? "A" : v === 1 ? "B" : "–")).join(" ")}</span>
+        <span class="muted">(– 는 어느 상태도 아님 — 조작 전 기준 프레임 등)</span>
+        <span class="muted">(출처: ${esc(st.assignFrom || "수동")})</span></div>`
+    : `<div class="s muted" style="margin-top:6px;">아직 배정하지 않았습니다 — 대비 지표는 배정 후에 계산됩니다.</div>`;
+  const manual = `<div class="flex small" style="margin-top:8px;flex-wrap:wrap;align-items:flex-end;">
+    <span style="align-self:center">수동 배정</span>
+    ${Array.from({ length: d.n }, (_, k) => `<label class="ctl"><span>#${k}</span>
+      <select data-frame="${k}" class="st-sel">
+        <option value="-"${!st.assign || st.assign[k] === -1 ? " selected" : ""}>제외</option>
+        <option value="0"${st.assign && st.assign[k] === 0 ? " selected" : ""}>A</option>
+        <option value="1"${st.assign && st.assign[k] === 1 ? " selected" : ""}>B</option>
+      </select></label>`).join("")}
+    <label class="ctl"><span>용어</span><select id="st-labels">
+      ${Object.keys(IMG_LABELSETS).map((k) => `<option value="${k}"${st.labels === k ? " selected" : ""}>${IMG_LABELSETS[k].name}</option>`).join("")}
+    </select></label>
+  </div>
+  <div class="s muted">용어 선택은 <b>표시 문구만</b> 바꿉니다 — 숫자는 부호중립으로 계산되며 달라지지 않습니다.
+    ${esc(IMG_LABELSETS[st.labels].note)}</div>`;
+  return head + `<table class="res"><thead><tr><th>근거</th><th>강도</th><th>내용</th><th>배정 / 채택</th></tr></thead><tbody>
+    ${fileRow}
+    ${schedRow}
+    ${row("프레임 간격", ev.cadence, "cadenceNote")}
+    ${row("밝기 준위", ev.levels, "levelsNote")}
+  </tbody></table>${conflict}${cur}${manual}`;
+}
+function imgBindState(rec) {
+  const st = imgState(rec), ev = st.evidence;
+  document.querySelectorAll("[data-adopt]").forEach((b) => b.addEventListener("click", () => {
+    const k = b.getAttribute("data-adopt");
+    const h = k === "파일 기록" ? ev.file
+      : k === "측정 설정 구조" ? ev.schedule
+      : k === "프레임 간격" ? ev.cadence : ev.levels;
+    if (!h) return;
+    st.assign = h.assign.slice(); st.assignFrom = k;
+    $("#state-body").innerHTML = imgStateHtml(rec); imgBindState(rec);
+    $("#contrast-body").innerHTML = imgContrastHtml(rec); imgBindContrast(rec);
+    imgFillDiffSelects(rec);
+  }));
+  document.querySelectorAll(".st-sel").forEach((s) => s.addEventListener("change", () => {
+    const n = st.d.n;
+    if (!st.assign) st.assign = new Array(n).fill(-1);
+    document.querySelectorAll(".st-sel").forEach((e) => {
+      const k = Number(e.getAttribute("data-frame"));
+      st.assign[k] = e.value === "-" ? -1 : Number(e.value);
+    });
+    st.assignFrom = "수동";
+    $("#contrast-body").innerHTML = imgContrastHtml(rec); imgBindContrast(rec);
+    imgFillDiffSelects(rec);
+  }));
+  const lb = $("#st-labels");
+  if (lb) lb.addEventListener("change", (e) => {
+    st.labels = e.target.value;
+    $("#state-body").innerHTML = imgStateHtml(rec); imgBindState(rec);
+    $("#contrast-body").innerHTML = imgContrastHtml(rec); imgBindContrast(rec);
+  });
+}
+
+/* -------------------------------- contrast --------------------------------- */
+function imgContrastHtml(rec) {
+  const st = imgState(rec), L = IMG_LABELSETS[st.labels];
+  if (!st.assign || !st.traces) return `<div class="s muted">상태를 배정하면 대비 지표가 계산됩니다.</div>`;
+  const c = PrismImg.contrast(st.traces, st.assign);
+  if (!c.idxA.length || !c.idxB.length)
+    return `<div class="s muted">두 상태 모두에 최소 한 프레임씩 배정해야 합니다 (현재 A ${c.idxA.length} · B ${c.idxB.length}).</div>`;
+  const s = c.summary;
+  const cm = st.cm;
+  const warn = s.mixedDirection
+    ? `<div class="s"><b class="tag-Low">입자마다 방향이 갈립니다.</b> 일부는 A 에서, 일부는 B 에서 더 밝습니다 —
+        "전체가 한 방향으로 스위칭한다"는 서술은 이 자료에 맞지 않습니다.</div>` : "";
+  const cmWarn = cm && cm.ok && cm.commonDominant
+    ? `<div class="s"><b class="tag-Low">주의 — 시야 전체가 ${fmt(cm.commonSwing, 4)}배로 함께 변한 상태입니다.</b>
+        아래 대비는 그 전역 변화를 포함한 값이므로, 입자 고유의 대비로 읽으면 안 됩니다.</div>` : "";
+  const rows = c.rows.map((r) => `<tr>
+    <td>${r.roi}</td>
+    <td class="mono">${fmt(r.meanA, 5)}${isFinite(r.sdA) ? ` <span class="muted">±${fmt(r.sdA, 3)}</span>` : ""}</td>
+    <td class="mono">${fmt(r.meanB, 5)}${isFinite(r.sdB) ? ` <span class="muted">±${fmt(r.sdB, 3)}</span>` : ""}</td>
+    <td class="mono">${fmt(r.ratioAB, 4)}</td><td class="mono">${fmt(r.ratioBA, 4)}</td>
+    <td class="mono">${fmt(r.michelson, 4)}</td></tr>`).join("");
+  return `${cmWarn}${warn}
+  <div class="s">${esc(L.a)} 프레임 ${s.nA}장 · ${esc(L.b)} 프레임 ${s.nB}장 · ROI ${s.nRoi}개</div>
+  <div class="s">Michelson 대비 (A−B)/(A+B): 중앙값 <b>${fmt(s.michelsonMedian, 4)}</b>
+    · 범위 ${fmt(s.michelsonMin, 4)} ~ ${fmt(s.michelsonMax, 4)}${isFinite(s.michelsonIQR) ? ` · IQR ${fmt(s.michelsonIQR, 4)}` : ""}</div>
+  <div class="s muted">A÷B 와 B÷A 를 <b>둘 다</b> 표시합니다. 어느 쪽이 "켜짐"인지는 파일이 말해 주지 않으므로
+    방향을 골라 한쪽만 보여 주면 해석을 숫자에 박아 넣는 셈이 됩니다.
+    Michelson 대비는 −1~+1 로 대칭·유계라서 방향 해석 없이 크기만 비교할 수 있습니다.</div>
+  <table class="res" style="margin-top:6px;"><thead><tr><th>#</th><th>${esc(L.a)} 평균</th><th>${esc(L.b)} 평균</th>
+    <th>A÷B</th><th>B÷A</th><th>Michelson</th></tr></thead><tbody>${rows}</tbody></table>
+  <div class="flex small" style="margin-top:6px;"><span class="right"><button id="ct-csv" class="small">CSV</button></span></div>`;
+}
+function imgBindContrast(rec) {
+  const b = $("#ct-csv");
+  if (!b) return;
+  b.addEventListener("click", () => {
+    const st = imgState(rec);
+    const c = PrismImg.contrast(st.traces, st.assign);
+    const rows = [["roi", "x", "y", "n_A", "n_B", "mean_A", "mean_B", "sd_A", "sd_B", "ratio_A_over_B", "ratio_B_over_A", "michelson"]];
+    c.rows.forEach((r, i) => {
+      const p = st.rois[i];
+      rows.push([r.roi, fmt(p.xc != null ? p.xc : p.x, 6), fmt(p.yc != null ? p.yc : p.y, 6),
+        r.nA, r.nB, r.meanA, r.meanB, r.sdA, r.sdB, r.ratioAB, r.ratioBA, r.michelson]);
+    });
+    downloadText(rec.name.replace(/\.h5$/i, "") + "_contrast.csv", rowsToCsv(rows), "text/csv");
+  });
+}
+
+/* ------------------------------- difference -------------------------------- */
+function imgFillDiffSelects(rec) {
+  const st = imgState(rec), d = st.d;
+  const a = $("#df-a"), b = $("#df-b");
+  if (!a || !b) return;
+  const opts = [];
+  for (let k = 0; k < d.n; k++) opts.push(`<option value="f${k}">프레임 #${k}</option>`);
+  if (st.assign && st.assign.some((v) => v === 0) && st.assign.some((v) => v === 1)) {
+    const L = IMG_LABELSETS[st.labels];
+    opts.push(`<option value="A">${esc(L.a)} 평균</option>`, `<option value="B">${esc(L.b)} 평균</option>`);
+  }
+  a.innerHTML = opts.join(""); b.innerHTML = opts.join("");
+  a.value = st.assign ? "A" : "f0";
+  b.value = st.assign ? "B" : (d.n > 1 ? "f1" : "f0");
+  imgDiffNote(rec);
+}
+function imgStateMean(rec, which) {
+  const st = imgState(rec), d = st.d;
+  const want = which === "A" ? 0 : 1;
+  let acc = null, n = 0;
+  for (let k = 0; k < d.n; k++) {
+    if (!st.assign || st.assign[k] !== want) continue;
+    const f = imgFrame(rec, k);
+    if (!f) continue;
+    acc = PrismImg.accSum(acc, f); n++;
+  }
+  if (acc && n > 1) PrismImg.scaleInPlace(acc, 1 / n);
+  return { img: acc, n };
+}
+function imgPickImage(rec, key) {
+  if (key === "A" || key === "B") return imgStateMean(rec, key).img;
+  return imgFrame(rec, Number(String(key).slice(1)));
+}
+/** 같은 상태 프레임쌍이 2장 이상일 때만 σ 를 만들 수 있다. */
+function imgSigmaPairs(rec) {
+  const st = imgState(rec), d = st.d;
+  const groups = {};
+  for (let k = 0; k < d.n; k++) {
+    const g = st.assign ? st.assign[k] : 0;
+    if (g < 0) continue;
+    (groups[g] = groups[g] || []).push(k);
+  }
+  for (const g of Object.keys(groups)) {
+    if (groups[g].length >= 2) {
+      const a = imgFrame(rec, groups[g][0]), b = imgFrame(rec, groups[g][1]);
+      if (a && b) return { sigma: PrismImg.noiseFromPair(a, b), from: `프레임 #${groups[g][0]} − #${groups[g][1]} (같은 상태)` };
+    }
+  }
+  return null;
+}
+function imgDiffNote(rec) {
+  const sp = imgSigmaPairs(rec);
+  const el = $("#df-note");
+  if (!el) return;
+  const u = $("#df-unit");
+  if (!sp) {
+    if (u) { u.value = "counts"; Array.from(u.options).forEach((o) => { if (o.value === "sigma") o.disabled = true; }); }
+    el.innerHTML = `σ 단위는 쓸 수 없습니다 — <b>같은 상태에 배정된 프레임이 2장 이상이어야</b> 화소 잡음을 실측할 수 있습니다.
+      여기서 광자전달 모형을 가정해 σ 를 지어내면 EM gain 초과잡음 때문에 유의성이 체계적으로 부풀려집니다.`;
+  } else {
+    if (u) Array.from(u.options).forEach((o) => { o.disabled = false; });
+    el.innerHTML = `σ = ${fmt(sp.sigma, 4)} counts/화소 — ${esc(sp.from)} 의 차에서 실측(÷√2). 모형 가정 없음.`;
+  }
+}
+function imgBindDiff(rec) {
+  const st = imgState(rec);
+  $("#df-a").addEventListener("change", () => imgDiffNote(rec));
+  $("#df-b").addEventListener("change", () => imgDiffNote(rec));
+  $("#df-run").addEventListener("click", () => {
+    const A = imgPickImage(rec, $("#df-a").value), B = imgPickImage(rec, $("#df-b").value);
+    if (!A || !B) { toast("두 이미지를 모두 고르십시오"); return; }
+    const df = PrismImg.difference(A, B);
+    let img = df.img, unit = "counts";
+    if ($("#df-unit").value === "sigma") {
+      const sp = imgSigmaPairs(rec);
+      if (!sp || !(sp.sigma > 0)) { toast("σ 를 실측할 수 없습니다"); return; }
+      img = Float32Array.from(df.img, (v) => v / sp.sigma); unit = "σ";
+    }
+    const d = st.d;
+    const [p1, p99] = PrismImg.percentiles(img, [0.002, 0.998]);
+    const m = Math.max(Math.abs(p1), Math.abs(p99)) || 1;
+    const bytes = PrismImg.scaleDiverging(img, m);
+    const lut = lutFor("__div");
+    const cv = $("#df-canvas");
+    const off = document.createElement("canvas"); off.width = d.nx; off.height = d.ny;
+    const octx = off.getContext("2d"), idata = octx.createImageData(d.nx, d.ny), px = idata.data;
+    for (let i = 0, j = 0; i < bytes.length; i++, j += 4) {
+      const b = bytes[i] * 3; px[j] = lut[b]; px[j + 1] = lut[b + 1]; px[j + 2] = lut[b + 2]; px[j + 3] = 255;
+    }
+    octx.putImageData(idata, 0, 0);
+    const w = $("#df-wrap").parentElement.clientWidth - 24;
+    cv.width = w; cv.height = Math.round(w * d.ny / d.nx);
+    cv.getContext("2d").drawImage(off, 0, 0, cv.width, cv.height);
+    $("#df-wrap").style.display = "";
+    $("#df-note").innerHTML += `<div style="margin-top:4px;">표시범위 ±${fmt(m, 4)} ${unit} (파랑 = B 가 큼 · 빨강 = A 가 큼) ·
+      차영상 배경 ${fmt(df.median, 4)} · σ(MAD) ${fmt(df.sigma, 4)} ${unit}</div>`;
+  });
+}
+
+/* ---------------------------- cross-file compare ---------------------------- */
+function imgCompareTargets(rec) {
+  const st = imgState(rec);
+  return App.files.filter((f) => !f.error && f.id !== rec.id && f.det && f.det.type === "imaging" &&
+    f.det.imaging.nx === st.d.nx && f.det.imaging.ny === st.d.ny);
+}
+function imgFillCompare(rec) {
+  const st = imgState(rec);
+  const el = $("#cmp-body");
+  if (!el) return;
+  const targets = imgCompareTargets(rec);
+  const intro = `<div class="s muted" style="margin-bottom:6px;">
+    띠통과(DoG) 상호상관으로 이동량을 구한 뒤 현재 ROI 를 대상 파일로 옮기고, <b>입자마다</b> 상대가 있는지 따집니다.
+    전역 "같은 자리인가" 판정 하나로 뭉뚱그리지 않습니다 — 시야가 조금만 이동해도 일부 입자는 넘어오고 일부는 밖으로 나가는데,
+    그 둘을 구분하지 않으면 "사라진 입자"와 "화면 밖으로 나간 입자"가 섞입니다.
+    <span class="muted">원본 화소 상관은 쓰지 않습니다: EM gain 프레임은 산탄잡음이 지배해 같은 자리끼리도 r ≈ 0.07 입니다.</span></div>`;
+  if (!targets.length) {
+    el.innerHTML = intro + `<div class="s muted">같은 크기(${st.d.ny}×${st.d.nx})의 다른 이미지 파일이 열려 있지 않습니다.</div>`;
+    return;
+  }
+  el.innerHTML = intro + `
+  <div class="flex small" style="margin-bottom:6px;flex-wrap:wrap;">
+    <label class="ctl"><span>대상 파일</span><select id="cmp-sel" multiple size="${Math.min(6, targets.length)}" style="min-width:320px">
+      ${targets.map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select></label>
+    <label class="ctl"><span>최대 이동 (px)</span><input id="cmp-max" type="number" step="8" value="64" style="width:90px"></label>
+    <span class="right"><button id="cmp-run" class="small">정합 및 ROI 전이</button></span>
+  </div>
+  <div id="cmp-out"></div>` + (st.compare ? "" : "");
+  $("#cmp-run").addEventListener("click", () => imgRunCompare(rec));
+  if (st.compare) $("#cmp-out").innerHTML = st.compare;
+}
+function imgRunCompare(rec) {
+  const st = imgState(rec), d = st.d;
+  if (!st.rois.length) { toast("먼저 ROI 를 검출하십시오"); return; }
+  const sel = Array.from($("#cmp-sel").selectedOptions).map((o) => o.value);
+  if (!sel.length) { toast("대상 파일을 고르십시오"); return; }
+  const maxShift = Number($("#cmp-max").value) || 64;
+  const base = imgBasisImage(rec);
+  $("#cmp-out").innerHTML = `<div class="s muted">정합 중… (파일당 1–2초)</div>`;
+  setTimeout(() => {
+    const out = [];
+    const baseBlank = PrismImg.blankNoise(base, d.nx, d.ny, st.rois, st.photOpt).sigma;
+    const basePh = PrismImg.photometry(base, d.nx, d.ny, st.rois, st.photOpt);
+    const cols = [];
+    for (const id of sel) {
+      const t = App.files.find((f) => f.id === id);
+      if (!t) continue;
+      let tImg = null;
+      try {
+        const tdet = t.det.imaging;
+        if (tdet.kind === "stack") {
+          let acc = null;
+          for (let i = 0; i < tdet.n; i++) acc = PrismImg.accSum(acc, PrismH5.readImageFrame(t.h5, tdet, i));
+          PrismImg.scaleInPlace(acc, 1 / tdet.n); tImg = acc;
+        } else tImg = PrismH5.readImageFrame(t.h5, tdet, 0);
+      } catch (e) { tImg = null; }
+      if (!tImg) { out.push(`<div class="s">${esc(t.name)} — 읽기 실패</div>`); continue; }
+      const reg = PrismImg.registerShift(base, tImg, d.nx, d.ny, { maxShift, roisA: st.rois });
+      const bn = PrismImg.blankNoise(tImg, d.nx, d.ny, [], st.photOpt).sigma;
+      const tr = PrismImg.transferRois(st.rois, reg, tImg, d.nx, d.ny, Object.assign({ sigmaBlank: bn }, st.photOpt));
+      cols.push({ name: t.name, reg, tr, bn });
+      const nDet = tr.filter((x) => x.detected === true).length;
+      const nOut = tr.filter((x) => !x.inside).length;
+      out.push(`<div class="s" style="margin-top:8px;"><b>${esc(t.name)}</b> —
+        이동량 <span class="mono">(${reg.dx}, ${reg.dy}) px</span> ·
+        상관 봉우리 ${fmt(reg.peak, 4)} <span class="muted">(무관한 이동에서 ${fmt(reg.nullLevel, 4)})</span> ·
+        PSR ${fmt(reg.psr, 3)}σ
+        ${reg.ok ? "" : `<br><span class="tag-Low">${esc(reg.why)}</span>`}
+        <br>현재 ROI ${st.rois.length}개 중 <b>대응 검출 ${nDet}개</b>${nOut ? ` · 화면 밖 ${nOut}개` : ""}
+        <span class="muted">(σ_blank ${fmt(bn, 3)}, 문턱 3σ)</span></div>`);
+      if (reg.ok && nDet <= Math.max(1, Math.floor(st.rois.length * 0.2)))
+        out.push(`<div class="s muted">이동량은 정해졌지만 <b>넘어온 입자가 거의 없습니다</b> —
+          같은 영역을 다시 찍었다기보다 스테이지가 옮겨 가 대체로 다른 입자를 보고 있다는 뜻입니다.
+          이 조합으로 "시간에 따른 변화"를 논하면 안 됩니다.</div>`);
+    }
+    if (cols.length) {
+      const head = `<tr><th>#</th><th>x, y (기준)</th><th>기준 flux</th>${cols.map((c) => `<th>${esc(c.name.slice(0, 22))}</th>`).join("")}</tr>`;
+      const rows = st.rois.map((p, i) => `<tr><td>${i}</td>
+        <td class="mono">${fmt(p.xc != null ? p.xc : p.x, 5)}, ${fmt(p.yc != null ? p.yc : p.y, 5)}</td>
+        <td class="mono">${fmt(basePh[i].sum, 5)}</td>
+        ${cols.map((c) => {
+          const x = c.tr[i];
+          if (!x.inside) return `<td class="muted">화면 밖</td>`;
+          const cls = x.detected ? "" : ' class="muted"';
+          return `<td${cls}><span class="mono">${fmt(x.sum, 5)}</span>${x.detected ? "" : " <span class=\"muted\">(미검출)</span>"}</td>`;
+        }).join("")}</tr>`).join("");
+      out.push(`<table class="res" style="margin-top:8px;"><thead>${head}</thead><tbody>${rows}</tbody></table>
+        <div class="s muted">기준 flux 는 현재 파일의 ${esc({ mean: "mean projection", max: "max projection", frame: "현재 프레임" }[st.basis])} 기준입니다.
+          "미검출" 은 그 자리의 flux 가 그 파일의 3σ_blank 에 못 미친다는 뜻이며, 입자가 없어졌다는 판정이 아닙니다.</div>
+        <div class="flex small" style="margin-top:6px;"><span class="right"><button id="cmp-csv" class="small">CSV</button></span></div>`);
+      st._cmpCols = cols; st._cmpBase = basePh;
+    }
+    st.compare = out.join("");
+    $("#cmp-out").innerHTML = st.compare;
+    const cb = $("#cmp-csv");
+    if (cb) cb.addEventListener("click", () => {
+      const rows = [["roi", "x", "y", "base_flux"].concat(cols.map((c) => c.name), cols.map((c) => c.name + "_detected"))];
+      st.rois.forEach((p, i) => rows.push([i, fmt(p.xc != null ? p.xc : p.x, 6), fmt(p.yc != null ? p.yc : p.y, 6), basePh[i].sum]
+        .concat(cols.map((c) => c.tr[i].sum), cols.map((c) => String(c.tr[i].detected)))));
+      downloadText(rec.name.replace(/\.h5$/i, "") + "_cross_file.csv", rowsToCsv(rows), "text/csv");
+    });
+  }, 30);
+}
+
+/* ------------------------------ selectivity -------------------------------- */
+/** 변조 깊이 + 공간 선택성. 초점 빔으로 한 입자만 조작하는 실험의 핵심 지표다. */
+function imgSelectivityHtml(rec) {
+  const st = imgState(rec), d = st.d;
+  const intro = `<div class="s muted" style="margin-bottom:6px;">
+    초점 빔을 한 입자에 겨냥하는 측정이라면 <b>표적만 반응하고 이웃은 가만히 있어야</b> 합니다.
+    반응하지 않은 <b>가장 가까운 이웃까지의 거리</b>가 그 빔의 유효 반경 상한이고,
+    깊이가 거리에 따라 완만히 줄면 빔이 샜거나 초점이 넓다는 뜻입니다.
+    거리는 화소 단위입니다 — µm/px 환산이 파일에 없으므로 여기서 지어내지 않습니다.</div>`;
+  if (!st.traces || st.traces.length < 2) return intro + `<div class="s muted">ROI 가 2개 이상 필요합니다.</div>`;
+  const dep = PrismImg.modulationDepth(st.traces, st.blank);
+  if (st.target == null) {
+    const sug = PrismImg.suggestTarget(dep);
+    st.target = sug ? sug.index : 0;
+    st.targetAuto = true;
+  }
+  const sel = PrismImg.selectivity(st.rois, dep, st.target);
+  if (!sel.ok) return intro + `<div class="s muted">${esc(sel.why)}</div>`;
+  const depTxt = (r) => (isFinite(r.depth) ? `${r.isLowerBound ? "≥" : ""}${fmt(r.depth, 3)}` : "–");
+  const t = sel.target;
+  const head = `<div class="flex small" style="margin-bottom:6px;align-items:flex-end;">
+    <label class="ctl"><span>표적 ROI</span><select id="sel-target">
+      ${st.rois.map((p, i) => `<option value="${i}"${i === st.target ? " selected" : ""}>#${i} (${Math.round(p.xc != null ? p.xc : p.x)}, ${Math.round(p.yc != null ? p.yc : p.y)})</option>`).join("")}
+    </select></label>
+    <label class="ctl"><span>'반응 없음' 기준 (배)</span><input id="sel-quiet" type="number" step="0.5" value="${sel.quietMax}" style="width:90px"></label>
+    <span class="muted">${st.targetAuto ? "변조가 가장 큰 ROI 를 자동 제안했습니다 — 실제 겨냥 위치를 아시면 바꾸십시오." : ""}</span>
+  </div>`;
+  const verdict = isFinite(sel.ratioToOthers) && sel.ratioToOthers > 3
+    ? `<div class="s"><b class="tag-High">표적만 반응했습니다</b> — 표적 변조 <b>${depTxt(t)}배</b>,
+        나머지 ${sel.nOthers}개 중 최대 ${fmt(sel.maxOtherDepth, 3)}배 (<b>${fmt(sel.ratioToOthers, 3)}배</b> 차이).</div>`
+    : `<div class="s"><b class="tag-Low">표적이 특별히 두드러지지 않습니다</b> — 표적 ${depTxt(t)}배 vs
+        나머지 최대 ${fmt(sel.maxOtherDepth, 3)}배. 표적 지정이 틀렸거나, 조작이 국소적이지 않았거나,
+        전체가 함께 변한 상황입니다(위 공통모드 패널을 함께 보십시오).</div>`;
+  const bound = sel.nearestQuiet
+    ? `<div class="s">반응하지 않은 가장 가까운 이웃: <b>#${sel.nearestQuiet.roi}</b>,
+        거리 <b>${fmt(sel.nearestQuiet.dist, 4)} px</b> (변조 ${depTxt(sel.nearestQuiet)}배)
+        → <b>조작의 유효 반경은 이보다 작습니다.</b>
+        ${sel.nearestLoud ? `<span class="muted">단, 더 가까운 곳에 반응한 이웃 #${sel.nearestLoud.roi}(${fmt(sel.nearestLoud.dist, 4)} px)이 있으므로 상한으로만 읽으십시오.</span>` : ""}</div>`
+    : `<div class="s muted">${sel.nOthers ? "기준 이하로 잠잠한 이웃이 없습니다 — 유효 반경 상한을 정할 수 없습니다." : "비교할 이웃이 없습니다."}</div>`;
+  const trend = sel.trend
+    ? `<div class="s ${sel.trend.graded ? "" : "muted"}">거리 추세: 가까운 절반 중앙값 ${fmt(sel.trend.near, 3)}배 ·
+        먼 절반 ${fmt(sel.trend.far, 3)}배 (경계 ${fmt(sel.trend.splitAt, 4)} px)
+        — ${sel.trend.graded ? "<b>가까울수록 크게 반응합니다. 조작이 표적에만 국한되지 않았을 수 있습니다.</b>" : "거리에 따른 경향이 뚜렷하지 않습니다."}</div>`
+    : "";
+  const rows = sel.rows.map((r) => `<tr${r.isTarget ? ' style="background:rgba(255,176,32,.10)"' : ""}>
+    <td>${r.isTarget ? "<b>표적</b> " : ""}#${r.roi}</td>
+    <td class="mono">${fmt(r.dist, 4)}</td>
+    <td class="mono">${depTxt(r)}</td>
+    <td class="mono">${fmt(st.traces[r.roi][dep[r.roi].kMax], 5)}</td>
+    <td class="mono">${fmt(st.traces[r.roi][dep[r.roi].kMin], 5)}</td>
+    <td class="muted">${r.isLowerBound ? "최저값이 잡음 아래 — 깊이는 하한" : ""}</td></tr>`).join("");
+  return intro + head + verdict + bound + trend + `
+  <table class="res" style="margin-top:8px;"><thead><tr><th>ROI</th><th>표적까지 (px)</th><th>변조 깊이</th>
+    <th>최대</th><th>최소</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+  <div class="flex small" style="margin-top:6px;"><span class="right"><button id="sel-csv" class="small">CSV</button></span></div>`;
+}
+function imgBindSelectivity(rec) {
+  const st = imgState(rec);
+  const t = $("#sel-target");
+  if (t) t.addEventListener("change", (e) => {
+    st.target = Number(e.target.value); st.targetAuto = false;
+    $("#sel-body").innerHTML = imgSelectivityHtml(rec); imgBindSelectivity(rec); imgDrawOverlay(rec);
+  });
+  const q = $("#sel-quiet");
+  if (q) q.addEventListener("change", (e) => {
+    st.quietMax = Number(e.target.value);
+    $("#sel-body").innerHTML = imgSelectivityHtml(rec); imgBindSelectivity(rec);
+  });
+  const c = $("#sel-csv");
+  if (c) c.addEventListener("click", () => {
+    const dep = PrismImg.modulationDepth(st.traces, st.blank);
+    const sel = PrismImg.selectivity(st.rois, dep, st.target, { quietMax: st.quietMax });
+    const rows = [["roi", "x", "y", "dist_from_target_px", "is_target", "depth", "depth_is_lower_bound", "max_flux", "min_flux"]];
+    sel.rows.forEach((r) => {
+      const p = st.rois[r.roi];
+      rows.push([r.roi, fmt(p.xc != null ? p.xc : p.x, 6), fmt(p.yc != null ? p.yc : p.y, 6),
+        fmt(r.dist, 5), r.isTarget, r.depth, r.isLowerBound,
+        st.traces[r.roi][dep[r.roi].kMax], st.traces[r.roi][dep[r.roi].kMin]]);
+    });
+    downloadText(rec.name.replace(/\.h5$/i, "") + "_selectivity.csv", rowsToCsv(rows), "text/csv");
+  });
+}
 
 </script>
 </body>
