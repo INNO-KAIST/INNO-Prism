@@ -301,7 +301,7 @@ select[multiple] { background: var(--surface-2); color: var(--text-primary); bor
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.14.0</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.17.1</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -35107,6 +35107,67 @@ function levenbergMarquardt(residFn, theta0, lo, hi, opts) {
 }
 
 /* ----------------------- beam profile (2D Gaussian) ------------------------ */
+/* ---------------- v3.15 · 비닝 배수 선택 (2-pass) --------------------------
+ * 문제: 이전 규칙 `f = ceil(max(W,H)/320)` 은 **원본 크기만** 보고 긴 변을 늘 ~320 px 로
+ * 줄였다. 빔이 실제로 몇 화소인지는 보지 않는다. 그래서 같은 빔이라도 촬영 경로에 따라
+ * 전혀 다른 값이 나왔다 — 260921 실측에서 **같은 빔을 1:1 원본과 3× 화면캡쳐에서
+ * ×2.466 다르게** 쟀다.
+ *
+ * 기전: 비닝은 폭 f 의 box convolution 이므로 σ_meas² ≈ σ_true² + f²/12.
+ * 스팟이 f 에 가까워지면 측정되는 것은 빔이 아니라 box 다. 실측에서 f 에 따라 A_peak 가
+ * 1.370 → 2.942 µm² 로 단조 증가한 것이 그 서명이다.
+ *
+ * 왜 지금까지 안 드러났나: 옛 파일은 1360×1024 캔버스에 **3× 확대된 뷰**였다. f=5 는
+ * 같았지만 빔이 화소 기준 3배 커서 샘플링 FWHM ≈ 4.1 px 로 간신히 버텼다.
+ * **규칙이 조용히 확대본에 맞춰져 있었다.**
+ *
+ * 해법: 보수적인 1차 비닝으로 스팟 크기를 먼저 재고, box 분산을 역보정해 원해상도
+ * FWHM 을 추정한 뒤, 비닝 후에도 targetFwhm 이상이 남도록 f 를 고른다.
+ * 이전 규칙은 **상한**으로만 남긴다 — 더 잘게 비닝하지는 않으므로 비용·메모리가
+ * 나빠지지 않고, 1차 피팅이 실패하면 그대로 후퇴한다.
+ *
+ * 실측 검증(260921): 1:1 원본 → f=1 (A_peak 1.370, f=1 과 일치),
+ * 3× 화면캡쳐 모사 → f=3 (1.323) — 두 경로 불일치가 ×2.466 → **×1.036** 으로 수렴.
+ */
+const BIN_TARGET_FWHM = 6;   // 비닝 후 확보할 최소 샘플링 FWHM (px)
+/** f×f box 평균. NaN(주석·포화 마스크)은 제외하고, bin 전체가 NaN 이면 NaN 을 남긴다. */
+function binDown(src, w0, h0, f) {
+  if (f === 1) return { w: w0, h: h0, data: src };
+  const w = Math.floor(w0 / f), h = Math.floor(h0 / f), o = new Float64Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let sum = 0, cnt = 0;
+    for (let dy = 0; dy < f; dy++) for (let dx = 0; dx < f; dx++) {
+      const v = src[(y * f + dy) * w0 + (x * f + dx)];
+      if (isFinite(v)) { sum += v; cnt++; }
+    }
+    o[y * w + x] = cnt ? sum / cnt : NaN;
+  }
+  return { w, h, data: o };
+}
+/**
+ * 반환: {f, by:"spot"|"cap"|"fallback", fCap, f0, fwhmFull}
+ *   by="spot"     스팟 크기로 정함 (정상 경로)
+ *   by="cap"      상한 규칙에 걸림 (스팟이 충분히 커서 더 줄여도 되지만 상한을 지킴)
+ *   by="fallback" 1차 피팅 실패 → 이전 규칙 그대로
+ */
+function chooseBinFactor(src, w0, h0, opts) {
+  const o = Object.assign({ satLevel: Infinity, targetFwhm: BIN_TARGET_FWHM, cap: null }, opts || {});
+  const fCap = isFinite(o.cap) && o.cap >= 1 ? Math.floor(o.cap) : Math.max(1, Math.ceil(Math.max(w0, h0) / 320));
+  if (fCap === 1) return { f: 1, by: "cap", fCap, f0: 1 };
+  // 1차는 보수적으로 (상한의 약 절반 해상도) — 여기서 실패하면 이전 규칙으로 후퇴한다
+  const f0 = Math.max(1, Math.min(fCap, Math.ceil(Math.max(w0, h0) / 640)));
+  let p1 = null;
+  try { p1 = fitBeam(binDown(src, w0, h0, f0), { satLevel: o.satLevel }); }
+  catch (e) { p1 = null; }
+  if (!p1 || !p1.success || !isFinite(p1.sx) || !isFinite(p1.sy)) return { f: fCap, by: "fallback", fCap, f0 };
+  const sMin = Math.min(p1.sx, p1.sy) * f0;                             // 원해상도 px 로 환산
+  const sTrue = Math.sqrt(Math.max(sMin * sMin - f0 * f0 / 12, 1e-6));  // box 분산 역보정
+  const fwhmFull = 2.3548 * sTrue;
+  const fSpot = Math.floor(fwhmFull / o.targetFwhm);
+  const f = Math.max(1, Math.min(fCap, fSpot));
+  return { f, by: fSpot >= fCap ? "cap" : "spot", fCap, f0, fwhmFull };
+}
+
 /**
  * Rotated elliptical 2D Gaussian + constant background:
  *   I(x,y) = B + A·exp(−[a·dx² + 2b·dx·dy + c·dy²]),  dx=x−x0, dy=y−y0
@@ -35905,8 +35966,8 @@ const SEG_MIN = 40;           // 배경 구간 최소 길이 (px)
 const LIN_MIN_DECADES = 0.8;  // 신호 동적범위 최소 (dec)
 const LIN_R2_MIN = 0.85;      // 아핀 모델(Var = a + b·m) 적합 하한
 const LIN_VAR_RATIO_MIN = 2;  // 분산이 이 배수 이상 변해야 기울기 부호를 신뢰할 수 있다
-const LIN_SIGMA_MIN = 0.45;   // σ̂ 가 이보다 작으면 8bit 양자화 지배 → 폐기
-const QUANT_VAR = 1 / 12;     // 8-bit 양자화 분산 바닥
+const LIN_SIGMA_MIN = 0.45;   // σ̂ 가 (양자화 계단의) 이 배수보다 작으면 양자화 지배 → 폐기
+const QUANT_VAR = 1 / 12;     // 계단 1 의 양자화 분산 바닥 (균일분포)
 
 function qMedian(a) {
   if (!a.length) return NaN;
@@ -35961,7 +36022,7 @@ function accumVariogram(getLine, getMask, nLines, lineLen, dmax, acc, cnt, strid
 function estimateUpscale(gray, w, h) {
   const fin = [];
   for (let i = 0; i < gray.length; i++) if (isFinite(gray[i])) fin.push(gray[i]);
-  if (fin.length < 5000) return { ok: false, reason: "유효 픽셀 부족" };
+  if (fin.length < 5000) return { ok: false, applicable: false, reason: "유효 픽셀 부족" };
   /* 배경 선택은 **흐린 영상** 위에서 한다. 원본에서 분위수로 자르면 균일한 배경이
    * 문턱을 가로질러 얼룩덜룩해져 연속 구간이 끊기고, 문턱을 느슨하게 하면 빔 날개가
    * 섞여 그 매끄러운 구조가 variogram 의 tail 을 부풀려 L 을 과대평가한다.
@@ -36149,7 +36210,15 @@ function collectD4(gray, w, h, D, S, black, bins, loM, hiM, NB) {
   }
 }
 
-function estimateLinearity(gray, w, h, upscaleL) {
+/* v3.17 — `quantStep` 은 0–255 환산 후의 **실제 양자화 계단**이다.
+ * 8-bit canvas 경로면 1, 12-bit TIFF 를 0–255 로 환산했으면 0.0623.
+ * 이걸 1 로 고정해 두면 12-bit 자료에서 분산 바닥을 **256배 과다 차감**하고
+ * (v = s1² − 1/12), 멀쩡한 빈을 σ 문턱으로 대량 폐기한다. 계조를 살려 읽어 온
+ * 의미가 거기서 사라진다. */
+function estimateLinearity(gray, w, h, upscaleL, quantStep) {
+  const qStep = isFinite(quantStep) && quantStep > 0 ? quantStep : 1;
+  const sigMin = LIN_SIGMA_MIN * qStep;
+  const quantVar = QUANT_VAR * qStep * qStep;
   const D = Math.max(1, Math.round(isFinite(upscaleL) ? upscaleL : 1));
   const fin = [];
   for (let i = 0; i < gray.length; i++) if (isFinite(gray[i]) && gray[i] < 250) fin.push(gray[i]);
@@ -36159,10 +36228,10 @@ function estimateLinearity(gray, w, h, upscaleL) {
 
   const sig = [];
   for (let i = 0; i < S.length; i++) { const m = S[i] - black; if (m > 0.5 && isFinite(m)) sig.push(m); }
-  if (sig.length < 600) return { ok: false, reason: "신호 픽셀 부족" };
+  if (sig.length < 600) return { ok: false, applicable: false, reason: "신호 픽셀 부족" };
   const loM = Math.max(0.5, qPercentile(sig, 0.10)), hiM = qPercentile(sig, 0.999);
   const dec = Math.log10(hiM / loM);
-  if (!(dec >= LIN_MIN_DECADES)) return { ok: false, reason: `신호 동적범위 부족 (${dec.toFixed(2)} dec < ${LIN_MIN_DECADES})`, decades: dec };
+  if (!(dec >= LIN_MIN_DECADES)) return { ok: false, applicable: false, reason: `신호 동적범위 부족 (${dec.toFixed(2)} dec < ${LIN_MIN_DECADES})`, decades: dec };
 
   const NB = 8;
   const b1 = [], b2 = [];
@@ -36171,19 +36240,22 @@ function estimateLinearity(gray, w, h, upscaleL) {
   collectD4(gray, w, h, 2 * D, S, black, b2, loM, hiM, NB);
 
   const pts = [];
+  /* v3.16 — 빈이 **왜** 폐기됐는지 센다. "잴 수 없었다"와 "재 봤더니 이상하다"를
+   * 가르는 근거가 바로 이 분포다 (아래 verdict 분기에서 쓴다). */
+  let nDropSigma = 0, nDropStruct = 0, nDropCount = 0;
   for (let i = 0; i < NB; i++) {
-    if (b1[i].length < LIN_BIN_MIN || b2[i].length < LIN_BIN_MIN) continue;
+    if (b1[i].length < LIN_BIN_MIN || b2[i].length < LIN_BIN_MIN) { nDropCount++; continue; }
     const s1 = sigmaFromD4(b1[i]), s2 = sigmaFromD4(b2[i]);
-    if (!isFinite(s1) || !isFinite(s2)) continue;
-    if (!(s1 > 0)) continue;
-    if (s2 / s1 > LIN_STRUCT_MAX) continue;            // 매끄러운 구조 오염 → 폐기
-    if (s1 < LIN_SIGMA_MIN) continue;                  // 양자화 바닥 지배 → 폐기
-    const v = s1 * s1 - QUANT_VAR;
+    if (!isFinite(s1) || !isFinite(s2)) { nDropCount++; continue; }
+    if (!(s1 > 0)) { nDropCount++; continue; }
+    if (s2 / s1 > LIN_STRUCT_MAX) { nDropStruct++; continue; }   // 매끄러운 구조 오염(리샘플 등) → 폐기
+    if (s1 < sigMin) { nDropSigma++; continue; }                 // 양자화 바닥 지배 → 폐기
+    const v = s1 * s1 - quantVar;
     if (!(v > 0)) continue;
     const m = loM * Math.pow(hiM / loM, (i + 0.5) / NB);
     pts.push({ m, v, n: b1[i].length });
   }
-  if (pts.length < 4) return { ok: false, reason: `유효 밝기 빈 부족 (${pts.length}) — 구조 오염 또는 표본 부족` };
+  if (pts.length < 4) return { ok: false, applicable: false, reason: `유효 밝기 빈 부족 (${pts.length}) — 구조 오염 또는 표본 부족` };
 
   /* 선형 검출기의 물리 모델은 멱법칙이 아니라 **아핀**이다:
    *     Var(I) = g·I + σ_read²  =  (g·black + σ_read²) + g·m,   m = I − black
@@ -36201,7 +36273,7 @@ function estimateLinearity(gray, w, h, upscaleL) {
     Sw += wt; Sx += wt * p.m; Sy += wt * p.v; Sxx += wt * p.m * p.m; Sxy += wt * p.m * p.v;
   }
   const den = Sw * Sxx - Sx * Sx;
-  if (!(Math.abs(den) > 1e-18)) return { ok: false, reason: "회귀 불능" };
+  if (!(Math.abs(den) > 1e-18)) return { ok: false, applicable: false, reason: "회귀 불능" };
   const b = (Sw * Sxy - Sx * Sy) / den;
   const a = (Sy - b * Sx) / Sw;
   let ssr = 0, sst = 0, wsum = 0, vbar = 0;
@@ -36231,15 +36303,41 @@ function estimateLinearity(gray, w, h, upscaleL) {
    * 따라서 β 가 1 을 유의하게 넘으면 a < 0 을 요구하는 셈이고, 이는 신호 0 에서
    * 분산이 음수라는 뜻이므로 어떤 선형 검출기로도 불가능하다 → 비선형 확정. */
   const superLinear = isFinite(beta) && isFinite(seBeta) && (beta - 2 * seBeta > 1);
+  /* v3.16 — "판정 보류"를 **둘로 가른다.**
+   *
+   * 집속 스팟 + 어두운 배경은 중간 밝기 화소가 구조적으로 거의 없고, 8-bit 로 깎이면
+   * 배경 σ 가 양자화 바닥(0.45 LSB) 아래로 내려간다. 그러면 이 검사는 **적용 자체가
+   * 불가능**하다 — 자료가 나쁜 게 아니라 이 방법이 이 종류의 영상에 맞지 않는 것이다.
+   * 그런데 출력이 "톤커브가 의심스럽다"와 구분되지 않아서, γ=0.33 으로 제대로 찍은
+   * 정상 파일이 `clean:false` 로 떨어지고 무결성 OK 배지가 **영원히 뜨지 않았다.**
+   * 허위 경보는 진짜 경고를 죽인다(v3.13 dichroic 가드에서 채택한 원칙).
+   *
+   *   not-applicable : 구조적으로 잴 수 없음 (read noise 지배 · 양자화 바닥)
+   *                    → issue 가 아니다. notes 로만 알린다.
+   *   indeterminate  : 쟀는데 결과가 이상함 (아핀 적합 불량 · 분산 변동 부족)
+   *                    → 실제 의심이므로 issue 로 올린다.
+   *
+   * 가르는 기준은 `increasing` 이다: 분산이 밝기에 따라 유의하게 늘지 **않으면**
+   * 기울기 자체가 식별되지 않은 것이므로 아무것도 판정할 수 없다. 늘긴 하는데
+   * 적합이 나쁘거나 변동이 작은 것은 자료가 무언가를 말하고 있는 것이다. */
+  /* 이 함수는 **잰 것만 보고한다.** "적용 불가인가"는 업스케일·블록압축 판정까지
+   * 함께 봐야 정해지므로 imageIntegrity 가 결정한다 (§v3.16).
+   * 여기서는 보류의 **종류**만 분류해 올린다. */
   const verdict = (decreasing || superLinear) ? "nonlinear"
     : (increasing && r2 >= LIN_R2_MIN && varRatio >= LIN_VAR_RATIO_MIN) ? "linear"
     : "indeterminate";
+  const indeterminateKind = verdict !== "indeterminate" ? null
+    : !increasing ? "no-slope"                                   // 기울기 자체가 식별되지 않음
+    : varRatio < LIN_VAR_RATIO_MIN ? "low-var-ratio"
+    : "poor-fit";
   const why = verdict !== "indeterminate" ? null
-    : !increasing ? "분산이 밝기에 거의 무관 — read noise 지배와 완만한 톤커브를 구분할 수 없음"
-    : varRatio < LIN_VAR_RATIO_MIN ? `분산 변동 부족 (${varRatio.toFixed(2)}배)`
+    : indeterminateKind === "no-slope" ? "분산이 밝기에 거의 무관 — read noise 지배와 완만한 톤커브를 구분할 수 없음"
+    : indeterminateKind === "low-var-ratio" ? `분산 변동 부족 (${varRatio.toFixed(2)}배)`
     : `아핀 모델 적합 불량 (R²=${r2.toFixed(3)}) — 톤커브 의심`;
   return { ok: true, _pts: pts, a, b, seB, r2, beta, seBeta, superLinear, bins: pts.length, decades: dec, varRatio, D,
-    verdict, linear: verdict === "linear", indeterminateWhy: why };
+    verdict, linear: verdict === "linear", indeterminateKind,
+    nDropSigma, nDropStruct, nDropCount,
+    indeterminateWhy: why, why };
 }
 
 /* ------------------------------------------------------------------ 종합 */
@@ -36248,13 +36346,14 @@ function estimateLinearity(gray, w, h, upscaleL) {
  *  경우로 한정한다. 비선형(톤커브) 영상에서는 리샘플 커널과 톤커브의 상호작용으로
  *  L 이 최대 ~35% 과대평가될 수 있음이 합성 격자에서 확인되었기 때문이다
  *  (bilinear + γ≥2.2 조합). 그 경우 권고는 "원본 TIFF 재촬영" 하나뿐이다. */
-function imageIntegrity(gray, w, h) {
+function imageIntegrity(gray, w, h, opts) {
+  const quantStep = opts && isFinite(opts.quantStep) && opts.quantStep > 0 ? opts.quantStep : 1;
   const up = estimateUpscale(gray, w, h);
   const blk = up.ok && up.bgMask ? estimateBlocking(gray, w, h, up.bgMask) : { ok: false, reason: "배경 마스크 없음" };
   if (up.ok) delete up.bgMask;
   /* 블록 압축이 보이면 업스케일 배수는 신뢰할 수 없다 — 판정 보류로 낮춘다. */
   if (blk.ok && blk.blocked && up.ok) { up.confoundedByBlocking = true; up.upscaled = false; up.factor = null; }
-  const lin = estimateLinearity(gray, w, h, up.ok ? up.L : 1);
+  const lin = estimateLinearity(gray, w, h, up.ok ? up.L : 1, quantStep);
   const issues = [];
   if (blk.ok && blk.blocked)
     issues.push({ kind: "block-compression", severity: "high", ratio: blk.ratio,
@@ -36263,9 +36362,34 @@ function imageIntegrity(gray, w, h) {
     issues.push({ kind: "upscale", severity: "high", L: up.L, factor: up.factor });
   else if (!up.ok)
     issues.push({ kind: "upscale-unverified", severity: "medium", why: up.reason });
+  /* v3.16 — "잴 수 없었다"와 "재 봤더니 이상하다"를 가른다.
+   *
+   * 집속 스팟 + 어두운 배경은 중간 밝기 화소가 구조적으로 거의 없어서, 분산-밝기
+   * 기울기 자체가 식별되지 않는다(`no-slope`). 이건 자료가 수상한 게 아니라 **이 방법이
+   * 이 종류의 영상에 맞지 않는 것**이다. 그런데 출력이 "톤커브 의심"과 구분되지 않아
+   * γ=0.33 으로 제대로 찍은 정상 파일이 clean:false 로 떨어지고 무결성 OK 배지가
+   * **영원히 뜨지 않았다.** 허위 경보는 진짜 경고를 죽인다(v3.13 dichroic 가드의 원칙).
+   *
+   * 다만 `no-slope` 를 무조건 면제하면 안 된다. **리샘플·블록압축된 영상도 이웃 상관
+   * 때문에 같은 증상을 낸다** — 실제로 합성 격자 시험의 U=3 bilinear 두 건(L=2.63·3.99)이
+   * 그렇다. 그건 "적용 불가"가 아니라 바로 이 검사가 잡아야 할 조작이므로, 그 경우에는
+   * 판정 보류를 issue 로 유지한다. 즉 면제는 **1:1 무압축 영상에 한정**한다. */
+  const resampled = !!(up.ok && isFinite(up.L) && up.L > 1.5) || !!(up.ok && up.upscaled);
+  const blockedNow = !!(blk.ok && blk.blocked);
+  /* 리샘플·블록압축된 영상에서는 **검사를 못 돌린 이유가 그 조작일 수 있으므로**
+   * 면제하지 않는다. "적용 안 됨"은 무해하게 들리는데, 그 경우 무해하지 않다. */
+  const linNotApplicable = !resampled && !blockedNow
+    && (!lin.ok || (lin.verdict === "indeterminate" && lin.indeterminateKind === "no-slope"));
+  const notes = [];
   if (lin.ok && lin.verdict === "nonlinear")
     issues.push({ kind: "nonlinear", severity: "high", b: lin.b, r2: lin.r2, beta: lin.beta });
-  else if (!lin.ok || lin.verdict === "indeterminate")
+  else if (linNotApplicable)
+    notes.push({ kind: "linearity-not-applicable",
+      why: lin.ok ? lin.indeterminateWhy : lin.reason, beta: lin.ok ? lin.beta : NaN,
+      detail: lin.ok
+        ? "집속 스팟처럼 중간 밝기 화소가 거의 없는 영상에서는 분산-밝기 기울기가 식별되지 않습니다. 톤커브가 있다는 뜻도, 없다는 뜻도 아닙니다."
+        : "검사를 돌릴 표본 자체가 부족합니다." });
+  else
     issues.push({ kind: "linearity-unverified", severity: "medium",
       why: lin.ok ? lin.indeterminateWhy : lin.reason, beta: lin.ok ? lin.beta : NaN });
   const blocked = blk.ok && blk.blocked;
@@ -36273,8 +36397,16 @@ function imageIntegrity(gray, w, h) {
   const scaleSuggestion = (up.ok && up.upscaled && linearOK && !blocked)
     ? { divideUmPerPxBy: up.factor, areaFactor: up.factor * up.factor }
     : null;
+  /* "검사를 통과함"과 "검사가 적용되지 않음"은 화면에서 반드시 구분돼야 한다.
+   * clean:true 만으로는 둘이 같아 보인다. */
+  const verified = {
+    upscale: !!(up.ok),
+    linearity: !!(lin.ok && (lin.verdict === "linear" || lin.verdict === "nonlinear")),
+    blocking: !!(blk.ok),
+  };
+  if (lin && typeof lin === "object") lin.applicable = !linNotApplicable;
   return {
-    upscale: up, linearity: lin, blocking: blk, issues,
+    upscale: up, linearity: lin, blocking: blk, issues, notes, verified, quantStep,
     clean: issues.length === 0,
     scaleSuggestion,
     scaleAdvisoryOnly: up.ok && up.upscaled && !linearOK,
@@ -36297,6 +36429,7 @@ return {
   detectScanMode, splitBranches,
   // beam profile
   fitGaussian2D, beamMetrics, isolateMainBlob, splitTouchingBlobs, removeStreaks, fitBeam,
+  chooseBinFactor, binDown,
   momentsD4Sigma,
   // v3.10: 업로드 이미지 무결성 (업스케일·선형성)
   imageIntegrity, estimateUpscale, estimateLinearity, estimateBlocking,
@@ -41894,6 +42027,238 @@ return {
 });
 
 </script>
+<!-- minimal TIFF decoder (16-bit path, canvas 우회) -->
+<script>
+/* =============================================================================
+ * INNO Prism — 최소 TIFF 디코더 (v3.17)
+ *
+ * 왜 만드나: 브라우저 canvas 는 TIFF 를 디코드하지 못하고, 설령 된다 해도
+ * `getImageData` 는 **채널당 8-bit** 다. 새 촬영 표준이 16-bit TIFF 인데
+ * v3.16 까지는 파일 선택 대화상자에서 고를 수는 있고 **그 다음에 실패**했다.
+ *
+ * 8-bit 로 깎이는 실측 비용 (260921, 같은 파일, f=1):
+ *     Gaussian A_peak   1.3700 → 1.1206 µm²   (+22.3 % 부풀림)
+ *     d4sAreaRatio      2.600  → 4.052        (−35.8 %)
+ *     fit R²            0.794  → 0.854
+ * 원인: 12-bit 기준 양자화 계단 16 ADU 가 이 카메라 read noise(1.89 ADU, photon
+ * transfer curve 실측)의 **8.4배**. 꼬리가 한두 계단으로 뭉개진다.
+ *
+ * 범위: 대상 파일 형식이 매우 단순하므로 거기에 맞춘다 —
+ *   · II/MM 양쪽 바이트 순서
+ *   · Compression 1 (무압축) 만. LZW·PackBits·JPEG 은 **거부하고 이유를 말한다**
+ *     (조용히 틀린 값을 내느니 안 읽는 게 낫다)
+ *   · BitsPerSample 8 / 16 / 32(float)
+ *   · SamplesPerPixel 1(Gray) / 3(RGB) / 4(RGBA)
+ *   · PlanarConfiguration 1 (chunky) · 다중 strip 허용
+ *   · SampleFormat 1(uint) / 2(int) / 3(float)
+ *
+ * 반환값의 `data` 는 **0–255 로 환산된 Float64Array** 다. 원본 계조를 8-bit 로
+ * 깎는 것이 아니라 **소수점을 살린 채** 스케일만 맞추는 것이다(12-bit 값 1 은
+ * 0.0623 이 된다). 이렇게 해야 하류(감마 되돌리기·주석 검출·무결성 검사)가
+ * 8-bit 전제로 쓴 상수들을 그대로 쓰면서도 계조는 잃지 않는다.
+ * 양자화 계단이 달라지는 것만 `quantStep` 으로 함께 넘긴다.
+ * ========================================================================== */
+"use strict";
+(function (root, factory) {
+  const api = factory();
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  else root.PrismTiff = api;
+})(typeof self !== "undefined" ? self : this, function () {
+
+const TAG = {
+  ImageWidth: 256, ImageLength: 257, BitsPerSample: 258, Compression: 259,
+  Photometric: 262, StripOffsets: 273, SamplesPerPixel: 277, RowsPerStrip: 278,
+  StripByteCounts: 279, PlanarConfig: 284, SampleFormat: 339, Predictor: 317,
+};
+const TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 };
+const COMPRESSION_NAME = {
+  1: "없음", 2: "CCITT G3 1D", 5: "LZW", 6: "구형 JPEG", 7: "JPEG",
+  8: "Deflate", 32773: "PackBits", 32946: "Deflate",
+};
+
+/** 이 버퍼가 TIFF 인가 (매직만 본다 — 확장자를 믿지 않는다) */
+function isTiff(buf) {
+  if (!buf || buf.byteLength < 8) return false;
+  const v = new DataView(buf.buffer !== undefined && buf.byteLength !== undefined && !(buf instanceof ArrayBuffer)
+    ? buf.buffer : buf, buf instanceof ArrayBuffer ? 0 : (buf.byteOffset || 0), 8);
+  const b0 = v.getUint8(0), b1 = v.getUint8(1);
+  if (b0 === 0x49 && b1 === 0x49) return v.getUint16(2, true) === 42;
+  if (b0 === 0x4d && b1 === 0x4d) return v.getUint16(2, false) === 42;
+  return false;
+}
+
+function readEntryValues(dv, le, off, type, count) {
+  const sz = TYPE_SIZE[type] || 1;
+  const total = sz * count;
+  const base = total <= 4 ? off + 8 : dv.getUint32(off + 8, le);
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const o = base + i * sz;
+    switch (type) {
+      case 1: case 7: out.push(dv.getUint8(o)); break;
+      case 2: out.push(dv.getUint8(o)); break;
+      case 3: out.push(dv.getUint16(o, le)); break;
+      case 4: out.push(dv.getUint32(o, le)); break;
+      case 5: out.push(dv.getUint32(o, le) / (dv.getUint32(o + 4, le) || 1)); break;
+      case 6: out.push(dv.getInt8(o)); break;
+      case 8: out.push(dv.getInt16(o, le)); break;
+      case 9: out.push(dv.getInt32(o, le)); break;
+      case 11: out.push(dv.getFloat32(o, le)); break;
+      case 12: out.push(dv.getFloat64(o, le)); break;
+      default: out.push(dv.getUint8(o));
+    }
+  }
+  return out;
+}
+
+/** 값들의 최대공약수 → "8-bit 를 16-bit 컨테이너에 다시 저장한 파일" 검출용 */
+function gcdOfSamples(read, n, stride) {
+  const g2 = (a, b) => { while (b) { const t = a % b; a = b; b = t; } return a; };
+  let g = 0, seen = 0;
+  for (let i = 0; i < n && seen < 20000; i += stride) {
+    const v = read(i);
+    if (!isFinite(v) || v <= 0 || v !== Math.floor(v)) continue;
+    g = g2(g, v); seen++;
+    if (g === 1) return 1;
+  }
+  return g || 1;
+}
+
+/**
+ * 디코드. 실패하면 **이유가 담긴 Error** 를 던진다 — 일반 예외 메시지만 나오면
+ * 사용자는 무엇을 해야 할지 알 수 없다.
+ * 반환: {w, h, data(Float64 0–255 gray), rgb?, samples, bitsPerSample, sampleFormat,
+ *        photometric, compression, fullScaleNative, effectiveBits, quantStep,
+ *        containerBits, maxNative, gcd}
+ */
+function decodeTiff(input) {
+  const ab = input instanceof ArrayBuffer ? input : input.buffer;
+  const byteOff = input instanceof ArrayBuffer ? 0 : (input.byteOffset || 0);
+  const len = input instanceof ArrayBuffer ? input.byteLength : input.byteLength;
+  if (len < 8) throw new Error("TIFF: 파일이 너무 작습니다");
+  const dv = new DataView(ab, byteOff, len);
+  const b0 = dv.getUint8(0), b1 = dv.getUint8(1);
+  let le;
+  if (b0 === 0x49 && b1 === 0x49) le = true;
+  else if (b0 === 0x4d && b1 === 0x4d) le = false;
+  else throw new Error("TIFF 가 아닙니다 (바이트 순서 표식 없음)");
+  if (dv.getUint16(2, le) !== 42) throw new Error("TIFF: 버전 표식이 42 가 아닙니다 (BigTIFF 는 지원하지 않습니다)");
+
+  const ifd = dv.getUint32(4, le);
+  if (ifd + 2 > len) throw new Error("TIFF: IFD 오프셋이 파일 밖입니다");
+  const nEnt = dv.getUint16(ifd, le);
+  const tags = {};
+  for (let i = 0; i < nEnt; i++) {
+    const off = ifd + 2 + i * 12;
+    if (off + 12 > len) break;
+    const tag = dv.getUint16(off, le), type = dv.getUint16(off + 2, le), count = dv.getUint32(off + 4, le);
+    try { tags[tag] = readEntryValues(dv, le, off, type, Math.min(count, 1 << 20)); } catch (e) { /* 손상 항목 무시 */ }
+  }
+  const one = (t, d) => (tags[t] && tags[t].length ? tags[t][0] : d);
+  const w = one(TAG.ImageWidth), h = one(TAG.ImageLength);
+  if (!(w > 0 && h > 0)) throw new Error("TIFF: 이미지 크기를 읽을 수 없습니다");
+
+  const comp = one(TAG.Compression, 1);
+  if (comp !== 1) {
+    throw new Error(`TIFF 압축 방식 ${COMPRESSION_NAME[comp] || comp} 은 아직 지원하지 않습니다 — ` +
+      `저장할 때 "압축 없음(uncompressed)" 으로 내보내 주세요. ` +
+      `(잘못 읽느니 읽지 않습니다 — 압축을 무시하고 해석하면 조용히 틀린 값이 나옵니다.)`);
+  }
+  const planar = one(TAG.PlanarConfig, 1);
+  if (planar !== 1) throw new Error("TIFF: PlanarConfiguration 2(분리 평면)는 아직 지원하지 않습니다");
+  const spp = one(TAG.SamplesPerPixel, 1);
+  const bpsArr = tags[TAG.BitsPerSample] || [8];
+  const bps = bpsArr[0];
+  if (!bpsArr.every((v) => v === bps)) throw new Error(`TIFF: 채널별 비트수가 다릅니다 (${bpsArr.join(",")})`);
+  if (![8, 16, 32].includes(bps)) throw new Error(`TIFF: BitsPerSample ${bps} 는 지원하지 않습니다 (8 · 16 · 32)`);
+  const sf = (tags[TAG.SampleFormat] && tags[TAG.SampleFormat][0]) || 1;
+  if (bps === 32 && sf !== 3) throw new Error("TIFF: 32-bit 은 float(SampleFormat 3) 만 지원합니다");
+  const photometric = one(TAG.Photometric, spp >= 3 ? 2 : 1);
+  const pred = one(TAG.Predictor, 1);
+  if (pred !== 1) throw new Error(`TIFF: Predictor ${pred} 는 아직 지원하지 않습니다`);
+
+  const offsets = tags[TAG.StripOffsets] || [];
+  const counts = tags[TAG.StripByteCounts] || [];
+  if (!offsets.length) throw new Error("TIFF: StripOffsets 가 없습니다 (타일 TIFF 는 지원하지 않습니다)");
+  const rowsPerStrip = one(TAG.RowsPerStrip, h);
+  const bytesPerSample = bps / 8;
+  const rowBytes = w * spp * bytesPerSample;
+
+  // strip 들을 하나로 잇는다
+  const need = rowBytes * h;
+  const flat = new Uint8Array(need);
+  let wrote = 0;
+  for (let si = 0; si < offsets.length; si++) {
+    const so = offsets[si];
+    const rows = Math.min(rowsPerStrip, h - si * rowsPerStrip);
+    if (rows <= 0) break;
+    const want = rowBytes * rows;
+    const have = counts.length > si ? counts[si] : want;
+    const take = Math.min(want, have, len - so);
+    if (so < 0 || so >= len || take <= 0) throw new Error(`TIFF: strip ${si} 오프셋이 파일 밖입니다`);
+    flat.set(new Uint8Array(ab, byteOff + so, take), wrote);
+    wrote += take;
+  }
+  if (wrote < need) throw new Error(`TIFF: 화소 자료가 부족합니다 (${wrote} / ${need} 바이트)`);
+
+  const sdv = new DataView(flat.buffer, flat.byteOffset, flat.byteLength);
+  const readSample = (i) => {
+    const o = i * bytesPerSample;
+    if (bps === 8) return sf === 2 ? sdv.getInt8(o) : sdv.getUint8(o);
+    if (bps === 16) return sf === 2 ? sdv.getInt16(o, le) : sdv.getUint16(o, le);
+    return sdv.getFloat32(o, le);
+  };
+  const nSamples = w * h * spp;
+
+  // 원본 최대값 · 유효 비트깊이
+  let maxNative = -Infinity, minNative = Infinity;
+  for (let i = 0; i < nSamples; i++) { const v = readSample(i); if (v > maxNative) maxNative = v; if (v < minNative) minNative = v; }
+  const containerFull = bps === 32 ? (maxNative > 0 ? maxNative : 1) : (Math.pow(2, bps) - 1);
+  const stride = Math.max(1, Math.floor(nSamples / 20000));
+  const gcd = bps === 32 ? 1 : gcdOfSamples(readSample, nSamples, stride);
+  /* 유효 비트깊이: 모든 값이 g 의 배수면 실제 계조는 containerFull/g 단계뿐이다.
+   * 예) 12-bit 값을 <<4 해서 16-bit 로 저장한 파일 → g=16 → 유효 12-bit.
+   * "8-bit 를 16-bit 로 다시 저장한 파일"을 이걸로 가려낸다. */
+  const fullScaleNative = bps === 32 ? containerFull : Math.floor(containerFull / gcd) * gcd;
+  const effectiveBits = bps === 32 ? 32 : Math.round(Math.log2(containerFull / gcd + 1));
+
+  // 0–255 로 환산 (계조는 소수점으로 유지)
+  const scale = 255 / (fullScaleNative || 1);
+  const data = new Float64Array(w * h);
+  let rgb = null;
+  if (spp === 1) {
+    for (let i = 0; i < w * h; i++) data[i] = readSample(i) * scale;
+  } else {
+    rgb = { r: new Float64Array(w * h), g: new Float64Array(w * h), b: new Float64Array(w * h) };
+    for (let i = 0; i < w * h; i++) {
+      const o = i * spp;
+      const r = readSample(o) * scale, g = readSample(o + 1) * scale, bb = readSample(o + 2) * scale;
+      rgb.r[i] = r; rgb.g[i] = g; rgb.b[i] = bb;
+      // canvas 경로와 **같은** 휘도 가중치를 쓴다 (두 경로의 값이 비교 가능해야 한다)
+      data[i] = 0.2126 * r + 0.7152 * g + 0.0722 * bb;
+    }
+  }
+  if (photometric === 0) {   // WhiteIsZero
+    for (let i = 0; i < data.length; i++) data[i] = 255 - data[i];
+    if (rgb) for (const k of ["r", "g", "b"]) for (let i = 0; i < rgb[k].length; i++) rgb[k][i] = 255 - rgb[k][i];
+  }
+
+  return {
+    w, h, data, rgb, samples: spp, bitsPerSample: bps, sampleFormat: sf,
+    photometric, compression: comp, littleEndian: le, nStrips: offsets.length,
+    containerBits: bps, maxNative, minNative, gcd,
+    fullScaleNative, effectiveBits,
+    // 0–255 환산 후의 양자화 계단. 하류 잡음 모델이 1 LSB 를 가정하므로 함께 넘긴다.
+    quantStep: bps === 32 ? 0 : (255 * gcd) / (fullScaleNative || 1),
+    // 포화 문턱 — 8-bit 의 254 와 같은 보수성 (full scale 한 계단 아래)
+    satLevel: 255 * (fullScaleNative - gcd) / (fullScaleNative || 1),
+  };
+}
+
+return { isTiff, decodeTiff, TAG, COMPRESSION_NAME };
+});
+
+</script>
 <!-- widefield imaging numeric layer -->
 <script>
 /* =============================================================================
@@ -42832,6 +43197,13 @@ const App = {
      * 얻은 A_peak 를 다른 채널 측정에 그대로 쓰는 사고가 조용히 일어난다
      * (실제로 600 DMSP 빔 면적으로 NIR 문턱을 계산해 1.38배 틀린 적이 있다).
      * 값만 저장하면 막을 수 없으므로 **출처를 기록하고 파일명과 대조**한다. */
+    /* v3.16 — **촬영측** 감마. displayGamma(되돌리기)와 짝이지만 다른 값이다.
+     * 260921 노출 선형성 실측으로 확정된 앵커는 둘뿐이다:
+     *   ProgRes γ 슬라이더 0.33 → 선형 (되돌릴 것 없음, displayGamma = 1)
+     *   ProgRes γ 슬라이더 0.50 → γ 2.01–2.06 (displayGamma ≈ 2.0)
+     * **다른 슬라이더 값으로 외삽하지 않는다** — 앵커가 두 개뿐이므로 그 사이·바깥의
+     * 거동은 측정되지 않았다. 기록해 두면 되돌리기 값과 어긋날 때 경고할 수 있다. */
+    captureGamma: null,           // ProgRes 감마 슬라이더 값 ("" = 미기록)
     dichroic: "",                 // 자유 입력 라벨 (예: "950 DMSP")
     beamChannel: "",              // "" = 미기록 | Blue | NIR | UV | VIS
     enabled: false,
@@ -43331,7 +43703,17 @@ function lensInfoHtml(c) {
       const prov = [];
       prov.push(`µm/px ${fmt(calibEffUmPerPx(), 4)} <span class="muted">(${nominal ? "공칭" : "실측"})</span>`);
       if (gamOn) prov.push(`γ=${fmt(c.displayGamma, 3)} 되돌림`);
-      if (q && q.clean) prov.push(`<span class="tag-High">무결성 OK</span>`);
+      /* v3.16 — clean:true 만으로는 "검사를 통과함"과 "검사가 적용되지 않음"이 같아 보인다.
+       * verified 로 무엇이 실제로 확인됐는지 구분해 표시한다. */
+      if (q && q.clean) {
+        const v = q.verified || {};
+        const unver = [];
+        if (v.linearity === false) unver.push("선형성");
+        if (v.upscale === false) unver.push("업스케일");
+        prov.push(unver.length
+          ? `<span class="tag-High">무결성 OK</span><span class="muted" title="${esc(unver.join("·"))} 검사는 이 영상에 적용되지 않았습니다 — 통과한 것이 아니라 잴 수 없었다는 뜻입니다">(${esc(unver.join("·"))} 미검증)</span>`
+          : `<span class="tag-High">무결성 OK</span>`);
+      }
       diag += ` · 측정 ${fmt(meas, 3)} µm <b class="${cls}">(×${fmt(r, 3)})</b> — <span class="${cls}">${msg}</span>` +
         `<br><span class="muted">근거: ${prov.join(" · ")}</span>`;
     }
@@ -43414,9 +43796,16 @@ function integrityHtml(q, imgW) {
   } else if (lin && lin.ok && lin.verdict === "linear") {
     bits.push(`<span class="tag-High">선형성 정합 (Var ∝ 신호, R²=${fmt(lin.r2, 3)})</span>` +
       `<span class="muted"> — γ ≲ 1.6 의 완만한 톤커브는 이 검사로 배제되지 않는다</span>`);
+  } else if (lin && lin.applicable === false) {
+    /* v3.16 — **적용 불가**와 **판정 보류**는 다른 말이다.
+     * 적용 불가는 "이 영상으로는 잴 수 없다"이지 "수상하다"가 아니다. 같은 문구로
+     * 쓰면 정상 파일에서도 경고가 떠서 진짜 경고가 묻힌다. */
+    const why = lin.ok ? lin.indeterminateWhy : lin.reason;
+    bits.push(`<span class="muted">선형성 검사 적용 안 됨</span><span class="muted"> — ${esc(why || "")}.` +
+      ` 톤커브가 있다는 뜻도, 없다는 뜻도 아니다 — 확인하려면 빔을 일부러 디포커스해 넓게 편 프레임을 한 번 찍으면 된다</span>`);
   } else {
     const why = lin && lin.ok ? lin.indeterminateWhy : (lin ? lin.reason : "");
-    bits.push(`<span class="tag-Low">선형성 판정 불가</span><span class="muted"> ${esc(why || "")}` +
+    bits.push(`<span class="tag-Low">선형성 판정 보류</span><span class="muted"> ${esc(why || "")}` +
       ` — 확인하려면 빔을 일부러 디포커스해 넓게 편 프레임을 한 번 찍으면 된다</span>`);
   }
   if (q.action) bits.push(`<b>${esc(q.action)}</b>`);
@@ -43465,12 +43854,21 @@ function beamBasisCompareHtml(c) {
     const er = b.enclosedRatio;
     const cls2 = er > 2 ? "tag-Poor" : er > 1.3 ? "tag-Low" : "tag-High";
     const g = b.growth.map((q) => `${q.kSigma}σ:${fmt(q.ratio, 3)}`).join(" · ");
+    /* v3.17.1 — enclosedRatio 는 **적합 상대량**이다: 조리개 반경이 적합된 σ 에 비례하고
+     * (R = kσ·√(σx σy)), 분모인 core flux 도 적합된 A·σx·σy 다. 즉 분자와 분모가 **둘 다**
+     * 적합에 따라 움직인다. 같은 빔이라도 감마 되돌리기 하나로 σ 가 바뀌면 이 값이 바뀌고,
+     * 그 변화의 방향은 빔마다 다르다(실측: 한 빔은 3.074→3.588 로 늘었다).
+     * 따라서 **두 세션의 enclosedRatio 를 직접 비교하면 안 된다.** 비교하려면 내보내기의
+     * growth[].rUm 을 써서 같은 물리 반경에서 읽어야 한다. */
     bits.push(`<span class="muted">─ curve of growth (core 밖 빛) ─</span>`);
     bits.push(`포함 플럭스 / core 플럭스 = <b class="${cls2}">${fmt(er, 3)}</b> (반경 ${fmt(b.growthRadiusSigma, 2)}σ)`
       + ` <span class="muted">· 성장곡선 ${g}</span>`);
     if (er > 1.3) {
       bits.push(`<span class="${cls2}">core 밖에 빛이 있습니다 — 파워밀도 식 I₀ = P/A_peak 는 <b>측정한 P 전부가 core 에 든다</b>고 가정합니다.`
         + ` 이 halo 가 <b>시료면의 실제 빛</b>이라면 peak irradiance 는 약 <b>${fmt(100 / er, 3)}%</b> (÷${fmt(er, 3)}) 로 낮춰 읽어야 합니다.`
+        + `<br><span class="muted">이 값은 <b>이 적합에 상대적</b>입니다 — 조리개 반경이 적합 σ 에 비례하므로`
+        + ` 감마·비닝이 달라진 다른 세션의 값과 직접 비교하면 안 됩니다. 비교하려면 내보내기의`
+        + ` <span class="mono">growth[].rUm</span> 으로 같은 물리 반경에서 읽으십시오.</span>`
         + ` 결상경로에서 생긴 산란/글레어라면 시료면에는 없으므로 보정하면 안 됩니다 —`
         + ` <b>레이저 차단 프레임</b>과 <b>노출시간 스케일링</b>으로 둘을 가릴 수 있습니다.</span>`);
       bits.push(`<span class="muted">이 추정은 바깥 annulus 가 halo 에 오염되어 halo 를 <b>과소</b>평가합니다`
@@ -43544,6 +43942,11 @@ function calibMetricsStale(c) {
     diffs.push(`µm/px ${fmt(st.umPerPx, 4)} → ${fmt(eff, 4)}`);
   if (gam !== st.displayGamma) diffs.push(`감마 ${st.displayGamma} → ${gam}`);
   if (bs && st.basis && bs.src !== st.basis) diffs.push(`면적 기준 ${st.basis} → ${bs.src}`);
+  /* v3.15 — 비닝 배수는 stamp 에는 있었으나 비교에서 빠져 있었다. A_peak 는 µm 스케일에
+   * 비닝 배수가 곱해져 들어가므로, 같은 파일을 다시 피팅해 f 가 바뀌면 저장된 metrics 는
+   * 더 이상 지금 조건의 값이 아니다. 이걸 비교하지 않으면 옛 면적이 조용히 남는다. */
+  const bf = (c.beam && c.beam.binFactor) || 1;
+  if (isFinite(st.binFactor) && bf !== st.binFactor) diffs.push(`비닝 ${st.binFactor}× → ${bf}×`);
   return diffs.length ? { why: diffs.join(" · ") } : null;
 }
 /* ---------------- v3.13 · dichroic ↔ 측정 채널 가드 -----------------------
@@ -43581,6 +43984,42 @@ function calibChannelCheck(rec) {
   return { state, beamCh, fileCh, dichroic: App.calib.dichroic || "" };
 }
 /** 파워 스캔 화면 상단 배너. 경고할 것이 없으면 "" 를 돌려준다. */
+/* ---------------- v3.16 · 촬영 감마 ↔ 되돌리기 감마 정합 -------------------
+ * 260921 노출 선형성 실측으로 **앵커 두 개만** 확정됐다:
+ *     ProgRes γ 0.33 → 선형        (되돌릴 것 없음 · displayGamma = 1)
+ *     ProgRes γ 0.50 → γ 2.01–2.06 (displayGamma ≈ 2.0)
+ * 그 사이나 바깥은 측정되지 않았으므로 **외삽하지 않는다** — 값을 제안하는 대신
+ * "이 값은 측정된 앵커가 아니다"라고만 말한다. 지어낸 감마로 되돌리면 폭·면적이
+ * 조용히 틀어지고, 그 틀어짐은 그래프 어디에도 나타나지 않는다.
+ * 반환: null 또는 {level:"bad"|"warn"|"ok", msg} */
+const CAPTURE_GAMMA_ANCHORS = [
+  { cap: 0.33, display: 1, label: "선형 (되돌릴 것 없음)" },
+  { cap: 0.50, display: 2.0, label: "γ ≈ 2.0 (실측 2.01–2.06)" },
+];
+function captureGammaCheck(c) {
+  const cap = Number(c.captureGamma);
+  if (!isFinite(cap) || cap <= 0) return null;
+  const disp = (isFinite(c.displayGamma) && c.displayGamma > 1) ? c.displayGamma : 1;
+  const anchor = CAPTURE_GAMMA_ANCHORS.find((a) => Math.abs(a.cap - cap) < 0.005);
+  if (!anchor) {
+    return { level: "warn", msg:
+      `슬라이더 ${fmt(cap, 3)} 은 <b>실측된 앵커가 아닙니다</b> (확정된 값은 0.33 → 선형, 0.50 → γ 2.0 둘뿐). ` +
+      `되돌리기 값을 여기서 추정하지 않습니다 — 외삽하면 폭·면적이 조용히 틀어집니다. ` +
+      `이 조건으로 노출 선형성을 먼저 재거나, 0.33 으로 다시 촬영하십시오.` };
+  }
+  if (Math.abs(disp - anchor.display) < 0.05)
+    return { level: "ok", msg: `슬라이더 ${fmt(cap, 3)} ↔ 되돌리기 γ ${fmt(disp, 3)} — 실측 앵커와 일치 (${esc(anchor.label)})` };
+  return { level: "bad", msg:
+    `슬라이더 ${fmt(cap, 3)} 이면 되돌리기 γ 는 <b>${fmt(anchor.display, 3)}</b> 이어야 하는데 지금 <b>${fmt(disp, 3)}</b> 입니다 ` +
+    `(${esc(anchor.label)}). 이대로 두면 빔 폭·면적이 그만큼 틀어집니다.` };
+}
+function captureGammaHtml(c) {
+  const q = captureGammaCheck(c);
+  if (!q) return "";
+  const cls = q.level === "bad" ? "tag-Poor" : q.level === "warn" ? "tag-Low" : "tag-High";
+  const tag = q.level === "bad" ? "불일치" : q.level === "warn" ? "미측정 조건" : "정합";
+  return `<div class="small" style="margin-top:6px;"><span class="${cls}">촬영 감마 ${tag}</span> ${q.msg}</div>`;
+}
 function calibChannelBannerHtml(rec) {
   if (!densityActive()) return "";           // 파워밀도를 안 쓰면 면적이 결과에 안 들어간다
   const q = calibChannelCheck(rec);
@@ -44174,6 +44613,10 @@ function openCalibModal() {
           <span>표시 감마 보정 γ</span>
           <input id="cb-gamma" type="number" step="0.05" min="1" max="4" style="width:96px"
                  placeholder="1 = 없음" value="${isFinite(c.displayGamma) && c.displayGamma > 1 ? c.displayGamma : ""}"></label>
+        <label class="ctl" title="촬영 당시 ProgRes 감마 슬라이더 값. 실측 확정 앵커: 0.33 = 선형(되돌릴 것 없음), 0.50 = γ 2.0. 다른 값은 측정되지 않았으므로 외삽하지 않습니다.">
+          <span>촬영 감마 (ProgRes)</span>
+          <input id="cb-capgamma" type="number" step="0.01" min="0" max="2" style="width:110px"
+                 placeholder="미기록" value="${isFinite(c.captureGamma) && c.captureGamma > 0 ? c.captureGamma : ""}"></label>
         <label class="ctl" title="이 빔 이미지를 찍을 때 광로에 끼워둔 dichroic. 라벨 그대로 적으면 됩니다 (예: 950 DMSP).">
           <span>빔 촬영 dichroic</span>
           <input id="cb-dichroic" type="text" style="width:130px" placeholder="예: 950 DMSP" value="${esc(c.dichroic || "")}"></label>
@@ -44185,6 +44628,7 @@ function openCalibModal() {
           </select></label>
       </div>
       <div id="cb-ch-note" class="small" style="margin-top:6px;"></div>
+      <div id="cb-capgamma-note">${captureGammaHtml(c)}</div>
       <div id="cb-beam-status" class="small muted" style="margin-top:6px;">${c.metrics ? "" : "이미지를 열면 자동으로 피팅됩니다."}</div>
       <div id="cb-beam-chart" class="chart" style="height:340px;display:${c.beam ? "" : "none"};"></div>
       <div id="cb-beam-out" class="small mono" style="margin-top:6px;"></div></div>
@@ -44229,6 +44673,10 @@ function openCalibModal() {
     c.umPerPxMeasured = (umEl && umEl.value !== "" && Number(umEl.value) > 0) ? Number(umEl.value) : null;
     const gmEl = back.querySelector("#cb-gamma");
     c.displayGamma = (gmEl && gmEl.value !== "" && Number(gmEl.value) > 1) ? Number(gmEl.value) : 1;
+    const cgEl = back.querySelector("#cb-capgamma");
+    c.captureGamma = (cgEl && cgEl.value !== "" && Number(cgEl.value) > 0) ? Number(cgEl.value) : null;
+    const cgNote = back.querySelector("#cb-capgamma-note");
+    if (cgNote) cgNote.innerHTML = captureGammaHtml(c);
     const dicEl = back.querySelector("#cb-dichroic");
     if (dicEl) c.dichroic = String(dicEl.value || "").trim();
     const chEl = back.querySelector("#cb-channel");
@@ -44397,7 +44845,7 @@ function openCalibModal() {
   const addBtnEl = back.querySelector("#cb-pair-add"), delBtnEl = back.querySelector("#cb-pair-del");
   if (addBtnEl) addBtnEl.addEventListener("click", () => setPairRows(c.pairRows + 1));
   if (delBtnEl) delBtnEl.addEventListener("click", () => setPairRows(c.pairRows - 1));
-  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda, #cb-umpx, #cb-gamma, #cb-dichroic, #cb-channel").forEach((el) => el.addEventListener("change", upd));
+  back.querySelectorAll(".cb-pm, .cb-end, #cb-pitch, #cb-mag, #cb-lambda, #cb-umpx, #cb-gamma, #cb-capgamma, #cb-dichroic, #cb-channel").forEach((el) => el.addEventListener("change", upd));
   fillObjSelect();
   back.querySelector("#cb-obj").addEventListener("change", () => {
     const i = Number(back.querySelector("#cb-obj").value);
@@ -44565,13 +45013,34 @@ function openCalibModal() {
     if (!file) return;
     back.querySelector("#cb-beam-status").textContent = "이미지 로드/피팅 중…";
     try {
-      const bmp = await createImageBitmap(file);
-      const cv = document.createElement("canvas");
-      cv.width = bmp.width; cv.height = bmp.height;
-      const ctx = cv.getContext("2d");
-      ctx.drawImage(bmp, 0, 0);
-      const idata = ctx.getImageData(0, 0, bmp.width, bmp.height).data;
-      const W0 = bmp.width, H0 = bmp.height;
+      /* v3.17 — TIFF 는 **canvas 를 우회한다.**
+       * 브라우저 canvas 는 TIFF 를 디코드하지 못하고, 된다 해도 getImageData 는
+       * 채널당 8-bit 다. 12-bit 자료를 8-bit 로 깎으면 실측에서 Gaussian 면적이
+       * +22.3 %, d4sAreaRatio 가 −35.8 % 틀어진다(양자화 계단 16 ADU 가 read
+       * noise 1.89 ADU 의 8.4배라 꼬리가 뭉개진다).
+       * 매직 바이트로 판정한다 — 확장자를 믿지 않는다. */
+      const abuf = await file.arrayBuffer();
+      let tif = null;
+      if (PrismTiff.isTiff(abuf)) {
+        try { tif = PrismTiff.decodeTiff(abuf); }
+        catch (te) { throw new Error(te.message); }   // 이유를 그대로 사용자에게
+      }
+      let W0, H0, idata = null, gTif = null, rgbTif = null;
+      let satLevelSrc = 254, quantStep = 1, depthNote = "";
+      if (tif) {
+        W0 = tif.w; H0 = tif.h; gTif = tif.data; rgbTif = tif.rgb;
+        satLevelSrc = tif.satLevel; quantStep = tif.quantStep;
+        depthNote = ` · <span class="tag-High">${tif.bitsPerSample}-bit TIFF 직접 읽기` +
+          (tif.effectiveBits !== tif.bitsPerSample ? ` (유효 ${tif.effectiveBits}-bit)` : "") + `</span>`;
+      } else {
+        const bmp = await createImageBitmap(file);
+        const cv = document.createElement("canvas");
+        cv.width = bmp.width; cv.height = bmp.height;
+        const ctx = cv.getContext("2d");
+        ctx.drawImage(bmp, 0, 0);
+        idata = ctx.getImageData(0, 0, bmp.width, bmp.height).data;
+        W0 = bmp.width; H0 = bmp.height;
+      }
       // --- 측정 오버레이(원/선/텍스트) 자동 제거 ---
       // ProgRes 저장 이미지에는 반경 표시용 컬러 주석(노란 원, 초록 선 등)이
       // 박혀 있음. 빔 데이터는 흑백(R≈G≈B)이므로 채도(chroma)가 큰 픽셀은
@@ -44579,8 +45048,12 @@ function openCalibModal() {
       const CHROMA_THR = 28;
       const annMask = new Uint8Array(W0 * H0);
       let nAnnRaw = 0;
-      for (let i = 0; i < W0 * H0; i++) {
-        const r = idata[i * 4], g = idata[i * 4 + 1], b = idata[i * 4 + 2];
+      // TIFF(RGB)도 같은 기준으로 본다. 단채널 TIFF 는 채도가 정의되지 않으므로 건너뛴다.
+      const rgbAt = idata
+        ? (i) => [idata[i * 4], idata[i * 4 + 1], idata[i * 4 + 2]]
+        : (rgbTif ? (i) => [rgbTif.r[i], rgbTif.g[i], rgbTif.b[i]] : null);
+      if (rgbAt) for (let i = 0; i < W0 * H0; i++) {
+        const [r, g, b] = rgbAt(i);
         const chroma = Math.max(r, g, b) - Math.min(r, g, b);
         if (chroma > CHROMA_THR) { annMask[i] = 1; nAnnRaw++; }
       }
@@ -44603,12 +45076,35 @@ function openCalibModal() {
       const grayFull = new Float64Array(W0 * H0);
       for (let i = 0; i < W0 * H0; i++) {
         if (annMask[i]) { grayFull[i] = NaN; continue; }
+        if (gTif) { grayFull[i] = gTif[i]; continue; }   // 이미 0–255 환산 · 계조 유지
         const i4 = i * 4;
         grayFull[i] = 0.2126 * idata[i4] + 0.7152 * idata[i4 + 1] + 0.0722 * idata[i4 + 2];
       }
       let integrity = null;
-      try { integrity = PrismEngine.imageIntegrity(grayFull, W0, H0); }
+      // 양자화 계단을 함께 넘긴다 — 12-bit 자료에 8-bit 바닥을 적용하면 멀쩡한 빈이 폐기된다
+      try { integrity = PrismEngine.imageIntegrity(grayFull, W0, H0, { quantStep }); }
       catch (err) { integrity = { error: String(err && err.message || err) }; }
+
+      /* v3.15 — 포화는 **원해상도에서, 감마 되돌리기 전에** 마스크한다.
+       *
+       * 두 가지가 동시에 틀려 있었다:
+       *  (1) 비닝 뒤에 마스크하면 포화 화소 1개가 f²−1 개 이웃과 평균되어 문턱 아래로
+       *      내려가 그냥 빠져나간다. f=5 면 255 짜리 1개가 이웃 평균 100 과 섞여 106 이
+       *      되므로 `fitBeam(satLevel:254)` 이 볼 수 없다. fitBeam 내부 주석이 말하는
+       *      "saturation must be masked BEFORE any correction" 이 앱 레벨에서 깨져 있었다.
+       *  (2) 감마를 되돌린 뒤에 보면 254 → 255·(254/255)^γ 로 내려간다(γ=2.2 에서 252.8).
+       *      문턱 판정은 저장된 원본 값에서 해야 한다.
+       * 포화 화소는 값이 잘려 있어 **정보가 없다**. 평균에 섞으면 그 bin 전체가 낮아져
+       * 빔 코어가 과소평가되므로 NaN 으로 빼고 비닝에서도 제외한다(이미 주석용 경로가 있다). */
+      /* v3.17 — 포화 문턱을 **검출된 full scale 기준**으로. 8-bit canvas 는 254,
+       * 12-bit TIFF(<<4 컨테이너)는 254.94 에 해당한다. 254 로 고정해 두면
+       * 12-bit 자료에서 상위 0.4 % 를 통째로 포화로 오인해 코어를 도려낸다. */
+      const SAT_LEVEL = satLevelSrc;
+      let nSatFull = 0;
+      for (let i = 0; i < W0 * H0; i++) {
+        const v = grayFull[i];
+        if (isFinite(v) && v >= SAT_LEVEL) { grayFull[i] = NaN; nSatFull++; }
+      }
 
       /* v3.11 — 표시 감마 되돌리기.
        * 무결성 검사는 **원본 픽셀값**에 돌려야 한다(톤커브를 찾는 것이 그 일이므로).
@@ -44629,7 +45125,12 @@ function openCalibModal() {
         }
       }
 
-      const f = Math.max(1, Math.ceil(Math.max(W0, H0) / 320));
+      /* v3.15 — 비닝 배수를 **스팟 크기를 보고** 정한다 (§A).
+       * 이전 규칙 `ceil(max(W,H)/320)` 은 원본 크기만 보고 긴 변을 늘 ~320 px 로 줄였다.
+       * 빔이 실제로 몇 화소인지는 보지 않으므로, 1:1 카메라 파일(빔 FWHM 9 px)에서
+       * f=5 → 샘플링 FWHM 2.84 px 가 되어 **빔이 아니라 box 를 재게** 된다. */
+      const binPick = PrismEngine.chooseBinFactor(grayFull, W0, H0, { satLevel: SAT_LEVEL });
+      const f = binPick.f;
       const w = Math.floor(W0 / f), h = Math.floor(H0 / f);
       const gray = new Float64Array(w * h);
       let nAnn = 0;
@@ -44649,8 +45150,19 @@ function openCalibModal() {
       // 빔 피팅 파이프라인: 원거리 ghost blob 제거 → 주 빔에 붙은 근접
       // 반사광 watershed 분리 → 주 빔 주변 ROI 한정 → Gaussian 피팅 →
       // residual 이상픽셀(+4σ) 클리핑 재피팅
-      const fit = PrismEngine.fitBeam({ w, h, data: gray }, { satLevel: 254 });
+      const fit = PrismEngine.fitBeam({ w, h, data: gray }, { satLevel: SAT_LEVEL });
       if (!fit.success) throw new Error(fit.message || "Gaussian 피팅 실패");
+      /* 샘플링 FWHM — **pf 로 나누기 전에** 잡는다. 이 값이 화면에 없었기 때문에
+       * 언더샘플링이 오래 숨어 있었다. 4 px 미만이면 빔이 아니라 격자를 재는 것이다. */
+      fit.sampledFwhmPx = 2.3548 * Math.min(fit.sx, fit.sy);
+      fit.binChosenBy = binPick.by;            // "spot" | "cap" | "fallback"
+      fit.binFwhmFullPx = binPick.fwhmFull ?? null;   // 1차 추정 원해상도 FWHM
+      fit.binCap = binPick.fCap;
+      fit.nSatFull = nSatFull;
+      fit.source = tif
+        ? { kind: "tiff", bitsPerSample: tif.bitsPerSample, effectiveBits: tif.effectiveBits,
+            samples: tif.samples, fullScaleNative: tif.fullScaleNative, gcd: tif.gcd, quantStep }
+        : { kind: "canvas8", bitsPerSample: 8, effectiveBits: 8, quantStep: 1 };
       const masked = fit.maskedData || gray;
       const pf = Math.max(1, Math.ceil(Math.max(w, h) / 160));
       const pw = Math.floor(w / pf), ph = Math.floor(h / pf);
@@ -44667,6 +45179,13 @@ function openCalibModal() {
       delete fit.maskedData;
       fit.x0 = fit.x0 / pf; fit.y0 = fit.y0 / pf;
       fit.sx = fit.sx / pf; fit.sy = fit.sy / pf;
+      /* v3.17.1 — **growth[].R 도 같이 환산한다.**
+       * R = kσ·sqrt(sx·sy) 는 fitBeam 안에서 f-비닝 px 로 만들어지는데, 여기서 sx·sy 만
+       * pf 로 나누면 R 만 옛 단위로 남는다. binFactor = f·pf 이므로 R 을 그대로
+       * `umPerPx × binFactor` 로 환산하면 **pf 배(이 자료에서 5배) 틀린 µm** 가 나온다.
+       * 지금은 R 을 아무도 쓰지 않아 드러나지 않을 뿐이고, 내보내기에 R 을 넣는 순간
+       * 바로 틀린 값이 나간다. fit 안의 길이 단위를 하나로 맞춰 함정을 없앤다. */
+      if (Array.isArray(fit.growth)) for (const q of fit.growth) if (isFinite(q.R)) q.R /= pf;
       // ISO 모멘트도 미리보기 스케일로 환산 (동일 px 기준 유지)
       if (fit.moments) {
         const m = fit.moments;
@@ -44679,7 +45198,17 @@ function openCalibModal() {
       fit.integrity = integrity;
       c.beam = fit;
       c.metrics = calibComputeMetrics() || c.metrics;
-      back.querySelector("#cb-beam-status").innerHTML = `피팅 완료 — ${bmp.width}×${bmp.height}px (${f}× 비닝) · R²(ROI)=${fmt(fit.r2, 4)}` +
+      const sfw = fit.sampledFwhmPx;
+      const sfwHtml = isFinite(sfw)
+        ? (sfw < 4
+          ? ` · <span class="tag-Poor">샘플링 FWHM ${fmt(sfw, 3)} binned px — 언더샘플링. 빔이 아니라 비닝 격자를 재고 있을 수 있습니다</span>`
+          : ` · 샘플링 FWHM ${fmt(sfw, 3)} binned px`)
+        : "";
+      const byTxt = { spot: "스팟 크기 기준", cap: "상한 규칙", fallback: "1차 피팅 실패 → 상한 규칙" }[fit.binChosenBy] || "";
+      back.querySelector("#cb-beam-status").innerHTML = `피팅 완료 — ${W0}×${H0}px (${f}× 비닝<span class="muted">, ${esc(byTxt)}` +
+        (isFinite(fit.binFwhmFullPx) ? ` · 추정 원해상도 FWHM ${fmt(fit.binFwhmFullPx, 3)} px` : "") + `</span>) · R²(ROI)=${fmt(fit.r2, 4)}` + sfwHtml +
+        depthNote +
+        (nSatFull > 0 ? ` · <span class="tag-Low">포화 ${nSatFull}px 원해상도에서 제외</span>` : "") +
         (nAnnRaw > 0 ? ` · <span style="color:var(--s4)">측정 주석(원/선/텍스트) ${nAnnRaw}px 자동 제거</span>` : "") +
         (fit.nStreakCols > 0 ? ` · <span style="color:var(--s7)">세로 잔광(판독 스미어) ${fit.nStreakCols}열 보정</span>` : "") +
         (fit.nStreakRows > 0 ? ` · <span style="color:var(--s7)">가로 잔광 ${fit.nStreakRows}행 보정</span>` : "") +
@@ -44734,6 +45263,8 @@ function exportCalibSession() {
     displayGamma: (isFinite(Number(c.displayGamma)) && Number(c.displayGamma) > 1) ? Number(c.displayGamma) : 1,
     // v3.13 — 이 빔이 어느 dichroic·채널의 것인지. 이것 없이는 면적값을 다른 채널에
     // 잘못 쓰는 것을 나중에 확인할 방법이 없다.
+    // v3.16 — 촬영측 감마. 되돌리기 값(displayGamma)과 짝으로 있어야 재현이 된다.
+    captureGamma: isFinite(Number(c.captureGamma)) && Number(c.captureGamma) > 0 ? Number(c.captureGamma) : null,
     dichroic: c.dichroic || null,
     beamChannel: c.beamChannel || null,
     areaBasis: c.areaBasis, areaBasisUsed: (calibBasisSigma() || {}).src || null,
@@ -44741,10 +45272,26 @@ function exportCalibSession() {
     beam: c.beam ? {
       sx: c.beam.sx, sy: c.beam.sy, theta: c.beam.theta, binFactor: c.beam.binFactor || 1,
       r2: c.beam.r2, nSat: c.beam.nSat, nNear: c.beam.nNear, nClip: c.beam.nClip,
+      // v3.15 — 비닝 배수를 **어떤 근거로** 골랐는지. 이것 없이는 같은 파일의 두 세션이
+      // 왜 다른 면적을 냈는지 나중에 알 수 없다 (v3.13 provenance 원칙).
+      binChosenBy: c.beam.binChosenBy || null,
+      binCap: c.beam.binCap ?? null,
+      sampledFwhmPx: isFinite(c.beam.sampledFwhmPx) ? c.beam.sampledFwhmPx : null,
+      binFwhmFullPx: isFinite(c.beam.binFwhmFullPx) ? c.beam.binFwhmFullPx : null,
+      nSatFull: c.beam.nSatFull ?? null,
+      // v3.17 — 8-bit canvas 로 읽었는지 16-bit TIFF 를 직접 읽었는지. 같은 파일이라도
+      // 경로에 따라 면적이 20% 이상 달라지므로 기록 없이는 재현할 수 없다.
+      source: c.beam.source || null,
       d4sAreaRatio: c.beam.d4sAreaRatio ?? null,
       enclosedRatio: c.beam.enclosedRatio ?? null,          // curve of growth (core 밖 빛)
       growthRadiusSigma: c.beam.growthRadiusSigma ?? null,
-      growth: Array.isArray(c.beam.growth) ? c.beam.growth.map((q) => ({ kSigma: q.kSigma, ratio: q.ratio })) : null,
+      /* v3.17.1 — 반경을 함께 남긴다. kσ 만 적어 두면 **다른 적합과 비교할 수 없다** —
+       * 조리개가 적합된 σ 에 비례하므로 같은 kσ 라도 물리 반경이 다르다. */
+      growth: Array.isArray(c.beam.growth) ? c.beam.growth.map((q) => ({
+        kSigma: q.kSigma, ratio: q.ratio,
+        rPx: isFinite(q.R) ? q.R : null,
+        rUm: isFinite(q.R) && isFinite(calibEffUmPerPx()) ? q.R * calibEffUmPerPx() * (c.beam.binFactor || 1) : null,
+      })) : null,
       // v3.10 — 이 파일의 숫자를 나중에 신뢰할 수 있는지 판단할 근거를 같이 남긴다.
       integrity: c.beam.integrity ? {
         upscaleL: c.beam.integrity.upscale?.ok ? c.beam.integrity.upscale.L : null,
@@ -44753,6 +45300,10 @@ function exportCalibSession() {
         linearitySlope: c.beam.integrity.linearity?.ok ? c.beam.integrity.linearity.b : null,
         linearityR2: c.beam.integrity.linearity?.ok ? c.beam.integrity.linearity.r2 : null,
         clean: !!c.beam.integrity.clean,
+        // v3.16 — "통과"와 "적용 안 됨"을 나중에 파일만 보고도 구분할 수 있어야 한다
+        verified: c.beam.integrity.verified || null,
+        notApplicable: Array.isArray(c.beam.integrity.notes)
+          ? c.beam.integrity.notes.map((n) => n.kind) : null,
         action: c.beam.integrity.action || null,
       } : null,
     } : null,
