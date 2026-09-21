@@ -288,7 +288,7 @@ a { color: var(--accent); }
 }
 
 /* --- widefield imaging viewer (v3.14) --- */
-#im-wrap canvas { image-rendering: pixelated; }
+/* image-rendering 은 확대/축소 배율에 따라 JS 가 인라인으로 정한다 (여기서 강제하지 않는다) */
 #im-ovl text { paint-order: stroke; stroke: rgba(0,0,0,.65); stroke-width: 2px; }
 #im-frame { accent-color: #3987e5; }
 #det-table, #cmp-out { max-height: 420px; overflow: auto; }
@@ -47460,7 +47460,11 @@ function renderImaging(rec) {
         <option value="1" selected>1.0</option><option value="1.5">1.5</option><option value="2">2.0</option></select></label>
       <label class="ctl"><span>ROI 표시</span><select id="im-roi"><option value="1">표시</option><option value="0">숨김</option></select></label>
       <span class="right flex">
-        <button id="im-reset" class="small">줌 초기화</button>
+        <button id="im-zoomout" class="small" title="축소 (−)">−</button>
+        <span id="im-zoomlab" class="mono small" style="min-width:74px;text-align:center;align-self:center"></span>
+        <button id="im-zoomin" class="small" title="확대 (+)">+</button>
+        <button id="im-fit" class="small" title="전체가 보이도록 (0)">화면 맞춤</button>
+        <button id="im-1to1" class="small" title="화소 1:1 (1)">1:1</button>
         <button id="im-png" class="small">PNG</button>
       </span>
     </div>
@@ -47475,7 +47479,7 @@ function renderImaging(rec) {
       <svg id="im-ovl" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;"></svg>
     </div>
     <div class="flex small" style="margin-top:6px;">
-      <span id="im-readout" class="mono muted">커서 = 좌표·원본 화소값 · 휠 = 확대 · 드래그 = 이동 · 더블클릭 = 초기화 · Shift+클릭 = ROI 추가/삭제</span>
+      <span id="im-readout" class="mono muted">커서 = 좌표·원본 화소값 · 휠/±키 = 확대·축소 · 드래그 = 이동 · 더블클릭 또는 0 키 = 화면 맞춤 · 1 키 = 화소 1:1 · Shift+클릭 = ROI 추가/삭제</span>
       <span id="im-stats" class="mono right"></span>
     </div>
     ${nameNote}${wlNote}
@@ -47563,6 +47567,59 @@ function renderImaging(rec) {
 }
 
 /* ------------------------------ image canvas ------------------------------- */
+/**
+ * 이미지를 넣을 화면 상자(CSS px).
+ *
+ * 가로만 맞추면 1024² 이미지가 세로로 화면을 넘어가 한눈에 안 들어온다.
+ * **뷰포트에 남은 높이**를 실제로 재서 세로도 같이 제한한다.
+ * 상자를 넘지 않는 한 확대는 자유롭다 — 넘어가는 순간 잘라 보는 방식(view rect)으로
+ * 바뀌므로 캔버스 자체는 절대 화면 밖으로 자라지 않는다.
+ */
+function imgFitBox(rec) {
+  const wrap = $("#im-wrap");
+  const panel = wrap && wrap.parentElement;
+  const availW = Math.max(240, (panel ? panel.clientWidth : 700) - 2);
+  let top = 0;
+  try { top = wrap.getBoundingClientRect().top; } catch (e) { top = 200; }
+  // 아래에 읽기값 줄·패널 여백이 들어갈 자리를 남긴다
+  const reserve = 96;
+  const availH = Math.max(240, Math.min(1600, (window.innerHeight || 900) - Math.max(80, top) - reserve));
+  return { w: availW, h: availH };
+}
+/** view rect 를 점 (px, py) 기준으로 factor 배 확대(<1)/축소(>1). 경계를 벗어나지 않는다. */
+function imgZoomBy(rec, factor, px, py) {
+  const st = imgState(rec), d = st.d, v = st.view || (st.view = { x: 0, y: 0, w: d.nx, h: d.ny });
+  const cx = px != null ? px : v.x + v.w / 2, cy = py != null ? py : v.y + v.h / 2;
+  const minW = 16, minH = 16;
+  let nw = v.w * factor, nh = v.h * factor;
+  // 전체보다 커지지 않게, 또 너무 작아지지 않게 — 종횡비는 유지
+  const capped = Math.min(d.nx / v.w, d.ny / v.h);
+  if (factor > 1) { const f = Math.min(factor, capped); nw = v.w * f; nh = v.h * f; }
+  if (nw < minW || nh < minH) { const f = Math.max(minW / v.w, minH / v.h); nw = v.w * f; nh = v.h * f; }
+  v.x = Math.max(0, Math.min(d.nx - nw, cx - (cx - v.x) * (nw / v.w)));
+  v.y = Math.max(0, Math.min(d.ny - nh, cy - (cy - v.y) * (nh / v.h)));
+  v.w = nw; v.h = nh;
+  imgRedraw(rec);
+}
+/** 전체가 보이도록 — view rect 를 이미지 전체로 되돌린다 (기본 상태). */
+function imgFitAll(rec) {
+  const st = imgState(rec), d = st.d;
+  st.view = { x: 0, y: 0, w: d.nx, h: d.ny };
+  imgRedraw(rec);
+}
+/** 화소 1:1 — 화면 상자만큼의 영역만 원래 화소 크기로 본다 (중심 유지). */
+function imgOneToOne(rec) {
+  const st = imgState(rec), d = st.d, v = st.view || (st.view = { x: 0, y: 0, w: d.nx, h: d.ny });
+  const box = imgFitBox(rec);
+  const cx = v.x + v.w / 2, cy = v.y + v.h / 2;
+  const nw = Math.min(d.nx, Math.max(16, box.w)), nh = Math.min(d.ny, Math.max(16, box.h));
+  st.view = {
+    x: Math.max(0, Math.min(d.nx - nw, cx - nw / 2)),
+    y: Math.max(0, Math.min(d.ny - nh, cy - nh / 2)),
+    w: nw, h: nh,
+  };
+  imgRedraw(rec);
+}
 function imgRedraw(rec) {
   const st = imgState(rec), d = st.d;
   const img = imgCurrent(rec);
@@ -47592,16 +47649,30 @@ function imgRedraw(rec) {
     px[j] = lut[b]; px[j + 1] = lut[b + 1]; px[j + 2] = lut[b + 2]; px[j + 3] = 255;
   }
   octx.putImageData(idata, 0, 0);
-  // view rect (zoom/pan)
+  // view rect (확대 = 잘라 보는 영역) + 표시 크기 (그 영역을 화면 상자에 맞춤)
   if (!st.view) st.view = { x: 0, y: 0, w: d.nx, h: d.ny };
   const v = st.view;
-  const wrapW = $("#im-wrap").clientWidth || 700;
-  const dispH = Math.round(wrapW * (v.h / v.w));
-  cv.width = wrapW; cv.height = dispH;
+  const box = imgFitBox(rec);
+  // 가로·세로 **둘 다** 상자를 넘지 않도록 — 가로만 맞추면 1024² 가 세로로 화면을 넘는다
+  const scale = Math.min(box.w / v.w, box.h / v.h);
+  const dispW = Math.max(40, Math.round(v.w * scale));
+  const dispH = Math.max(40, Math.round(v.h * scale));
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(dispW * dpr); cv.height = Math.round(dispH * dpr);
+  cv.style.width = dispW + "px"; cv.style.height = dispH + "px";
+  // 확대할 때는 화소를 또렷하게, 축소할 때는 부드럽게
+  cv.style.imageRendering = scale >= 1 ? "pixelated" : "auto";
+  const wrap = $("#im-wrap");
+  wrap.style.width = dispW + "px";
+  wrap.style.margin = "0 auto";
+  st.disp = { w: dispW, h: dispH, scale };
   const ctx = cv.getContext("2d");
-  ctx.imageSmoothingEnabled = v.w > wrapW;
+  ctx.imageSmoothingEnabled = scale < 1;
   ctx.clearRect(0, 0, cv.width, cv.height);
   ctx.drawImage(off, v.x, v.y, v.w, v.h, 0, 0, cv.width, cv.height);
+  const zl = $("#im-zoomlab");
+  if (zl) zl.textContent = `${(scale * 100).toFixed(scale < 1 ? 0 : 0)}%` +
+    (v.w < d.nx || v.h < d.ny ? ` · ${Math.round(v.w)}×${Math.round(v.h)}` : "");
   // stats + frame label
   const stt = PrismImg.robustStats(img);
   $("#im-stats").textContent = `원본 배경 ${fmt(stt.median, 5)} · σ(MAD) ${fmt(stt.sigma, 3)}` +
@@ -47618,8 +47689,11 @@ function imgDrawOverlay(rec) {
   if (!svg) return;
   if (!st.showRoi || !st.rois.length) { svg.innerHTML = ""; return; }
   const v = st.view, cv = $("#im-canvas");
-  const sx = cv.width / v.w, sy = cv.height / v.h;
-  svg.setAttribute("viewBox", `0 0 ${cv.width} ${cv.height}`);
+  // **표시 크기(CSS px)** 기준이어야 한다 — 캔버스 backing store 는 devicePixelRatio
+  // 배율이 걸려 있어서 그걸 쓰면 hidpi 화면에서 ROI 원이 어긋난다.
+  const dsp = st.disp || { w: cv.clientWidth || cv.width, h: cv.clientHeight || cv.height };
+  const sx = dsp.w / v.w, sy = dsp.h / v.h;
+  svg.setAttribute("viewBox", `0 0 ${dsp.w} ${dsp.h}`);
   const verd = st.cm && st.cm.ok ? st.cm.flags : null;
   const color = (i) => {
     if (!verd) return "#8fd0ff";
@@ -47630,7 +47704,7 @@ function imgDrawOverlay(rec) {
   const r = st.photOpt.r * Math.max(sx, 0.01);
   svg.innerHTML = st.rois.map((p, i) => {
     const cx = ((p.xc != null ? p.xc : p.x) - v.x) * sx, cy = ((p.yc != null ? p.yc : p.y) - v.y) * sy;
-    if (cx < -20 || cy < -20 || cx > cv.width + 20 || cy > cv.height + 20) return "";
+    if (cx < -20 || cy < -20 || cx > dsp.w + 20 || cy > dsp.h + 20) return "";
     const c = color(i);
     const rr = Math.max(4, r);
     // 표적 ROI 는 이중 원으로 표시 — 선택성 표의 기준점이 어디인지 그림에서 바로 보이게
@@ -47650,7 +47724,10 @@ function imgBindImage(rec) {
   set("#im-phi", "change", (e) => { st.pHi = Number(e.target.value); imgRedraw(rec); });
   set("#im-smooth", "change", (e) => { st.dispSmooth = Number(e.target.value); st._smKey = null; imgRedraw(rec); });
   set("#im-roi", "change", (e) => { st.showRoi = e.target.value === "1"; imgDrawOverlay(rec); });
-  set("#im-reset", "click", () => { st.view = { x: 0, y: 0, w: d.nx, h: d.ny }; imgRedraw(rec); });
+  set("#im-fit", "click", () => imgFitAll(rec));
+  set("#im-1to1", "click", () => imgOneToOne(rec));
+  set("#im-zoomin", "click", () => imgZoomBy(rec, 1 / 1.4));
+  set("#im-zoomout", "click", () => imgZoomBy(rec, 1.4));
   set("#im-frame", "input", (e) => {
     st.frame = Number(e.target.value);
     if (st.source !== "frame") { st.source = "frame"; $("#im-src").value = "frame"; }
@@ -47698,17 +47775,35 @@ function imgBindImage(rec) {
     cv.style.cursor = "grabbing";
   });
   window.addEventListener("mouseup", () => { if (st._drag) { st._drag = null; cv.style.cursor = "crosshair"; } });
-  cv.addEventListener("dblclick", () => { st.view = { x: 0, y: 0, w: d.nx, h: d.ny }; imgRedraw(rec); });
+  cv.addEventListener("dblclick", () => imgFitAll(rec));
   cv.addEventListener("wheel", (ev) => {
     ev.preventDefault();
-    const p = toImg(ev), v = st.view;
-    const f = ev.deltaY < 0 ? 0.8 : 1.25;
-    const nw = Math.max(24, Math.min(d.nx, v.w * f)), nh = Math.max(24, Math.min(d.ny, v.h * f));
-    v.x = Math.max(0, Math.min(d.nx - nw, p.x - (p.x - v.x) * (nw / v.w)));
-    v.y = Math.max(0, Math.min(d.ny - nh, p.y - (p.y - v.y) * (nh / v.h)));
-    v.w = nw; v.h = nh;
-    imgRedraw(rec);
+    const p = toImg(ev);
+    imgZoomBy(rec, ev.deltaY < 0 ? 0.8 : 1.25, p.x, p.y);
   }, { passive: false });
+  // 키보드: + − 확대/축소 · 0 화면맞춤 · 1 화소 1:1
+  if (!st._keyBound) {
+    st._keyBound = (ev) => {
+      if (!$("#im-canvas") || App.activeId !== rec.id || App.activeTab !== "view") return;
+      const t = ev.target;
+      if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+      if (ev.key === "+" || ev.key === "=") { ev.preventDefault(); imgZoomBy(rec, 1 / 1.4); }
+      else if (ev.key === "-" || ev.key === "_") { ev.preventDefault(); imgZoomBy(rec, 1.4); }
+      else if (ev.key === "0") { ev.preventDefault(); imgFitAll(rec); }
+      else if (ev.key === "1") { ev.preventDefault(); imgOneToOne(rec); }
+    };
+    window.addEventListener("keydown", st._keyBound);
+  }
+  // 창 크기가 바뀌면 화면 상자도 바뀐다 → 다시 맞춘다 (연타 방지로 디바운스)
+  if (!st._resizeBound) {
+    st._resizeBound = () => {
+      clearTimeout(st._resizeTimer);
+      st._resizeTimer = setTimeout(() => {
+        if ($("#im-canvas") && App.activeId === rec.id && App.activeTab === "view") imgRedraw(rec);
+      }, 120);
+    };
+    window.addEventListener("resize", st._resizeBound);
+  }
 }
 function imgToggleRoi(rec, p) {
   const st = imgState(rec);
@@ -48183,9 +48278,17 @@ function imgBindDiff(rec) {
       const b = bytes[i] * 3; px[j] = lut[b]; px[j + 1] = lut[b + 1]; px[j + 2] = lut[b + 2]; px[j + 3] = 255;
     }
     octx.putImageData(idata, 0, 0);
-    const w = $("#df-wrap").parentElement.clientWidth - 24;
-    cv.width = w; cv.height = Math.round(w * d.ny / d.nx);
-    cv.getContext("2d").drawImage(off, 0, 0, cv.width, cv.height);
+    // 차영상도 세로가 화면을 넘지 않게 같은 상자 계산을 쓴다
+    const dbox = imgFitBox(rec);
+    const dscale = Math.min((($("#df-wrap").parentElement.clientWidth || 700) - 24) / d.nx, dbox.h / d.ny);
+    const dw = Math.max(80, Math.round(d.nx * dscale)), dh = Math.max(80, Math.round(d.ny * dscale));
+    cv.width = dw; cv.height = dh;
+    cv.style.width = dw + "px"; cv.style.height = dh + "px";
+    cv.style.imageRendering = dscale >= 1 ? "pixelated" : "auto";
+    $("#df-wrap").style.width = dw + "px"; $("#df-wrap").style.margin = "6px auto 0";
+    const dctx = cv.getContext("2d");
+    dctx.imageSmoothingEnabled = dscale < 1;
+    dctx.drawImage(off, 0, 0, cv.width, cv.height);
     $("#df-wrap").style.display = "";
     $("#df-note").innerHTML += `<div style="margin-top:4px;">표시범위 ±${fmt(m, 4)} ${unit} (파랑 = B 가 큼 · 빨강 = A 가 큼) ·
       차영상 배경 ${fmt(df.median, 4)} · σ(MAD) ${fmt(df.sigma, 4)} ${unit}</div>`;
