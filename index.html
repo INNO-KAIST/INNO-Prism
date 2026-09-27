@@ -301,7 +301,7 @@ select[multiple] { background: var(--surface-2); color: var(--text-primary); bor
 <div id="toast"></div>
 <div id="app">
   <header>
-    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.17.1</span></div>
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><defs><linearGradient id="bpe" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><polygon points="14.2,11.5 22,7.2 22,9.4" fill="#ff5c7a"/><polygon points="14.4,12.4 22,10.6 22,12.8" fill="#ffb020"/><polygon points="14.4,13.3 22,14 22,16.2" fill="#38bdf8"/><path d="M2 15.8l7.4-3.1" stroke="#e8ecff" stroke-width="1.1" stroke-linecap="round" opacity="0.8"/><path d="M12 4L5.5 18.5h13L12 4z" stroke="url(#bpe)" stroke-width="1.8" stroke-linejoin="round" fill="rgba(159,216,255,0.09)"/></svg> INNO Prism <span class="ver">v3.18.0</span></div>
     <button id="open-files">파일 열기</button>
     <button id="open-dir">폴더 열기</button>
     <button id="batch-btn">일괄 피팅</button>
@@ -40981,8 +40981,297 @@ function darkenAnalyze(input, opts) {
   return out;
 }
 
+/* =============================================================================
+ * SegPA 1.0 — globally optimal piecewise power-law segmentation (v3.18)
+ *
+ * Reference implementation: tests/segpa_proto/segpa.py (validated 2026-09-27 on
+ * synthetic grids, 288 up/down scans, the 22-row manual sheet and a 40-case blind
+ * judgement by the researcher). This port must stay numerically identical to it;
+ * tests/test_segpa_parity.mjs checks that on every branch of the 288 corpus.
+ *
+ *  1. log10 I vs log10 P is split into K straight segments by exact dynamic
+ *     programming — the global optimum over every breakpoint placement, so there
+ *     are no local minima. K ≤ K_BIC.
+ *  2. Between segments a "bridge" (one sampling interval, raw two-point secant)
+ *     carries a 1-jump. Mean-value theorem: a secant never exceeds the true
+ *     maximum slope, so a bridge value is a valid LOWER BOUND.
+ *  3. A regime is a significant peak of the slope chain: above both valleys by
+ *     z·σ, ≥ min_ratio× and ≥ +min_prom over the pre-regime power law, rising
+ *     ≥ min_rise decades and staying lit. Candidates are collected over every
+ *     scale K ≤ K_BIC (a stochastic-switching staircase becomes one ruler at a
+ *     coarser scale); overlapping candidates keep the best slope lower bound.
+ *  4. Reported per regime: Ith bracket (last pre-regime point ↔ first point
+ *     clearly above it), headline PA (steepest defensible element; "≥" when it is
+ *     a bridge or two points), class (PA if headline ≥ T_class = 5, else S-bend
+ *     — researcher's decision 2026-09-27), and the auxiliary MAIN-RISE slope: the
+ *     steepest straight window that carries ≥ 0.7 decades of rise — what a
+ *     researcher reads when a single jump sits inside a longer steep rise.
+ * ========================================================================== */
+const SEGPA_VERSION = "1.0.0";
+const SEGPA_DEFAULTS = { z: 2.0, minRise: 0.3, minProm: 3.0, minRatio: 2.0, TClass: 5.0, mainD: 0.7, mainExt: 0.15, Kmax: 9 };
+
+function sp_median(a) {
+  const b = a.filter((v) => !Number.isNaN(v)).slice().sort((p, q) => p - q);
+  const n = b.length; if (!n) return NaN;
+  return n % 2 ? b[(n - 1) / 2] : 0.5 * (b[n / 2 - 1] + b[n / 2]);
+}
+function sp_ls(x, y, i, j) {           // unweighted least-squares slope on points i..j
+  let sx = 0, sy = 0; const n = j - i + 1;
+  for (let k = i; k <= j; k++) { sx += x[k]; sy += y[k]; }
+  const mx = sx / n, my = sy / n; let sxx = 0, sxy = 0;
+  for (let k = i; k <= j; k++) { sxx += (x[k] - mx) * (x[k] - mx); sxy += (x[k] - mx) * (y[k] - my); }
+  return sxy / sxx;
+}
+function sp_wfit(xs, ys, ws) {         // weighted LS line (weights on squared residuals): {a, b}
+  let S = 0, Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+  for (let k = 0; k < xs.length; k++) { const w = ws[k]; S += w; Sx += w * xs[k]; Sy += w * ys[k]; Sxx += w * xs[k] * xs[k]; Sxy += w * xs[k] * ys[k]; }
+  const D = S * Sxx - Sx * Sx; const b = (S * Sxy - Sx * Sy) / D; return { a: (Sy - b * Sx) / S, b };
+}
+
+/** P + either reps (n × r) or I with standard error se. Sort, merge near-duplicate setpoints. */
+function segPrep(P, reps, I, se) {
+  const n0 = P.length; let m = new Array(n0), s = new Array(n0);
+  if (reps) {
+    const sd = new Array(n0), nr = new Array(n0);
+    for (let i = 0; i < n0; i++) {
+      const r = (reps[i] || []).filter((v) => Number.isFinite(v)); nr[i] = r.length;
+      const mu = r.length ? r.reduce((a, v) => a + v, 0) / r.length : NaN; m[i] = mu;
+      if (r.length > 1) { let q = 0; for (const v of r) q += (v - mu) * (v - mu); sd[i] = Math.sqrt(q / (r.length - 1)); }
+      else sd[i] = Math.sqrt(Math.max(mu, 1));
+    }
+    const a = sp_median(sd.map((v, i) => v * v / Math.max(m[i], 1)));
+    for (let i = 0; i < n0; i++) s[i] = Math.sqrt(Math.max(sd[i] * sd[i], a * Math.max(m[i], 1))) / Math.sqrt(Math.max(nr[i], 1));
+  } else { m = Array.from(I, Number); s = Array.from(se, Number); }
+  let idx = []; for (let i = 0; i < n0; i++) idx.push(i);
+  idx.sort((p, q) => P[p] - P[q]);
+  idx = idx.filter((i) => Number.isFinite(P[i]) && P[i] > 0 && Number.isFinite(m[i]));
+  let Ps = idx.map((i) => P[i]), ms = idx.map((i) => m[i]), ss = idx.map((i) => s[i]);
+  const xx = Ps.map((v) => Math.log10(v));
+  const gaps = []; for (let k = 1; k < xx.length; k++) { const g = xx[k] - xx[k - 1]; if (g > 0) gaps.push(g); }
+  const md = gaps.length ? sp_median(gaps) : 1.0;
+  const Pm = [Ps[0]], mm = [ms[0]], sm = [ss[0]]; const grp = [[0]];
+  for (let k = 1; k < Ps.length; k++) {
+    if (xx[k] - Math.log10(Pm[Pm.length - 1]) < 0.25 * md) {
+      const g = grp[grp.length - 1]; g.push(k);
+      let W = 0, Wm = 0, lx = 0;
+      for (const q of g) { const w = 1 / Math.pow(Math.max(ss[q], 1e-12), 2); W += w; Wm += w * ms[q]; lx += xx[q]; }
+      Pm[Pm.length - 1] = Math.pow(10, lx / g.length); mm[mm.length - 1] = Wm / W; sm[sm.length - 1] = 1 / Math.sqrt(W);
+    } else { Pm.push(Ps[k]); mm.push(ms[k]); sm.push(ss[k]); grp.push([k]); }
+  }
+  const x = [], y = [], sy = [];
+  for (let k = 0; k < Pm.length; k++) {
+    const Ipos = Math.max(mm[k], Math.max(sm[k], 1e-9));
+    x.push(Math.log10(Pm[k])); y.push(Math.log10(Ipos)); sy.push(Math.max(sm[k] / (Ipos * Math.LN10), 1e-4));
+  }
+  return { x, y, sy, m: mm, se: sm };
+}
+
+function segSegment(x, y, sy, Kmax, Kforce) {
+  const n = x.length, minlen = 2;
+  const pf = { S: [0], Sx: [0], Sy: [0], Sxx: [0], Sxy: [0], Syy: [0] };
+  for (let i = 0; i < n; i++) {
+    const w = 1 / (sy[i] * sy[i]);
+    pf.S.push(pf.S[i] + w); pf.Sx.push(pf.Sx[i] + w * x[i]); pf.Sy.push(pf.Sy[i] + w * y[i]);
+    pf.Sxx.push(pf.Sxx[i] + w * x[i] * x[i]); pf.Sxy.push(pf.Sxy[i] + w * x[i] * y[i]); pf.Syy.push(pf.Syy[i] + w * y[i] * y[i]);
+  }
+  const seg = (i, j) => {
+    const g = (k) => pf[k][j + 1] - pf[k][i];
+    const S = g("S"), Sx = g("Sx"), Sy = g("Sy"), Sxx = g("Sxx"), Sxy = g("Sxy"), Syy = g("Syy");
+    const D = S * Sxx - Sx * Sx;
+    if (D <= 1e-300) return { rss: 0, a: NaN, b: NaN, se: NaN };
+    const b = (S * Sxy - Sx * Sy) / D, a = (Sy - b * Sx) / S;
+    const rss = Math.max(Syy - 2 * a * Sy - 2 * b * Sxy + a * a * S + 2 * a * b * Sx + b * b * Sxx, 0);
+    return { rss, a, b, se: Math.sqrt(S / D) };
+  };
+  const C = []; for (let i = 0; i < n; i++) { C.push(new Float64Array(n).fill(Infinity)); for (let j = i + minlen - 1; j < n; j++) C[i][j] = seg(i, j).rss; }
+  const F = [], arg = [];
+  for (let k = 0; k <= Kmax; k++) { F.push(new Float64Array(n).fill(Infinity)); arg.push(new Int32Array(n)); }
+  for (let j = 0; j < n; j++) F[1][j] = C[0][j];
+  for (let k = 2; k <= Kmax; k++) {
+    for (let j = 0; j < n; j++) {
+      if (j === 0) { F[k][j] = Infinity; arg[k][j] = 1; continue; }
+      let best = Infinity, bt = 0;
+      for (let t = 0; t < j; t++) { const v = F[k - 1][t] + C[t + 1][j]; if (v < best) { best = v; bt = t; } }
+      F[k][j] = best; arg[k][j] = bt + 1;
+    }
+  }
+  const Kfeas = []; for (let k = 1; k <= Kmax; k++) if (Number.isFinite(F[k][n - 1])) Kfeas.push(k);
+  const kf = Kfeas[Kfeas.length - 1];
+  const phi = Math.max(F[kf][n - 1] / Math.max(n - (3 * kf - 1), 1), 1.0);
+  let K = Kfeas[0], bestBic = Infinity;
+  for (const k of Kfeas) { const b = F[k][n - 1] / phi + (3 * k - 1) * Math.log(n); if (b < bestBic) { bestBic = b; K = k; } }
+  if (Kforce != null) K = Kforce;
+  const cuts = []; { let j = n - 1, k = K; while (k > 1) { const s0 = arg[k][j]; cuts.push(s0); j = s0 - 1; k--; } }
+  cuts.sort((p, q) => p - q);
+  const starts = [0].concat(cuts), ends = starts.slice(1).map((v) => v - 1).concat([n - 1]);
+  const segs = starts.map((i, q) => { const r = seg(i, ends[q]); return { i, j: ends[q], a: r.a, b: r.b, se: r.se * Math.sqrt(phi) }; });
+  return { segs, phi, K };
+}
+
+function segMainRise(x, y, lo, hi, D) {
+  const idx = []; for (let k = 0; k < x.length; k++) if (x[k] >= lo - 1e-9 && x[k] <= hi + 1e-9) idx.push(k);
+  let best = null;
+  for (let a = 0; a < idx.length; a++) {
+    for (let b = a + 1; b < idx.length; b++) {
+      const i = idx[a], j = idx[b];
+      if (y[j] - y[i] >= D) {
+        const sl = sp_ls(x, y, i, j);
+        if (!best || sl > best.slope) best = { slope: sl, x0: x[i], x1: x[j], n: j - i + 1 };
+        break;
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * segPA(P, {reps} | {I, se}, opts) → {version, regimes:[...], dark, K, Kbic, tau, spikes, segs, x, y}
+ * P in W. Each regime: {cls, kind, status, head, headLo, main, bracketW:[lo,hi], xThW, x0W, x1W, rise, …}
+ */
+function segPA(P, data, opts) {
+  const o = Object.assign({}, SEGPA_DEFAULTS, opts || {});
+  let { x, y, sy, m, se } = segPrep(P, data.reps || null, data.I, data.se);
+  if (x.length < 8) throw new Error(`SegPA: 분석 가능한 점이 ${x.length}개 — 최소 8개 필요`);
+  // isolated whole-setpoint excursions are not transitions
+  const keep = x.map(() => true), spikes = [];
+  for (let i = 1; i < x.length - 1; i++) {
+    const d1 = y[i] - y[i - 1], d2 = y[i + 1] - y[i];
+    const s_ = Math.sqrt(sy[i] * sy[i] + 0.5 * (sy[i - 1] * sy[i - 1] + sy[i + 1] * sy[i + 1]));
+    const dev = y[i] - 0.5 * (y[i - 1] + y[i + 1]);
+    if (Math.sign(d1) !== Math.sign(d2) && Math.abs(dev) > 6 * s_ && Math.abs(y[i + 1] - y[i - 1]) < Math.abs(dev) / 3) { keep[i] = false; spikes.push(x[i]); }
+  }
+  const sel = (arr) => arr.filter((_, i) => keep[i]);
+  x = sel(x); y = sel(y); sy = sel(sy); m = sel(m); se = sel(se);
+  const n = x.length;
+  // local noise from 3rd-difference pseudo-residuals, robust rolling scale (11 points)
+  let tau = 0;
+  if (n >= 7) {
+    const e = new Array(n).fill(0), d3 = [];
+    for (let k = 0; k + 3 < n; k++) d3.push((y[k + 3] - 3 * y[k + 2] + 3 * y[k + 1] - y[k]) / Math.sqrt(20));
+    for (let k = 0; k < d3.length; k++) e[k + 1] = d3[k];
+    e[0] = d3[0]; e[n - 2] = d3[d3.length - 1]; e[n - 1] = d3[d3.length - 1];
+    const loc = [];
+    for (let k = 0; k < n; k++) loc.push(1.4826 * sp_median(e.slice(Math.max(0, k - 5), k + 6).map(Math.abs)));
+    tau = sp_median(loc.map((v, k) => Math.sqrt(Math.max(v * v - sy[k] * sy[k], 0))));
+    sy = sy.map((v, k) => Math.sqrt(Math.max(v * v, loc[k] * loc[k])));
+  }
+  const z = o.z;
+  const detect = (segs) => {
+    const s0 = segs[0]; let dark = null;
+    if (Math.abs(s0.b) < Math.max(z * s0.se, 0.5) && s0.j - s0.i >= 3) {
+      const v = m.slice(s0.i, s0.j + 1), mu = v.reduce((a, q) => a + q, 0) / v.length;
+      dark = { D: mu, sd: Math.sqrt(v.reduce((a, q) => a + (q - mu) * (q - mu), 0) / (v.length - 1)) };
+    }
+    const el = [];
+    segs.forEach((s, k) => {
+      el.push({ kind: "seg", k, lo: s.b - z * s.se, hi: s.b + z * s.se, s: s.b, i: s.i, j: s.j });
+      if (k < segs.length - 1) {
+        const i = s.j, j = segs[k + 1].i, h = x[j] - x[i];
+        const dr = y[j] - y[i], sdr = Math.hypot(sy[i], sy[j]);
+        el.push({ kind: "bridge", k, lo: (dr - z * sdr) / h, hi: (dr + z * sdr) / h, s: dr / h, i, j, raw: dr / h, rawLo: (dr - z * sdr) / h });
+      }
+    });
+    const S = el.map((e) => e.s), LO = el.map((e) => e.lo), HI = el.map((e) => e.hi), N = el.length;
+    const regimes = [];
+    for (let p = 0; p < N; p++) {
+      const side = (step) => {
+        let q = p + step, vmin = Infinity, vhi = Infinity;
+        while (q >= 0 && q < N) {
+          if (LO[q] > S[p]) return [vmin, vhi, false];
+          if (S[q] < vmin) vmin = S[q];
+          vhi = Math.min(vhi, HI[q]); q += step;
+        }
+        return [vmin, vhi, true];
+      };
+      const [lv, lhi, lb] = side(-1), [rv, rhi, rb] = side(+1);
+      if (!Number.isFinite(lv)) continue;
+      if (!Number.isFinite(rv) && !rb) continue;
+      const rightCens = rb && !Number.isFinite(rv);
+      if (LO[p] <= lhi || (Number.isFinite(rv) && LO[p] <= rhi)) continue;
+      if (LO[p] <= 1.0) continue;
+      if (LO[p] - lhi < o.minProm) continue;
+      const lseg = [];
+      for (let q = p - 1; q >= 0; q--) { if (LO[q] > S[p]) break; if (el[q].kind === "seg") lseg.push(el[q].s); }
+      const base = Math.max(lseg.length ? Math.min(...lseg) : lv, 0);
+      if (S[p] < o.minRatio * Math.max(base, 0.5) || S[p] - base < o.minProm) continue;
+      if (!lb && lv > 0.5 * S[p]) continue;
+      if (!rb && rv > 0.5 * S[p]) continue;
+      const flank = Number.isFinite(rv) ? Math.max(lv, rv) : lv;
+      const half = (S[p] + flank) / 2;
+      let a = p; while (a - 1 >= 0 && S[a - 1] > half) a--;
+      let b = p; while (b + 1 < N && S[b + 1] > half) b++;
+      const i0 = el[a].i, j0 = el[b].j, rise = y[j0] - y[i0];
+      if (rise < o.minRise) continue;
+      const post = y.slice(j0 + 1, j0 + 4);
+      if (post.length && sp_median(post) < y[j0] - 0.5 * rise) continue;
+      const pre = segs.find((sg) => sg.i <= i0 - 1 && i0 - 1 <= sg.j);
+      if (pre) { const b0 = Math.max(pre.b, 0); if (S[p] < o.minRatio * Math.max(b0, 0.5) || S[p] - b0 < o.minProm) continue; }
+      const pk = el[p];
+      regimes.push({ i: i0, j: j0, peak: pk.kind === "bridge" ? pk.raw : S[p], peakLo: pk.kind === "bridge" ? pk.rawLo : LO[p],
+        kind: pk.kind, prom: S[p] - flank, rightCens, rise });
+    }
+    regimes.sort((p, q) => q.peakLo - p.peakLo);
+    const kept = [];
+    for (const r of regimes) if (kept.every((k) => r.j < k.i || r.i > k.j)) kept.push(r);
+    const out = kept.map((r) => {
+      const ii = []; for (let q = r.i; q <= r.j; q++) ii.push(q);
+      const fit = sp_wfit(ii.map((q) => x[q]), ii.map((q) => y[q]), ii.map((q) => 1 / (sy[q] * sy[q])));
+      const ps = segs.find((s) => s.i <= r.i - 1 && r.i - 1 <= s.j) || null;
+      const xt = ps && fit.b !== ps.b ? (ps.a - fit.a) / (fit.b - ps.b) : NaN;
+      let paSig = NaN;
+      if (dark) {
+        const Dm = dark.D - 3 * dark.sd, jj = ii.filter((q) => m[q] - dark.D > 3 * Math.max(dark.sd, se[q]));
+        if (jj.length >= 2) { const ly = jj.map((q) => Math.log10(m[q] - Dm)), lx = jj.map((q) => x[q]); paSig = sp_ls(lx, ly, 0, jj.length - 1); }
+      }
+      const lower = ii.length <= 2 || r.kind === "bridge";
+      let br = [x[r.i - 1], x[r.i]];
+      const nearDark = !!dark && y[r.i] < Math.log10(dark.D) + 1.0;
+      if (nearDark) {
+        const lit = []; for (let q = Math.max(r.i - 2, 0); q <= r.j; q++) if (m[q] - dark.D > 3 * dark.sd) lit.push(q);
+        if (lit.length && lit[0] > 0) br = [x[lit[0] - 1], x[lit[0]]];
+      }
+      const head = nearDark && Number.isFinite(paSig) && paSig > r.peak ? paSig : r.peak;
+      const main = segMainRise(x, y, br[0], br[1] + o.mainExt, o.mainD);
+      return { kind: r.kind, head, headLo: r.peakLo, peak: r.peak, regimeSlope: fit.b, darkSub: paSig, nPts: ii.length,
+        xTh: xt, bracket: br, x0: x[r.i], x1: x[r.j], rise: r.rise, prom: r.prom, nearDark,
+        main, cls: head >= o.TClass ? "PA" : "S-bend",
+        status: (lower ? "lower-bound" : "resolved") + (r.rightCens ? " / right-censored" : "") };
+    });
+    out.sort((p, q) => q.headLo - p.headLo);
+    return { dark, regimes: out };
+  };
+  const first = segSegment(x, y, sy, o.Kmax, null);
+  const Kbic = first.K;
+  let base = null; const cands = [];
+  for (let Kc = Kbic; Kc > 1; Kc--) {
+    const sc = Kc === Kbic ? first.segs : segSegment(x, y, sy, o.Kmax, Kc).segs;
+    const r2 = detect(sc);
+    if (!base) base = Object.assign({ segs: sc }, r2);
+    for (const q of r2.regimes) { q.scale = Kc; cands.push(q); }
+  }
+  cands.sort((p, q) => q.headLo - p.headLo);
+  const dxs = []; for (let k = 1; k < x.length; k++) dxs.push(x[k] - x[k - 1]);
+  const gap = 2.5 * sp_median(dxs);
+  const chosen = [];
+  for (const q of cands) if (chosen.every((c) => q.x1 + gap < c.x0 || q.x0 > c.x1 + gap)) chosen.push(q);
+  const W = (v) => Math.pow(10, v);
+  for (const q of chosen) {
+    q.bracketW = [W(q.bracket[0]), W(q.bracket[1])]; q.xThW = W(q.xTh); q.x0W = W(q.x0); q.x1W = W(q.x1);
+    if (q.main) { q.main.x0W = W(q.main.x0); q.main.x1W = W(q.main.x1); }
+  }
+  return {
+    engine: "SegPA", version: SEGPA_VERSION, options: o,
+    regimes: chosen, K: base.segs.length, Kbic, tau, spikes: spikes.map(W),
+    dark: base.dark, segs: base.segs.map((s) => ({ x0W: W(x[s.i]), x1W: W(x[s.j]), slope: s.b, se: s.se, a: s.a })),
+    data: { P: x.map(W), I: y.map((v) => Math.pow(10, v)) },
+  };
+}
+
+
 return {
   VERSION,
+  // SegPA 1.0 (v3.18) — globally optimal piecewise power-law regime detector
+  segPA, SEGPA_VERSION, SEGPA_DEFAULTS, segPrep, segSegment, segMainRise,
   analyze, bootstrap, evaluate, synth,
   // RiseFit (ANP rise-time kinetics)
   riseAnalyze, riseBootstrap, riseLogRebin, RISE_MODELS,
@@ -45435,6 +45724,7 @@ function renderPowerScan(rec) {
     <div class="flex"><h3 style="margin:0;">Log–Log Power Dependence <span id="fit-status" class="muted small"></span></h3>
       <span class="right flex small"><span id="m-out" class="mono small"></span></span></div>
     <div class="chips" id="layer-chips">
+      <button class="chip" data-layer="segpa" title="SegPA: PA regime 구간(연한 띠)·Ith 브래킷(진한 띠)·PA 값">SegPA regime</button>
       <button class="chip" data-layer="fit" title="선택된 파라메트릭 모델 곡선">피팅 곡선</button>
       <button class="chip" data-layer="pa" title="최대 기울기 지점의 접선 — 접선이 데이터의 급경사와 겹치면 잘 맞은 것">PA 위치</button>
       <button class="chip" data-layer="ith" title="문턱 파워 I_th 와 포화 파워 P_sat 세로선">I_th 위치</button>
@@ -45457,7 +45747,8 @@ function renderPowerScan(rec) {
     <h3>국소 기울기 곡선 s(P) = d log I / d log P <span class="muted small">— 비선형성의 전체 프로파일</span></h3>
     <div id="chart-slope" class="chart" style="height:330px;"></div>
   </div>
-  <div class="panel"><h3>피팅 결과</h3><div id="fit-results"><div class="muted">피팅 중…</div></div></div>
+  <div class="panel"><h3>PA regime <span class="muted small">— SegPA ${PrismFit.SEGPA_VERSION} · up/down 원자료</span></h3><div id="segpa-results"><div class="muted">분석 중…</div></div></div>
+  <div class="panel"><h3>PrismFit 2.2 상세 <span class="muted small">— 기존 모델 기반 결과 (참고)</span></h3><div id="fit-results"><div class="muted">피팅 중…</div></div></div>
   <div class="panel">
     <div class="flex">
       <h3 style="margin:0;">불확도 진단 (전체 파이프라인 부트스트랩)</h3>
@@ -45560,6 +45851,9 @@ function renderPowerScan(rec) {
 }
 
 async function runPowerAnalysis(rec, force) {
+  try { renderSegPA(rec); } catch (e) { const s0 = document.getElementById("segpa-results"); if (s0) s0.innerHTML = `<div class="tag-Poor">SegPA 실패: ${esc(e.message)}</div>`; }
+  // SegPA 는 수 ms 라 PrismFit(수 초~수십 초)을 기다리지 않고 원자료 + regime 을 먼저 그린다.
+  if (!rec.cache[analysisKey()]) { try { const ld = getLoaded(rec); drawPowerChart(rec, ld, branchForSettings(ld, rec).branches, null); } catch (e) {} }
   const key = analysisKey();
   const status = $("#fit-status");
   try {
@@ -45663,7 +45957,7 @@ function computeManualSlope(rec) {
 // 문제가 실제로 있었다. 기본은 "타겟 branch 데이터 + 피팅 곡선 + I_th + PA 위치" 뿐이고,
 // residual·제외점·bistable·점멸·반대 branch 는 칩을 눌러 켠다.
 const LAYER_DEFAULTS = {
-  fit: true, pa: true, ith: true,
+  segpa: true, fit: true, pa: true, ith: true,
   resid: false, excluded: false, bistable: false, blink: false, other: false,
   envelope: false, spline: false, weights: false, bootband: false, norm: false,
 };
@@ -45706,6 +46000,110 @@ function misfitRuns(res) {
   }
   if (cur && cur.n >= 3) runs.push(cur);
   return runs;
+}
+
+/* ---------------------------------------------------------------------------
+ * v3.18 — SegPA 1.0 (PA regime · Ith · PA 헤드라인 · 주 상승 기울기)
+ * 원자료 up/down 분지에 직접 적용한다(고상태 envelope·스플라인·파라메트릭 모델과 독립).
+ * 검증: 288 스캔 Python 기준 구현과 576/576 분지 동일(tests/test_segpa_parity.mjs),
+ *       연구원 블라인드 판정 40건(Ith |Δ| 중위 0.012 dec, PA ±25% 이내 79%, "아니오" 5/5 regime 없음).
+ * 분류: 헤드라인 PA ≥ 5 → "PA", 미만 → "S-bend(약한 비선형)" — 연구원 결정(2026-09-27).
+ * ------------------------------------------------------------------------- */
+function segpaFor(rec, name) {
+  const key = `segpa|${name}|${App.settings.bandMin}|${App.settings.bandMax}`;
+  if (rec.cache[key] !== undefined) return rec.cache[key];
+  let out = null;
+  try {
+    const branches = PrismEngine.splitBranches(getLoaded(rec));
+    const br = name === "down" ? branches.down : branches.up;
+    if (!br) { rec.cache[key] = null; return null; }
+    // down 분지는 최대 파워점을 up 과 공유한다 — 검증과 같게 down 에서는 그 점을 뺀다.
+    const off = name === "down" ? 1 : 0;
+    const P = br.powerAvg.slice(off);
+    const reps = br.intensityReplicates ? br.intensityReplicates.slice(off) : null;
+    const hasReps = !!reps && reps.some((r) => r && r.filter((v) => Number.isFinite(v)).length >= 2);
+    let data;
+    if (hasReps) data = { reps };
+    else {
+      const I = br.intensityAvg.slice(off);
+      const tr = getPATrace(rec);
+      const t = tr && tr.counting && tr.acqTime > 0 ? tr.acqTime : NaN;   // 광자 계수: Poisson SE = √(I·t)/t
+      data = { I, se: I.map((v) => (Number.isFinite(t) ? Math.sqrt(Math.max(v * t, 1)) / t : Math.sqrt(Math.max(v, 1)))) };
+    }
+    out = PrismFit.segPA(P, data);
+    out._branch = name;
+  } catch (e) { out = { error: String((e && e.message) || e), regimes: [] }; }
+  rec.cache[key] = out;
+  return out;
+}
+function segpaSelectedName(rec) {
+  let name = App.settings.branch === "down" ? "down" : "up";
+  if (name === "down") { try { if (!PrismEngine.splitBranches(getLoaded(rec)).down) name = "up"; } catch (e) { name = "up"; } }
+  return name;
+}
+function segpaFirst(sp) {            // 가장 낮은 파워의 regime = 점화
+  if (!sp || !sp.regimes || !sp.regimes.length) return null;
+  return sp.regimes.reduce((a, b) => (b.bracketW[0] < a.bracketW[0] ? b : a));
+}
+function segpaPaText(q) {
+  const ge = q.status.startsWith("lower-bound") ? "≥ " : "";
+  return `${ge}${fmt(q.head, 3)}`;
+}
+function segpaDens(w) {
+  const kd = densityFactor(); if (!isFinite(kd)) return "";
+  const du = activeDensityUnit(); return `${fmt(w * kd / du.div, 4)} ${du.name}`;
+}
+function renderSegPA(rec) {
+  const el = document.getElementById("segpa-results");
+  if (!el) return;
+  const sel = segpaSelectedName(rec);
+  const both = { up: segpaFor(rec, "up"), down: segpaFor(rec, "down") };
+  const dens = densityActive();
+  const rowsHtml = [];
+  for (const name of ["up", "down"]) {
+    const sp = both[name];
+    if (!sp) continue;
+    const mark = name === sel ? ' style="background:rgba(57,135,229,0.08)"' : "";
+    if (sp.error) { rowsHtml.push(`<tr${mark}><td>${name}</td><td colspan="7" class="tag-Poor">실패: ${esc(sp.error)}</td></tr>`); continue; }
+    if (!sp.regimes.length) { rowsHtml.push(`<tr${mark}><td>${name}</td><td colspan="7" class="muted">regime 없음 — 앞 구간 멱법칙보다 뚜렷하게(×2, +3) 가파른 구간이 없습니다</td></tr>`); continue; }
+    const regs = sp.regimes.slice().sort((a, b) => a.bracketW[0] - b.bracketW[0]);
+    regs.forEach((q, k) => {
+      const tag = q.cls === "PA" ? `<b style="color:${PALETTE.red}">PA</b>` : `<span class="muted" title="헤드라인 PA < 5 — 약한 비선형, PA 판정 보류">S-bend</span>`;
+      const br = `${fmt(q.bracketW[0], 4)} – ${fmt(q.bracketW[1], 4)} W` + (dens ? `<div class="s muted">${segpaDens(q.bracketW[0])} – ${segpaDens(q.bracketW[1])}</div>` : "");
+      const main = q.main ? `${fmt(q.main.slope, 3)} <span class="muted small">(${q.main.n}점)</span>` : `<span class="muted">–</span>`;
+      const st = q.status.startsWith("lower-bound") ? `하한 (${q.kind === "bridge" ? "한 간격 jump" : "2점"})` : "분해됨";
+      rowsHtml.push(`<tr${mark}><td>${k === 0 ? name : ""}</td><td>${regs.length > 1 ? "#" + (k + 1) + " " : ""}${tag}</td><td class="num">${br}</td>
+        <td class="num"><b>${segpaPaText(q)}</b></td><td class="num">${main}</td><td>${st}${q.status.includes("right-censored") ? " · 스캔 끝 검열" : ""}</td>
+        <td class="num">${fmt(q.rise, 3)}</td><td class="num">K=${q.scale}</td></tr>`);
+    });
+  }
+  const fu = segpaFirst(both.up), fd = segpaFirst(both.down);
+  const hyst = fu && fd ? Math.sqrt(fu.bracketW[0] * fu.bracketW[1]) / Math.sqrt(fd.bracketW[0] * fd.bracketW[1]) : NaN;
+  el.innerHTML = `
+    <table class="res">
+      <tr><th>분지</th><th>분류</th><th>Ith 브래킷</th><th>PA (헤드라인)</th><th>주 상승 기울기</th><th>상태</th><th>상승 (dec)</th><th>스케일</th></tr>
+      ${rowsHtml.join("")}
+    </table>
+    <div class="small muted" style="margin-top:6px;line-height:1.55">
+      <b>Ith 브래킷</b> = 점화 직전 마지막 점 ↔ 점화 후 첫 점. <b>PA (헤드라인)</b> = 데이터가 방어할 수 있는 가장 가파른 직선 구간의 기울기
+      (≥ 는 한 간격 jump 또는 2점이라 참값이 그 이상이라는 뜻). <b>주 상승 기울기</b> = 0.7 decade 이상 오르는 가장 가파른 직선창 — jump 가 긴 상승 안에 있을 때 연구자가 자를 대는 값.
+      분류: PA ≥ 5 → PA, 미만 → S-bend.
+      ${isFinite(hyst) ? `<br><b>Ith↑/Ith↓</b> = ${fmt(hyst, 3)} (첫 regime 브래킷 기하평균 비 · &gt;1 쌍안정/지연형, &lt;1 광퇴색형)` : ""}
+      <br>SegPA ${PrismFit.SEGPA_VERSION} · 구간 분할은 동적계획법 전역최적(국소해 없음) · 강조 행 = 현재 분석 branch
+    </div>`;
+}
+function segpaSummaryText(rec) {
+  const out = [];
+  for (const name of ["up", "down"]) {
+    const sp = segpaFor(rec, name);
+    if (!sp || sp.error) continue;
+    if (!sp.regimes.length) { out.push(`SegPA ${name}: regime 없음`); continue; }
+    sp.regimes.slice().sort((a, b) => a.bracketW[0] - b.bracketW[0]).forEach((q, k) => {
+      out.push(`SegPA ${name}${sp.regimes.length > 1 ? " #" + (k + 1) : ""}: ${q.cls} · Ith ${fmt(q.bracketW[0], 4)}–${fmt(q.bracketW[1], 4)} W · PA ${segpaPaText(q)}` +
+        (q.main ? ` · 주 상승 ${fmt(q.main.slope, 3)}` : "") + ` · ${q.status}`);
+    });
+  }
+  return out.join("\n");
 }
 
 function drawPowerChart(rec, loaded, branches, analysis) {
@@ -46071,6 +46469,23 @@ function drawPowerChart(rec, loaded, branches, analysis) {
     el._manAnnIdx = -1;
     const mOut = $("#m-out");
     if (mOut) mOut.textContent = "";
+  }
+
+  // ---- v3.18 SegPA overlay: regime 구간 · Ith 브래킷 · PA 라벨 ----
+  if (L.segpa) {
+    const sp = segpaFor(rec, segpaSelectedName(rec));
+    if (sp && !sp.error) {
+      sp.regimes.slice().sort((a, b) => a.bracketW[0] - b.bracketW[0]).forEach((q, idx) => {
+        const isPA = q.cls === "PA";
+        shapes.push({ type: "rect", xref: "x", yref: "paper", layer: "below", x0: Math.min(q.x0W, q.bracketW[0]) * k, x1: q.x1W * k, y0: 0, y1: 1,
+          fillcolor: isPA ? "rgba(230,103,103,0.10)" : "rgba(160,160,150,0.10)", line: { width: 0 } });
+        shapes.push({ type: "rect", xref: "x", yref: "paper", layer: "below", x0: q.bracketW[0] * k, x1: q.bracketW[1] * k, y0: 0, y1: 1,
+          fillcolor: isPA ? "rgba(230,103,103,0.38)" : "rgba(160,160,150,0.35)", line: { width: 0 } });
+        annots.push({ x: Math.log10(q.bracketW[1] * k), xref: "x", yref: "paper", y: 0.02 + 0.075 * idx, xanchor: "left", yanchor: "bottom", showarrow: false,
+          text: `${isPA ? "PA" : "S-bend"} ${segpaPaText(q)}${q.main && Math.abs(q.main.slope - q.head) / q.head > 0.25 ? ` · 주상승 ${fmt(q.main.slope, 3)}` : ""}`,
+          font: { size: 11, color: isPA ? PALETTE.red : "#a09f96" }, bgcolor: "rgba(26,26,25,0.75)" });
+      });
+    }
   }
 
   // ---- 축 구성 ----
@@ -46682,6 +47097,7 @@ function exportPowerJson(rec) {
   downloadText(rec.name.replace(/\.h5$/i, "") + "_analysis.json",
     JSON.stringify({ app: "INNO Prism", engine: "PrismFit " + PrismFit.VERSION, file: rec.name, settings: App.settings,
       calibration: calib, densityFactor_mWcm2_per_W: densityFactor() || null,
+      segpa: { up: segpaFor(rec, "up"), down: segpaFor(rec, "down") },
       manualSlope: man && man.chord !== undefined ? { range_W: rec.cache.manualRange, chord: man.chord, lsq: man.lsq, n: man.n } : null,
       analysis: slim }, null, 1), "application/json");
 }
@@ -46765,7 +47181,7 @@ function summaryText(rec) {
   return lines.join("\n");
 }
 function copySummary(rec) {
-  navigator.clipboard.writeText(summaryText(rec)).then(() => toast("요약이 복사되었습니다"));
+  navigator.clipboard.writeText([segpaSummaryText(rec), summaryText(rec)].filter(Boolean).join("\n")).then(() => toast("요약이 복사되었습니다"));
 }
 
 /* ------------------------- EMCCD readout view ----------------------------- */
@@ -47692,7 +48108,7 @@ async function runBatch() {
     <div id="batch-status" class="small muted">준비…</div>
     <div style="overflow:auto;max-height:56vh;margin-top:8px;">
     ${targets.length ? `<table class="res" id="batch-table">
-      <tr><th>파일</th><th>타입</th><th>보고 PA</th><th>모델</th><th>s_max</th><th>점프</th><th>임계 (W)</th><th>포화 (W)</th><th>B</th><th>χ²_red</th><th>품질</th></tr>
+      <tr><th>파일</th><th>타입</th><th title="SegPA 헤드라인 (현재 branch 의 가장 낮은 파워 regime)">SegPA PA</th><th>분류</th><th>SegPA Ith (W)</th><th>주 상승</th><th>PrismFit 보고 PA</th><th>모델</th><th>s_max</th><th>점프</th><th>임계 (W)</th><th>포화 (W)</th><th>B</th><th>χ²_red</th><th>품질</th></tr>
     </table>` : ""}
     ${riseTargets.length ? `<h3 style="margin:14px 0 6px;">Rise time <span class="muted small">(RiseFit · 파일별 여기출력 순으로 τ 비교 → critical slowing/임계 판정)</span></h3>
     <table class="res" id="batch-rise-table">
@@ -47722,7 +48138,10 @@ async function runBatch() {
       a.quality = PrismFit.evaluate(a, null);
       results.push({ rec, a });
       const q = a.quality;
+      const sq = segpaFirst(segpaFor(rec, segpaSelectedName(rec)));
       row = `<tr><td>${esc(rec.name)}</td><td>${rec.det.type === "power_apd" ? "APD" : "EMCCD"}</td>
+        <td class="num"><b>${sq ? segpaPaText(sq) : "–"}</b></td><td>${sq ? sq.cls : "없음"}</td>
+        <td class="num">${sq ? fmt(sq.bracketW[0], 4) + "–" + fmt(sq.bracketW[1], 4) : "–"}</td><td class="num">${sq && sq.main ? fmt(sq.main.slope, 3) : "–"}</td>
         <td class="num"><b>${a.paSource === "lower-bound" || a.paGridLimited ? "≥" : ""}${fmt(a.paReport, 4)}</b>${a.paSource === "unresolved" ? '<span class="tag-Poor" title="unidentified — point estimate 아님">?</span>' : ""}</td>
         <td>H${a.chosenOrder}</td>
         <td class="num">${fmt(a.sMax, 4)}${a.sMaxIsLowerBound ? "↑" : ""}</td>
@@ -47734,7 +48153,7 @@ async function runBatch() {
         <td class="tag-${q.band}">${fmt(q.score, 3)} (${q.band})</td></tr>`;
       rec.cache[analysisKey()] = a;
     } catch (e) {
-      row = `<tr><td>${esc(rec.name)}</td><td colspan="9" class="tag-Poor">실패: ${esc(e.message)}</td></tr>`;
+      row = `<tr><td>${esc(rec.name)}</td><td colspan="13" class="tag-Poor">실패: ${esc(e.message)}</td></tr>`;
     }
     table.insertAdjacentHTML("beforeend", row);
   }
@@ -47797,11 +48216,16 @@ async function runBatch() {
   csvBtn.disabled = !results.length;
   csvBtn.addEventListener("click", () => {
     const kd = densityFactor();
-    const rows = [["file", "type", "branch", "agg_mode", "pa_report", "pa_source", "pa_grid_limited", "pa_jump_slope", "pa_jump_dlogP", "model_order", "s_max", "s_max_is_lower_bound", "s_max_at_P_W",
+    const rows = [["file", "type", "branch", "segpa_n_regimes", "segpa_class", "segpa_pa_head", "segpa_pa_is_lower_bound", "segpa_pa_head_lo2sigma", "segpa_main_rise", "segpa_ith_lo_W", "segpa_ith_hi_W",
+      ...(isFinite(kd) ? ["segpa_ith_lo_mW_cm2", "segpa_ith_hi_mW_cm2"] : []), "segpa_status", "segpa_all_regimes", "agg_mode", "pa_report", "pa_source", "pa_grid_limited", "pa_jump_slope", "pa_jump_dlogP", "model_order", "s_max", "s_max_is_lower_bound", "s_max_at_P_W",
       "threshold_W", ...(isFinite(kd) ? ["threshold_mW_cm2"] : []), "saturation_W", ...(isFinite(kd) ? ["saturation_mW_cm2"] : []),
       "background_B", "k1", "k2", "k3", "chi2_red", "runs_p", "n_outliers", "quality_score", "quality_band", "spline_sMax"]];
     for (const { rec, a } of results) {
-      rows.push([rec.name, rec.det.type, a._branchUsed, a._aggUsed || "mean", a.paReport, a.paSource, a.paGridLimited,
+      const spb = segpaFor(rec, segpaSelectedName(rec)), sq = segpaFirst(spb);
+      const allR = spb && spb.regimes ? spb.regimes.slice().sort((x, y) => x.bracketW[0] - y.bracketW[0]).map((q) => `${q.cls}:${q.head.toFixed(3)}@${q.bracketW[0].toExponential(4)}-${q.bracketW[1].toExponential(4)}`).join(" | ") : "";
+      rows.push([rec.name, rec.det.type, a._branchUsed, spb && spb.regimes ? spb.regimes.length : "", sq ? sq.cls : "none", sq ? sq.head : "", sq ? sq.status.startsWith("lower-bound") : "", sq ? sq.headLo : "",
+        sq && sq.main ? sq.main.slope : "", sq ? sq.bracketW[0] : "", sq ? sq.bracketW[1] : "",
+        ...(isFinite(kd) ? [sq ? sq.bracketW[0] * kd : "", sq ? sq.bracketW[1] * kd : ""] : []), sq ? sq.status : "", allR, a._aggUsed || "mean", a.paReport, a.paSource, a.paGridLimited,
         a.paJump ? a.paJump.slope : "", a.paJump ? a.paJump.dlogP : "", "H" + a.chosenOrder, a.sMax, a.sMaxIsLowerBound, a.sMaxAtP,
         a.thresholdP, ...(isFinite(kd) ? [isFinite(a.thresholdP) ? a.thresholdP * kd : ""] : []),
         a.saturationP, ...(isFinite(kd) ? [isFinite(a.saturationP) ? a.saturationP * kd : ""] : []),
