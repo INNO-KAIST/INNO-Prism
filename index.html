@@ -392,6 +392,48 @@ body { word-break: keep-all; }
 :where(h1, h2, h3, h4) { text-wrap-style: balance; }
 :where(p, li, td, th, label, small, .notes, .muted, .empty-state) { text-wrap-style: pretty; }
 
+/* ---- ③ 재설계 (rd3) — 결과 요약 카드 · 접기 · 내보내기 메뉴 · 칩 그룹 · 일괄 진행 ---- */
+.ctl-global { align-self: center; font-size: 11px; color: var(--text-secondary); border: 1px dashed var(--border); border-radius: 999px; padding: 3px 9px; white-space: nowrap; }
+.pa-head { padding: 12px 14px; }
+.ph-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+.ph-cell { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.ph-cell.on { border-color: var(--ui-accent); background: var(--ui-accent-soft, rgba(169,164,230,.08)); }
+.ph-h { font-size: 11.5px; color: var(--text-secondary); margin-bottom: 4px; }
+.ph-tag { font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: rgba(169,164,230,.16); color: var(--text-primary); margin-left: 4px; }
+.ph-main { display: flex; align-items: baseline; gap: 8px; }
+.ph-line { display: flex; align-items: baseline; gap: 8px; margin-top: 2px; }
+.ph-k { font-size: 12px; color: var(--text-secondary); min-width: 24px; }
+.ph-v { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-primary); line-height: 1.15; }
+.ph-v.ph-none { font-size: 16px; font-weight: 600; color: var(--text-secondary); }
+.ph-v2 { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ph-s { font-size: 11.5px; color: var(--text-secondary); margin-top: 3px; }
+.ph-cls { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 6px; }
+.ph-cls.pa { background: rgba(230,90,80,.16); color: #f08a80; }
+.ph-cls.sb { background: rgba(160,160,150,.16); color: var(--text-secondary); }
+.ph-foot { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-top: 10px; font-size: 12px; color: var(--text-secondary); }
+.ph-more { margin-left: auto; }
+.ph-foot a { color: var(--ui-accent); }
+details.fold > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::before { content: ""; width: 7px; height: 7px; border-right: 1.6px solid var(--text-secondary); border-bottom: 1.6px solid var(--text-secondary); transform: rotate(-45deg); transition: transform .15s; flex: none; }
+details.fold[open] > summary::before { transform: rotate(45deg); }
+details.fold > summary h3 { margin: 0; }
+details.fold[open] > summary { margin-bottom: 8px; }
+.fold-sum { margin-left: 6px; font-size: 11px; font-weight: 400; }
+.exp-menu { position: relative; }
+.exp-menu > summary { list-style: none; cursor: pointer; font-size: 12px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); }
+.exp-menu > summary::-webkit-details-marker { display: none; }
+.exp-menu > summary::after { content: " ▾"; color: var(--text-secondary); }
+.exp-pop { position: absolute; right: 0; top: calc(100% + 4px); z-index: 30; display: flex; flex-direction: column; gap: 4px; min-width: 170px; padding: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-1); box-shadow: 0 12px 30px rgba(0,0,0,.35); }
+.exp-pop button { text-align: left; }
+.chip-grp { font-size: 10.5px; color: var(--text-secondary); letter-spacing: .02em; margin-right: -2px; }
+.err-state ul { margin: 6px 0 8px 18px; padding: 0; line-height: 1.7; }
+.batch-prog { height: 4px; border-radius: 4px; background: var(--border); overflow: hidden; margin-top: 6px; }
+.batch-prog > i { display: block; height: 100%; width: 0; background: var(--ui-accent); transition: width .25s; }
+.batch-done tr[data-id] { cursor: pointer; }
+.batch-done tr[data-id]:hover td { background: rgba(169,164,230,.10); }
+@media (max-width: 820px) { .ph-v { font-size: 22px; } .ctl-global { white-space: normal; } }
+
 /* ════════ INNO suite UX layer — 공통 CSS (2026-09-29) ════════ */
 /* 앱 전환 버튼·메뉴 (크롬 위) */
 .inno-apps{position:relative;display:inline-flex}
@@ -44378,6 +44420,17 @@ async function ensureH5() {
   return App.h5Module;
 }
 let fileSeq = 0;
+/* HDF5 superblock 서명은 파일 오프셋 0, 512, 1024, 2048 … 중 한 곳에 있다 (HDF5 File Format Spec §II.A).
+   h5wasm 은 서명이 없는 파일도 예외 없이 열어 "데이터셋 없음"으로 보였기 때문에, 열기 전에 확인한다. */
+function hasHdf5Signature(buf) {
+  const sig = [0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a];
+  for (let off = 0; off + 8 <= buf.length; off = off ? off * 2 : 512) {
+    let ok = true;
+    for (let i = 0; i < 8; i++) if (buf[off + i] !== sig[i]) { ok = false; break; }
+    if (ok) return true;
+  }
+  return false;
+}
 async function addFiles(fileList) {
   const files = Array.from(fileList).filter((f) => /\.(h5|hdf5)$/i.test(f.name));
   if (!files.length) { toast(".h5 파일이 없습니다"); return; }
@@ -44392,6 +44445,7 @@ async function addFiles(fileList) {
       name: f.name, size: f.size, vpath: `/work/${id}.h5`, h5: null, det: null, meta: null, cache: {}, error: null };
     try {
       const buf = new Uint8Array(await f.arrayBuffer());
+      if (!hasHdf5Signature(buf)) throw new Error("HDF5 서명(\\x89HDF)이 없습니다 — .h5 형식이 아니거나 앞부분이 잘린 파일입니다");
       try { Module.FS.mkdir("/work"); } catch (e) {}
       Module.FS.writeFile(rec.vpath, buf);
       rec.h5 = new h5wasm.File(rec.vpath, "r");
@@ -44518,7 +44572,13 @@ function renderAll() {
   const tabDefs = [["view", viewTabLabel(rec)], ["structure", "H5 구조"]];
   tabs.innerHTML = tabDefs.map(([k, l]) => `<div class="tab ${App.activeTab === k ? "active" : ""}" data-tab="${k}">${l}</div>`).join("");
   if (rec.error) {
-    view.innerHTML = `<div class="panel"><h3>파일 읽기 오류</h3><div class="mono">${esc(rec.error)}</div></div>`;
+    view.innerHTML = `<div class="panel err-state" role="alert"><h3>이 파일을 열 수 없습니다</h3>
+      <div class="small">다음 중 하나일 가능성이 큽니다.</div>
+      <ul class="small"><li>HDF5(.h5) 형식이 아니거나 확장자만 .h5인 파일</li><li>측정 중이거나 저장이 끝나지 않아 잘린 파일</li><li>복사 중 손상된 파일 — 원본에서 다시 복사해 보세요</li></ul>
+      <details class="small"><summary class="muted">오류 원문</summary><div class="mono">${esc(rec.error)}</div></details>
+      <div class="flex" style="margin-top:10px;"><button id="err-rm" class="small">목록에서 제거</button></div></div>`;
+    const rb = document.getElementById("err-rm");
+    if (rb) rb.addEventListener("click", () => { const b = document.querySelector(`#file-list [data-rm="${rec.id}"]`); if (b) b.click(); });
     return;
   }
   if (App.activeTab === "structure") return renderStructure(rec);
@@ -46470,8 +46530,10 @@ function renderPowerScan(rec) {
       <label class="ctl" id="c-unit-wrap" style="display:${densityActive() ? "" : "none"};"><span>X축 단위</span>
         <select id="c-unit"><option value="W">W (원시)</option><option value="density">파워밀도 (자동 단위)</option></select></label>
       <button id="c-refit" class="primary">다시 피팅</button>
+      <span class="ctl-global" title="branch · 스무딩 · 단조 제약 · 집계${isEmccd ? " · 적분 파장" : ""}은 열린 모든 파일에 함께 적용됩니다">모든 파일 공통 설정</span>
     </div>
   </div>
+  <div class="panel pa-head" id="pa-headline" aria-live="polite"><div class="muted small">분석 중…</div></div>
   ${isEmccd ? `<div class="panel"><h3>EMCCD 스펙트럼 미리보기 <span class="muted small">(replicate 평균 · 회색 영역 = 적분범위)</span></h3>
     <div class="flex small" style="margin-bottom:6px;">
       <span>표시할 측정점:</span>
@@ -46481,8 +46543,16 @@ function renderPowerScan(rec) {
     <div id="chart-spec" class="chart chart-short"></div></div>` : ""}
   <div class="panel">
     <div class="flex"><h3 style="margin:0;">Log–Log Power Dependence <span id="fit-status" class="muted small"></span></h3>
-      <span class="right flex small"><span id="m-out" class="mono small"></span></span></div>
+      <span class="right flex small"><span id="m-out" class="mono small"></span>
+        <details class="exp-menu"><summary>내보내기</summary><div class="exp-pop" role="menu">
+          <button id="ex-png" class="small">그래프 PNG</button>
+          <button id="ex-slope-png" class="small">기울기 곡선 PNG</button>
+          <button id="ex-csv" class="small">데이터 + 피팅 CSV</button>
+          <button id="ex-json" class="small">전체 결과 JSON</button>
+          <button id="ex-copy" class="small">요약 복사</button>
+        </div></details></span></div>
     <div class="chips" id="layer-chips">
+      <span class="chip-grp">표시</span>
       <button class="chip" data-layer="segpa" title="SegPA: PA regime 구간(연한 띠)·Ith 브래킷(진한 띠)·PA 값">SegPA regime</button>
       <button class="chip" data-layer="fit" title="선택된 파라메트릭 모델 곡선">피팅 곡선</button>
       <button class="chip" data-layer="pa" title="최대 기울기 지점의 접선 — 접선이 데이터의 급경사와 겹치면 잘 맞은 것">PA 위치</button>
@@ -46492,12 +46562,12 @@ function renderPowerScan(rec) {
       <button class="chip" data-layer="bistable" title="bistable 서술: 저상태·고상태 두 멱법칙과 전환 파워 (이 서술이 더 지지될 때만 나타남)">bistable 곡선</button>
       <button class="chip" data-layer="blink" title="반복 측정이 계수통계보다 크게 흩어진 setpoint — 두 상태 사이를 점멸한 지점">점멸 setpoint</button>
       <button class="chip" data-layer="other" title="반대 branch (up↔down) 를 함께 표시 — 기본은 분석 대상 branch 만 보입니다">반대 branch</button>
-      <span class="chip-sep"></span>
+      <span class="chip-sep"></span><span class="chip-grp">보기</span>
       <button class="chip" data-layer="norm" title="세로축을 I/모델 비율로 — 3 decade 축에서 숨는 오차가 전부 드러난다">정규화 뷰</button>
       <button class="chip" data-layer="weights" title="점 크기 ∝ 유효 가중치 — 곡선이 실제로 무엇에 맞춰졌는지">가중치 크기</button>
       <button class="chip" data-layer="spline" title="비모수 P-spline 교차검증 곡선">P-spline</button>
       <button class="chip" data-layer="envelope" title="고상태 max envelope (실제 집계가 일어난 파일에서만)">고상태 envelope</button>
-      <span class="chip-sep"></span>
+      <span class="chip-sep"></span><span class="chip-grp">도구</span>
       <button class="chip" data-layer="manual" title="반투명 윈도우의 양쪽 끝을 드래그해 범위 조절 — 윈도우 내 최좌·최우 점을 이은 코드 기울기">수동 기울기</button>
     </div>
     <div id="chart-power" class="chart" style="height:430px;"></div>
@@ -46506,8 +46576,8 @@ function renderPowerScan(rec) {
     <h3>국소 기울기 곡선 s(P) = d log I / d log P <span class="muted small">— 비선형성의 전체 프로파일</span></h3>
     <div id="chart-slope" class="chart" style="height:330px;"></div>
   </div>
-  <div class="panel"><h3>PA regime <span class="muted small">— SegPA ${PrismFit.SEGPA_VERSION} · up/down 원자료</span></h3><div id="segpa-results"><div class="muted">분석 중…</div></div></div>
-  <div class="panel"><h3>PrismFit 2.2 상세 <span class="muted small">— 기존 모델 기반 결과 (참고)</span></h3><div id="fit-results"><div class="muted">피팅 중…</div></div></div>
+  <details class="panel fold" data-fold="segpa"${foldOpen("segpa") ? " open" : ""}><summary><h3>SegPA 구간 상세 <span class="muted small">— ${PrismFit.SEGPA_VERSION} · up/down 원자료 · regime 전체</span></h3></summary><div id="segpa-results"><div class="muted">분석 중…</div></div></details>
+  <details class="panel fold" data-fold="fit"${foldOpen("fit") ? " open" : ""}><summary><h3>PrismFit 2.2 상세 <span class="muted small">— 모델 기반 결과 (참고)</span> <span id="fit-sum" class="fold-sum"></span></h3></summary><div id="fit-results"><div class="muted">피팅 중…</div></div></details>
   <div class="panel">
     <div class="flex">
       <h3 style="margin:0;">불확도 진단 (전체 파이프라인 부트스트랩)</h3>
@@ -46519,14 +46589,7 @@ function renderPowerScan(rec) {
     </div>
     <div id="diag-results" class="small muted" style="margin-top:8px;">진단은 요청 시에만 실행됩니다 (수십 초). 실행 후 s_max·임계값에 95% CI가 붙고 기울기 곡선에 신뢰 밴드가 표시됩니다.</div>
   </div>
-  <div class="panel"><div class="flex">
-    <h3 style="margin:0;">내보내기</h3>
-    <button id="ex-png" class="small">그래프 PNG</button>
-    <button id="ex-slope-png" class="small">기울기곡선 PNG</button>
-    <button id="ex-csv" class="small">데이터+피팅 CSV</button>
-    <button id="ex-json" class="small">전체 결과 JSON</button>
-    <button id="ex-copy" class="small">요약 복사</button>
-  </div></div>`;
+`;
 
   $("#c-branch").value = s.branch;
   $("#c-lambda").value = String(s.lambdaFactor ?? 1);
@@ -46600,6 +46663,9 @@ function renderPowerScan(rec) {
     }
     refreshPowerView(r);
   };
+  document.querySelectorAll("#view details.fold").forEach((d) => d.addEventListener("toggle", () => { App.ui.fold[d.dataset.fold] = d.open; }));
+  const em = document.querySelector("#view .exp-menu");
+  if (em) em.addEventListener("click", (e) => { if (e.target.closest(".exp-pop button")) em.open = false; });
   $("#c-diag").addEventListener("click", () => runDiagnosticsUI(rec));
   $("#ex-png").addEventListener("click", () => exportChartPng(rec, "#chart-power", "_powerfit"));
   $("#ex-slope-png").addEventListener("click", () => exportChartPng(rec, "#chart-slope", "_slope"));
@@ -46850,6 +46916,63 @@ function renderSegPA(rec) {
       ${isFinite(hyst) ? `<br><b>Ith↑/Ith↓</b> = ${fmt(hyst, 3)} (첫 regime 브래킷 기하평균 비 · &gt;1 쌍안정/지연형, &lt;1 광퇴색형)` : ""}
       <br>SegPA ${PrismFit.SEGPA_VERSION} · 구간 분할은 동적계획법 전역최적(국소해 없음) · 강조 행 = 현재 분석 branch
     </div>`;
+  renderPaHeadline(rec);
+}
+/* ③ 재설계 — 결과 요약 카드. SegPA(헤드라인 방법)를 분지별로 한 줄씩, PrismFit 은 참고 한 줄.
+   값은 아래 상세 표와 같은 함수(segpaFirst/segpaPaText)에서 가져온다 — 숫자를 새로 만들지 않는다. */
+App.ui = App.ui || { fold: {} };
+function foldOpen(k) { return !!(App.ui && App.ui.fold && App.ui.fold[k]); }
+function fitWarnCount(a) {
+  let n = 0;
+  if ((a.boundHits || []).length) n++;
+  if (a.stability && a.stability.checked && !a.stability.stable) n++;
+  if (a.slopeProfile && a.slopeProfile.verdict === "unbounded") n++;
+  return n;
+}
+function renderPaHeadline(rec) {
+  const el = document.getElementById("pa-headline");
+  if (!el) return;
+  const sel = segpaSelectedName(rec);
+  const dens = densityActive();
+  const cells = [];
+  for (const name of ["up", "down"]) {
+    const sp = segpaFor(rec, name);
+    if (!sp) continue;
+    const on = name === sel;
+    let body;
+    if (sp.error) body = `<div class="ph-main"><span class="ph-v tag-Poor">SegPA 실패</span></div><div class="ph-s">${esc(sp.error)}</div>`;
+    else if (!sp.regimes.length) body = `<div class="ph-main"><span class="ph-v ph-none">regime 없음</span></div><div class="ph-s">앞 구간보다 뚜렷하게 가파른 구간이 없습니다</div>`;
+    else {
+      const q = segpaFirst(sp), n = sp.regimes.length;
+      const cls = q.cls === "PA" ? `<span class="ph-cls pa" title="헤드라인 PA ≥ 5">PA regime</span>` : `<span class="ph-cls sb" title="헤드라인 PA < 5 — 약한 비선형, PA 판정 보류">S-bend</span>`;
+      const st = (q.status.startsWith("lower-bound") ? `하한 (${q.kind === "bridge" ? "한 간격 jump" : "2점"})` : "분해됨") + (q.status.includes("right-censored") ? " · 스캔 끝 검열" : "");
+      body = `<div class="ph-main"><span class="ph-k">PA</span><span class="ph-v">${segpaPaText(q)}</span>${cls}</div>
+        <div class="ph-line"><span class="ph-k">I<sub>th</sub></span><span class="ph-v2">${fmt(q.bracketW[0], 4)} – ${fmt(q.bracketW[1], 4)} W</span></div>
+        ${dens ? `<div class="ph-s">${segpaDens(q.bracketW[0])} – ${segpaDens(q.bracketW[1])}</div>` : ""}
+        <div class="ph-s">${st}${n > 1 ? ` · regime ${n}개 중 첫 점화` : ""}</div>`;
+    }
+    cells.push(`<div class="ph-cell${on ? " on" : ""}"><div class="ph-h">${name === "up" ? "up (증가)" : "down (감소)"}${on ? ' <span class="ph-tag">분석 대상</span>' : ""}</div>${body}</div>`);
+  }
+  const a = currentAnalysis(rec);
+  let pf;
+  if (!a) pf = `<span class="muted">PrismFit 피팅 중…</span>`;
+  else {
+    const q = a.quality || {}, boot = a.diag, w = fitWarnCount(a);
+    const ge = a.paSource === "lower-bound" || a.paGridLimited ? "≥ " : "";
+    pf = `PrismFit (참고) PA <b>${a.paSource === "unresolved" ? "unidentified" : ge + fmt(a.paReport, 4)}</b>`
+      + (q.band ? ` · 품질 <span class="tag-${q.band}">${q.band}</span>` : "")
+      + (boot && boot.ci && boot.ci.sMax && isFinite(boot.ci.sMax[0]) ? ` · s<sub>max</sub> 95% CI [${fmt(boot.ci.sMax[0], 3)}, ${fmt(boot.ci.sMax[1], 3)}]` : "")
+      + (w ? ` · <a href="#" class="ph-warn" data-openfold="fit">⚠ 경고 ${w}건</a>` : "");
+  }
+  el.innerHTML = `<div class="ph-grid">${cells.join("") || '<div class="muted">SegPA 결과 없음</div>'}</div>
+    <div class="ph-foot">${pf}<span class="ph-more"><a href="#" data-openfold="segpa">구간 상세</a></span></div>`;
+  el.querySelectorAll("[data-openfold]").forEach((x) => x.addEventListener("click", (e) => {
+    e.preventDefault();
+    const d = document.querySelector(`#view details.fold[data-fold="${x.dataset.openfold}"]`);
+    if (d) { d.open = true; d.scrollIntoView({ behavior: "smooth", block: "start" }); }
+  }));
+  const fs = document.getElementById("fit-sum");
+  if (fs) fs.innerHTML = a ? `${a.quality && a.quality.band ? `<span class="tag-${a.quality.band}">${a.quality.band}</span>` : ""}${fitWarnCount(a) ? ` <span class="tag-Poor">⚠ ${fitWarnCount(a)}</span>` : ""}` : "";
 }
 function segpaSummaryText(rec) {
   const out = [];
@@ -47429,6 +47552,7 @@ function orderLabel(a) {
 function renderFitResults(rec, analysis) {
   const el = $("#fit-results");
   if (!el) return;
+  try { renderPaHeadline(rec); } catch (e) {}
   const a = analysis, p = a.params, q = a.quality, d = a.diagnostics;
   const boot = a.diag;
   const kd = densityFactor();
@@ -48869,7 +48993,8 @@ async function runBatch() {
   const back = document.createElement("div");
   back.className = "modal-back";
   back.innerHTML = `<div class="modal"><h2>일괄 피팅 <span class="muted small">(PrismFit 2 · branch=${App.settings.branch})</span></h2>
-    <div id="batch-status" class="small muted">준비…</div>
+    <div id="batch-status" class="small muted" aria-live="polite">준비…</div>
+    <div class="batch-prog" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div>
     <div style="overflow:auto;max-height:56vh;margin-top:8px;">
     ${targets.length ? `<table class="res" id="batch-table">
       <tr><th>파일</th><th>타입</th><th title="SegPA 헤드라인 (현재 branch 의 가장 낮은 파워 regime)">SegPA PA</th><th>분류</th><th>SegPA Ith (W)</th><th>주 상승</th><th>PrismFit 보고 PA</th><th>모델</th><th>s_max</th><th>점프</th><th>임계 (W)</th><th>포화 (W)</th><th>B</th><th>χ²_red</th><th>품질</th></tr>
@@ -48889,6 +49014,14 @@ async function runBatch() {
      없어진 #batch-status 에 쓰려다 오류로 멈췄다. */
   let running = true, cancelled = false;
   const setStatus = (t) => { const el = back.querySelector("#batch-status"); if (el) el.textContent = t; };
+  const nAll = targets.length + riseTargets.length;
+  const setBar = (k) => { const pb = back.querySelector(".batch-prog"); if (!pb) return; const v = nAll ? Math.round(100 * k / nAll) : 100; pb.firstChild.style.width = v + "%"; pb.setAttribute("aria-valuenow", v); };
+  back.addEventListener("click", (e) => {
+    const tr = e.target.closest("tr[data-id]");
+    if (!tr) return;
+    if (running) { toast("일괄 피팅이 끝나면 열 수 있습니다"); return; }
+    back.remove(); setProgress(null); selectFile(tr.dataset.id);
+  });
   $("#batch-close").addEventListener("click", () => {
     if (running) {
       if (!confirm("일괄 피팅을 중단하고 닫을까요?\n(이미 피팅된 파일의 결과는 각 파일 화면에 남습니다)")) return;
@@ -48901,7 +49034,7 @@ async function runBatch() {
   for (let i = 0; i < targets.length; i++) {
     if (cancelled) return;
     const rec = targets[i];
-    setStatus(`피팅 중 ${i + 1}/${targets.length}: ${rec.name}`);
+    setStatus(`피팅 중 ${i + 1}/${targets.length}: ${rec.name}`); setBar(i);
     setProgress(i / targets.length);
     let row;
     try {
@@ -48914,7 +49047,7 @@ async function runBatch() {
       results.push({ rec, a });
       const q = a.quality;
       const sq = segpaFirst(segpaFor(rec, segpaSelectedName(rec)));
-      row = `<tr><td>${esc(rec.name)}</td><td>${rec.det.type === "power_apd" ? "APD" : "EMCCD"}</td>
+      row = `<tr data-id="${rec.id}" title="클릭하면 이 파일을 엽니다"><td>${esc(rec.name)}</td><td>${rec.det.type === "power_apd" ? "APD" : "EMCCD"}</td>
         <td class="num"><b>${sq ? segpaPaText(sq) : "–"}</b></td><td>${sq ? sq.cls : "없음"}</td>
         <td class="num">${sq ? fmt(sq.bracketW[0], 4) + "–" + fmt(sq.bracketW[1], 4) : "–"}</td><td class="num">${sq && sq.main ? fmt(sq.main.slope, 3) : "–"}</td>
         <td class="num"><b>${a.paSource === "lower-bound" || a.paGridLimited ? "≥" : ""}${fmt(a.paReport, 4)}</b>${a.paSource === "unresolved" ? '<span class="tag-Poor" title="unidentified — point estimate 아님">?</span>' : ""}</td>
@@ -48939,7 +49072,7 @@ async function runBatch() {
   for (let i = 0; i < riseTargets.length; i++) {
     if (cancelled) return;
     const rec = riseTargets[i];
-    setStatus(`Rise 분석 중 ${i + 1}/${riseTargets.length}: ${rec.name}`);
+    setStatus(`Rise 분석 중 ${i + 1}/${riseTargets.length}: ${rec.name}`); setBar(targets.length + i);
     let row;
     try {
       const d = getRiseData(rec);
@@ -48950,7 +49083,7 @@ async function runBatch() {
       const r = a.rise;
       const [vc, vt] = RISE_VERDICT_STYLE[a.verdict.klass] || RISE_VERDICT_STYLE.none;
       const lg = r && r.fit && r.fit.model === "logistic_delay" ? r.fit.params : null;
-      row = `<tr><td>${esc(rec.name)}</td>
+      row = `<tr data-id="${rec.id}" title="클릭하면 이 파일을 엽니다"><td>${esc(rec.name)}</td>
         <td class="num"><b>${r && r.ok ? (r.unresolvedFast ? "&lt;" : "") + fmtT(r.free.t1090) : "–"}</b></td>
         <td class="num">${r && r.ok ? fmtT(r.free.t1e) : "–"}</td>
         <td class="num">${r && r.ok ? fmtT(r.free.t50) : "–"}</td>
@@ -48987,8 +49120,9 @@ async function runBatch() {
       downloadText("risetime_batch.csv", rowsToCsv(rows), "text/csv");
     });
   }
-  setProgress(1); setTimeout(() => setProgress(null), 300);
-  setStatus(`완료 — Power scan ${results.length}/${targets.length}` +
+  setProgress(1); setTimeout(() => setProgress(null), 300); setBar(nAll);
+  back.querySelector(".modal").classList.add("batch-done");
+  setStatus(`완료 · 행을 누르면 그 파일을 엽니다 — Power scan ${results.length}/${targets.length}` +
     (riseTargets.length ? ` · Rise ${riseResults.length}/${riseTargets.length}` : "") +
     ` · s_max 뒤 ↑ 표시는 edge-censored lower bound`);
   const csvBtn = $("#batch-csv");
