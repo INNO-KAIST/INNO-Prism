@@ -389,8 +389,8 @@ table.res tr.sel td { background: var(--ui-accent-soft); }
    한글은 기본값이 '음절마다 줄바꿈 가능'이라 좁은 폭에서 마지막 한두 글자만 다음 줄로
    떨어진다. 어절 단위로만 끊고, 한 단어만 남는 줄을 브라우저가 피하게 한다. */
 body { word-break: keep-all; }
-:where(h1, h2, h3, h4) { text-wrap: balance; }
-:where(p, li, td, th, label, small, .notes, .muted, .empty-state) { text-wrap: pretty; }
+:where(h1, h2, h3, h4) { text-wrap-style: balance; }
+:where(p, li, td, th, label, small, .notes, .muted, .empty-state) { text-wrap-style: pretty; }
 
 </style>
 </head>
@@ -48855,12 +48855,23 @@ async function runBatch() {
       <span class="right"><button id="batch-close">닫기</button></span>
     </div></div>`;
   document.body.appendChild(back);
-  $("#batch-close").addEventListener("click", () => back.remove());
-  const table = $("#batch-table");
+  /* 실행 중에 닫으면 중단한다(확인 후). 예전에는 창만 사라지고 루프가 계속 돌다가
+     없어진 #batch-status 에 쓰려다 오류로 멈췄다. */
+  let running = true, cancelled = false;
+  const setStatus = (t) => { const el = back.querySelector("#batch-status"); if (el) el.textContent = t; };
+  $("#batch-close").addEventListener("click", () => {
+    if (running) {
+      if (!confirm("일괄 피팅을 중단하고 닫을까요?\n(이미 피팅된 파일의 결과는 각 파일 화면에 남습니다)")) return;
+      cancelled = true;
+    }
+    back.remove(); setProgress(null);
+  });
+  const table = back.querySelector("#batch-table");
   const results = [];
   for (let i = 0; i < targets.length; i++) {
+    if (cancelled) return;
     const rec = targets[i];
-    $("#batch-status").textContent = `피팅 중 ${i + 1}/${targets.length}: ${rec.name}`;
+    setStatus(`피팅 중 ${i + 1}/${targets.length}: ${rec.name}`);
     setProgress(i / targets.length);
     let row;
     try {
@@ -48889,14 +48900,16 @@ async function runBatch() {
     } catch (e) {
       row = `<tr><td>${esc(rec.name)}</td><td colspan="13" class="tag-Poor">실패: ${esc(e.message)}</td></tr>`;
     }
+    if (cancelled) return;
     table.insertAdjacentHTML("beforeend", row);
   }
   // --- rise-time files ---
   const riseResults = [];
-  const riseTable = document.getElementById("batch-rise-table");
+  const riseTable = back.querySelector("#batch-rise-table");
   for (let i = 0; i < riseTargets.length; i++) {
+    if (cancelled) return;
     const rec = riseTargets[i];
-    $("#batch-status").textContent = `Rise 분석 중 ${i + 1}/${riseTargets.length}: ${rec.name}`;
+    setStatus(`Rise 분석 중 ${i + 1}/${riseTargets.length}: ${rec.name}`);
     let row;
     try {
       const d = getRiseData(rec);
@@ -48922,8 +48935,10 @@ async function runBatch() {
     }
     if (riseTable) riseTable.insertAdjacentHTML("beforeend", row);
   }
+  if (cancelled) return;
+  running = false;
   if (riseResults.length) {
-    const rb = document.getElementById("batch-rise-csv");
+    const rb = back.querySelector("#batch-rise-csv");
     rb.disabled = false;
     rb.addEventListener("click", () => {
       const rows = [["file", "t10_90_ms", "t_1e_ms", "t50_ms", "t10_ms", "t90_ms", "induction_ratio", "verdict", "model",
@@ -48943,9 +48958,9 @@ async function runBatch() {
     });
   }
   setProgress(1); setTimeout(() => setProgress(null), 300);
-  $("#batch-status").textContent = `완료 — Power scan ${results.length}/${targets.length}` +
+  setStatus(`완료 — Power scan ${results.length}/${targets.length}` +
     (riseTargets.length ? ` · Rise ${riseResults.length}/${riseTargets.length}` : "") +
-    ` · s_max 뒤 ↑ 표시는 edge-censored lower bound`;
+    ` · s_max 뒤 ↑ 표시는 edge-censored lower bound`);
   const csvBtn = $("#batch-csv");
   csvBtn.disabled = !results.length;
   csvBtn.addEventListener("click", () => {
