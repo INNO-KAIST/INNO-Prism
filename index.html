@@ -392,6 +392,36 @@ body { word-break: keep-all; }
 :where(h1, h2, h3, h4) { text-wrap-style: balance; }
 :where(p, li, td, th, label, small, .notes, .muted, .empty-state) { text-wrap-style: pretty; }
 
+/* ════════ INNO suite UX layer — 공통 CSS (2026-09-29) ════════ */
+/* 앱 전환 버튼·메뉴 (크롬 위) */
+.inno-apps{position:relative;display:inline-flex}
+.inno-apps-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:8px;
+  border:1px solid var(--chrome-line);background:var(--chrome-soft);color:var(--chrome-ink);cursor:pointer;padding:0}
+.inno-apps-btn:hover{background:var(--chrome-soft-2)}
+.inno-apps-menu{display:none;position:fixed;z-index:300;width:300px;max-width:calc(100vw - 24px);
+  background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-lg);padding:6px}
+.inno-apps-menu.open{display:block}
+.inno-apps-menu a{display:flex;align-items:center;gap:12px;padding:8px 10px;border-radius:8px;color:inherit;text-decoration:none}
+.inno-apps-menu a:hover,.inno-apps-menu a:focus-visible{background:var(--surface-2);text-decoration:none}
+.inno-apps-menu a.cur{background:var(--accent-soft)}
+.inno-apps-menu img{border-radius:9px;flex:none}
+.inno-apps-menu b{display:block;font-weight:600;font-size:13.5px}
+.inno-apps-menu small{display:block;color:var(--muted);font-size:12px;line-height:1.35}
+/* 키보드로 연 행·칸의 포커스 표시 */
+[role=button][tabindex="0"]:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+/* 대화창 패널 자체에 포커스가 가도 테두리는 그리지 않는다(안의 요소부터 보이게) */
+[role=dialog]:focus{outline:none}
+/* 빈 결과 안내 (앱 공통) */
+.inno-empty{padding:28px 16px;text-align:center;color:var(--muted);font-size:13px}
+.inno-empty b{display:block;color:var(--ink);font-weight:600;font-size:14px;margin-bottom:4px}
+.inno-empty .btn{margin-top:10px}
+
+/* Prism: 앱 전환 버튼은 헤더 오른쪽 끝 */
+header .inno-apps{margin-left:10px}
+/* Prism 토큰 이름에 맞춤 */
+.inno-apps-menu{--surface:var(--surface-1);--ink:var(--text-primary);--muted:var(--text-muted);--accent-soft:var(--ui-accent-soft);--shadow-lg:0 24px 70px rgba(0,0,0,.55)}
+[role=button][tabindex="0"]:focus-visible{outline-color:var(--focus)}
+
 </style>
 </head>
 <body>
@@ -50338,6 +50368,196 @@ function imgBindSelectivity(rec) {
     downloadText(rec.name.replace(/\.h5$/i, "") + "_selectivity.csv", rowsToCsv(rows), "text/csv");
   });
 }
+
+</script>
+<!-- INNO suite UX layer -->
+<script>
+/* INNO suite UX layer — Prism 설정 (build.py 가 inno-ux.js 앞에 넣는다) */
+window.INNO_UX = {
+  apps: [{"name": "NanoLab", "desc": "합성 계획 · ICP", "url": "https://inno-kaist.github.io/INNO-NanoLab/", "icon": "data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cdefs%3E%3ClinearGradient id=%22swnan%22 x1=%220%22 y1=%220%22 x2=%221%22 y2=%221%22%3E%3Cstop offset=%220%22 stop-color=%22%235a3526%22/%3E%3Cstop offset=%22.62%22 stop-color=%22%233a241b%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width=%2264%22 height=%2264%22 rx=%2215%22 fill=%22url%28%23swnan%29%22/%3E%3Crect x=%22.75%22 y=%22.75%22 width=%2262.5%22 height=%2262.5%22 rx=%2214.3%22 fill=%22none%22 stroke=%22%23fff%22 stroke-opacity=%22.10%22 stroke-width=%221.5%22/%3E%3Cpath d=%22M27.5 13h9M29 13v12.2a14.5 14.5 0 1 0 6 0V13%22 stroke=%22%23e8b598%22 stroke-width=%224.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22 fill=%22none%22/%3E%3Cpath d=%22M19.6 40.5a12.5 12.5 0 0 0 24.8 0z%22 fill=%22%23e8b598%22 opacity=%22.38%22/%3E%3Ccircle cx=%2232%22 cy=%2239.5%22 r=%225.2%22 fill=%22%23F4F6F1%22/%3E%3Ccircle cx=%2232%22 cy=%2239.5%22 r=%228.4%22 fill=%22none%22 stroke=%22%23F4F6F1%22 stroke-width=%221.8%22 opacity=%22.7%22/%3E%3C/svg%3E", "current": false}, {"name": "Prism", "desc": "광학 측정 데이터 분석", "url": "https://inno-kaist.github.io/INNO-Prism/", "icon": "data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cdefs%3E%3ClinearGradient id=%22swpri%22 x1=%220%22 y1=%220%22 x2=%221%22 y2=%221%22%3E%3Cstop offset=%220%22 stop-color=%22%23363263%22/%3E%3Cstop offset=%22.62%22 stop-color=%22%2323213f%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width=%2264%22 height=%2264%22 rx=%2215%22 fill=%22url%28%23swpri%29%22/%3E%3Crect x=%22.75%22 y=%22.75%22 width=%2262.5%22 height=%2262.5%22 rx=%2214.3%22 fill=%22none%22 stroke=%22%23fff%22 stroke-opacity=%22.10%22 stroke-width=%221.5%22/%3E%3Cpath d=%22M30 14 14.5 47h31z%22 stroke=%22%23bdb9ec%22 stroke-width=%224.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22 fill=%22none%22/%3E%3Cpath d=%22M6 38.5 24.5 33%22 stroke=%22%23F4F6F1%22 stroke-width=%223.2%22 stroke-linecap=%22round%22/%3E%3Cpath d=%22M37.5 30.5 57 23%22 stroke=%22%23F4F6F1%22 stroke-width=%223.2%22 stroke-linecap=%22round%22/%3E%3Cpath d=%22M38.5 33.5 57 32.5%22 stroke=%22%23bdb9ec%22 stroke-width=%223.2%22 stroke-linecap=%22round%22/%3E%3Cpath d=%22M39.5 36.5 57 42%22 stroke=%22%23bdb9ec%22 stroke-width=%223.2%22 stroke-linecap=%22round%22 opacity=%22.55%22/%3E%3C/svg%3E", "current": true}, {"name": "Ledger", "desc": "측정 계획 · 이력", "url": "https://inno-kaist.github.io/INNO-Ledger/", "icon": "data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cdefs%3E%3ClinearGradient id=%22swled%22 x1=%220%22 y1=%220%22 x2=%221%22 y2=%221%22%3E%3Cstop offset=%220%22 stop-color=%22%2323505c%22/%3E%3Cstop offset=%22.62%22 stop-color=%22%2316323a%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width=%2264%22 height=%2264%22 rx=%2215%22 fill=%22url%28%23swled%29%22/%3E%3Crect x=%22.75%22 y=%22.75%22 width=%2262.5%22 height=%2262.5%22 rx=%2214.3%22 fill=%22none%22 stroke=%22%23fff%22 stroke-opacity=%22.10%22 stroke-width=%221.5%22/%3E%3Crect x=%2215%22 y=%2215%22 width=%2210%22 height=%2210%22 rx=%222.6%22 fill=%22%239fcad3%22 opacity=%221%22/%3E%3Crect x=%2227%22 y=%2215%22 width=%2210%22 height=%2210%22 rx=%222.6%22 fill=%22%239fcad3%22 opacity=%221%22/%3E%3Crect x=%2239%22 y=%2215%22 width=%2210%22 height=%2210%22 rx=%222.6%22 fill=%22%239fcad3%22 opacity=%220.4%22/%3E%3Crect x=%2215%22 y=%2227%22 width=%2210%22 height=%2210%22 rx=%222.6%22 fill=%22%239fcad3%22 opacity=%221%22/%3E%3Crect x=%2227%22 y=%2227%22 width=%2210%22 height=%2210%22 rx=%222.6%22 fill=%22%239fcad3%22 opacity=%220.4%22/%3E%3Crect x=%2240.1%22 y=%2228.1%22 width=%227.8%22 height=%227.8%22 rx=%222%22 fill=%22none%22 stroke=%22%239fcad3%22 stroke-width=%222.2%22 opacity=%22.55%22/%3E%3Crect x=%2215%22 y=%2239%22 width=%2210%22 height=%2210%22 rx=%222.6%22 fill=%22%239fcad3%22 opacity=%220.4%22/%3E%3Crect x=%2227%22 y=%2239%22 width=%2210%22 height=%2210%22 rx=%222.6%22 fill=%22%23F4F6F1%22/%3E%3Crect x=%2240.1%22 y=%2240.1%22 width=%227.8%22 height=%227.8%22 rx=%222%22 fill=%22none%22 stroke=%22%239fcad3%22 stroke-width=%222.2%22 opacity=%22.55%22/%3E%3C/svg%3E", "current": false}, {"name": "Analytics", "desc": "STEM · EDS 분석", "url": "https://inno-kaist.github.io/INNO-Analytics/", "icon": "data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cdefs%3E%3ClinearGradient id=%22swana%22 x1=%220%22 y1=%220%22 x2=%221%22 y2=%221%22%3E%3Cstop offset=%220%22 stop-color=%22%234f3048%22/%3E%3Cstop offset=%22.62%22 stop-color=%22%2333202f%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width=%2264%22 height=%2264%22 rx=%2215%22 fill=%22url%28%23swana%29%22/%3E%3Crect x=%22.75%22 y=%22.75%22 width=%2262.5%22 height=%2262.5%22 rx=%2214.3%22 fill=%22none%22 stroke=%22%23fff%22 stroke-opacity=%22.10%22 stroke-width=%221.5%22/%3E%3Ccircle cx=%2232%22 cy=%2232%22 r=%2219%22 stroke=%22%23e1b7d5%22 stroke-width=%224.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22 fill=%22none%22/%3E%3Cpath d=%22M19 40h5l3.5-15 3.5 15h3l2.5-7 2.5 7H45%22 stroke=%22%23F4F6F1%22 stroke-width=%223.4%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22 fill=%22none%22/%3E%3C/svg%3E", "current": false}, {"name": "Scheduler", "desc": "장비 주간 스케줄", "url": "https://inno-kaist.github.io/INNO-Scheduler/", "icon": "data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cdefs%3E%3ClinearGradient id=%22swsch%22 x1=%220%22 y1=%220%22 x2=%221%22 y2=%221%22%3E%3Cstop offset=%220%22 stop-color=%22%23264466%22/%3E%3Cstop offset=%22.62%22 stop-color=%22%231a2e42%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width=%2264%22 height=%2264%22 rx=%2215%22 fill=%22url%28%23swsch%29%22/%3E%3Crect x=%22.75%22 y=%22.75%22 width=%2262.5%22 height=%2262.5%22 rx=%2214.3%22 fill=%22none%22 stroke=%22%23fff%22 stroke-opacity=%22.10%22 stroke-width=%221.5%22/%3E%3Crect x=%2214%22 y=%2218%22 width=%2236%22 height=%2232%22 rx=%226%22 stroke=%22%23a9c7e5%22 stroke-width=%224.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22 fill=%22none%22/%3E%3Cpath d=%22M14 27.5h36%22 stroke=%22%23a9c7e5%22 stroke-width=%224.5%22/%3E%3Cpath d=%22M24 12.5v9M40 12.5v9%22 stroke=%22%23a9c7e5%22 stroke-width=%224.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22 fill=%22none%22/%3E%3Crect x=%2220.5%22 y=%2233%22 width=%228%22 height=%228%22 rx=%222%22 fill=%22%23a9c7e5%22 opacity=%22.45%22/%3E%3Crect x=%2234%22 y=%2233%22 width=%229.5%22 height=%229.5%22 rx=%222.4%22 fill=%22%23F4F6F1%22/%3E%3C/svg%3E", "current": false}, {"name": "RefAtlas", "desc": "연구실 문헌 지도", "url": "https://inno-refatlas.pages.dev/site/", "icon": "data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cdefs%3E%3ClinearGradient id=%22swref%22 x1=%220%22 y1=%220%22 x2=%221%22 y2=%221%22%3E%3Cstop offset=%220%22 stop-color=%22%2328504a%22/%3E%3Cstop offset=%22.62%22 stop-color=%22%231b3533%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width=%2264%22 height=%2264%22 rx=%2215%22 fill=%22url%28%23swref%29%22/%3E%3Crect x=%22.75%22 y=%22.75%22 width=%2262.5%22 height=%2262.5%22 rx=%2214.3%22 fill=%22none%22 stroke=%22%23fff%22 stroke-opacity=%22.10%22 stroke-width=%221.5%22/%3E%3Cpath d=%22M32 31.5 17 19%22 stroke=%22%23a6c6ad%22 stroke-width=%223.4%22 stroke-linecap=%22round%22 opacity=%22.6%22/%3E%3Cpath d=%22M32 31.5 47 16%22 stroke=%22%23a6c6ad%22 stroke-width=%223.4%22 stroke-linecap=%22round%22 opacity=%22.6%22/%3E%3Cpath d=%22M32 31.5 48 46%22 stroke=%22%23a6c6ad%22 stroke-width=%223.4%22 stroke-linecap=%22round%22 opacity=%22.6%22/%3E%3Cpath d=%22M32 31.5 17 46%22 stroke=%22%23a6c6ad%22 stroke-width=%223.4%22 stroke-linecap=%22round%22 opacity=%22.6%22/%3E%3Cpath d=%22M47 16 48 46%22 stroke=%22%23a6c6ad%22 stroke-width=%223.4%22 stroke-linecap=%22round%22 opacity=%22.6%22/%3E%3Ccircle cx=%2217%22 cy=%2219%22 r=%226%22 fill=%22%23a6c6ad%22/%3E%3Ccircle cx=%2247%22 cy=%2216%22 r=%225%22 fill=%22%23a6c6ad%22/%3E%3Ccircle cx=%2248%22 cy=%2246%22 r=%226.5%22 fill=%22%23a6c6ad%22/%3E%3Ccircle cx=%2217%22 cy=%2246%22 r=%224.6%22 fill=%22%23a6c6ad%22/%3E%3Ccircle cx=%2232%22 cy=%2231.5%22 r=%228%22 fill=%22%23F4F6F1%22/%3E%3C/svg%3E", "current": false}],
+  overlay: ".modal-back", panel: ".modal", closeBtn: ".rpt-x, #batch-close, #cb-close, [data-close]",
+  noDirty: ".rpt-back",
+  clickables: [".file-item", "#tabs .tab", "#drop-hint"],
+  tablists: [{ list: "#tabs", tab: ".tab", active: "active" }],
+  live: ["#toast"],
+  switcherHost: "header"
+};
+
+</script>
+<script>
+/* ════════ INNO suite UX layer (2026-09-29) ════════
+   6개 INNO 앱이 같은 규칙으로 동작하도록 붙이는 공통 층. 앱 코드는 거의 건드리지 않고,
+   DOM 을 지켜보다가(MutationObserver) 필요한 속성·동작을 덧붙인다.
+     1) 대화창·서랍: role=dialog, 열면 포커스를 안으로, 닫으면 원래 자리로, Tab 순환,
+        Esc 로 닫기, 입력을 고친 채 바깥을 누르면 확인.
+     2) 키보드: 클릭으로만 열리던 행·칸·항목에 tabindex·role 부여, Enter/Space 로 실행.
+     3) 탭 목록: role=tablist/tab, aria-selected.
+     4) 토스트: aria-live 로 화면낭독기에도 전달.
+     5) 앱 전환: 상단 크롬에 INNO 앱 목록 버튼.
+   설정은 window.INNO_UX = {...} (이 스크립트보다 먼저). */
+(function () {
+  "use strict";
+  const C = window.INNO_UX || {};
+  const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"]),[contenteditable="true"]';
+  const visible = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+
+  /* ---------- 1) 대화창 ---------- */
+  const stack = [];   // {ov, panel, ret, snap}
+  const overlaySel = C.overlay || ".overlay";
+  const panelSel = C.panel || ".modal,.drawer";
+  const isOpen = ov => ov.isConnected && (C.isOpen ? C.isOpen(ov) : (getComputedStyle(ov).display !== "none" && (!C.openClass || ov.classList.contains(C.openClass))));
+  function snapshot(panel) {
+    return [...panel.querySelectorAll("input,textarea,select")].map(e => e.type === "checkbox" || e.type === "radio" ? e.checked : e.value).join("\u0001");
+  }
+  function onOpen(ov) {
+    if (stack.some(s => s.ov === ov)) return;
+    const panel = ov.matches(panelSel) ? ov : (ov.querySelector(panelSel) || ov);
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    const h = panel.querySelector("h1,h2,h3");
+    if (h && !panel.getAttribute("aria-label")) panel.setAttribute("aria-label", h.textContent.trim().slice(0, 80));
+    const entry = { ov, panel, ret: document.activeElement, snap: null };
+    stack.push(entry);
+    /* 앱이 같은 대화창의 내용을 통째로 다시 그리면(저장·발급 뒤 재렌더) 그 시점을 새 기준으로 */
+    entry.mo = new MutationObserver(() => requestAnimationFrame(() => { entry.snap = snapshot(panel); }));
+    entry.mo.observe(panel, { childList: true });
+    requestAnimationFrame(() => {
+      entry.snap = snapshot(panel);
+      if (panel.contains(document.activeElement)) return;
+      const first = [...panel.querySelectorAll(FOCUSABLE)].find(e => visible(e) && !e.classList.contains("closex"));
+      if (first && /^(INPUT|TEXTAREA|SELECT)$/.test(first.tagName)) first.focus({ preventScroll: true });
+      else { if (!panel.hasAttribute("tabindex")) panel.setAttribute("tabindex", "-1"); panel.focus({ preventScroll: true }); }
+    });
+  }
+  function onClose(entry) {
+    const i = stack.indexOf(entry); if (i >= 0) stack.splice(i, 1);
+    if (entry.mo) entry.mo.disconnect();
+    if (entry.ret && entry.ret.isConnected && typeof entry.ret.focus === "function") entry.ret.focus({ preventScroll: true });
+  }
+  function dirty(entry) {
+    if (C.noDirty && entry.ov.matches(C.noDirty)) return false;   // 입력이 자동 저장되는 창
+    return entry.snap != null && snapshot(entry.panel) !== entry.snap;
+  }
+  function closeTop() {
+    const e = stack[stack.length - 1]; if (!e) return false;
+    if (dirty(e) && !confirm("입력한 내용이 저장되지 않았습니다. 닫을까요?")) return true;
+    e._confirmed = true;
+    const btn = e.panel.querySelector(C.closeBtn || ".closex,[data-close]");
+    if (btn && visible(btn)) btn.click();
+    else if (C.closeOverlay) C.closeOverlay(e.ov);
+    else e.ov.remove();
+    return true;
+  }
+  function scan() {
+    document.querySelectorAll(overlaySel).forEach(ov => { if (isOpen(ov)) onOpen(ov); });
+    for (const e of stack.slice()) if (!isOpen(e.ov)) onClose(e);
+  }
+  // 바깥(배경) 클릭 — 입력을 고쳤으면 확인 (캡처 단계에서 앱 핸들러보다 먼저)
+  document.addEventListener("click", ev => {
+    const e = stack[stack.length - 1]; if (!e || ev.target !== e.ov || e._confirmed) return;
+    if (dirty(e) && !confirm("입력한 내용이 저장되지 않았습니다. 닫을까요?")) { ev.stopImmediatePropagation(); ev.preventDefault(); }
+  }, true);
+  document.addEventListener("keydown", ev => {
+    const top = stack[stack.length - 1];
+    if (ev.key === "Escape" && top) {
+      if (document.querySelector(".inno-apps.open")) return;   // 앱 메뉴가 먼저 (메뉴 쪽 핸들러가 닫는다)
+      if (closeTop()) { ev.preventDefault(); ev.stopPropagation(); }
+      return;
+    }
+    if (ev.key === "Tab" && top) {   // 포커스 순환
+      const f = [...top.panel.querySelectorAll(FOCUSABLE)].filter(visible);
+      if (!f.length) return;
+      const a = f[0], z = f[f.length - 1];
+      if (!top.panel.contains(document.activeElement)) { ev.preventDefault(); a.focus(); }
+      else if (ev.shiftKey && document.activeElement === a) { ev.preventDefault(); z.focus(); }
+      else if (!ev.shiftKey && document.activeElement === z) { ev.preventDefault(); a.focus(); }
+    }
+  }, true);
+
+  /* ---------- 2) 키보드로 여는 행·칸 ---------- */
+  const clickSel = (C.clickables || []).join(",");
+  function markClickables(root) {
+    if (!clickSel) return;
+    (root.querySelectorAll ? root : document).querySelectorAll(clickSel).forEach(el => {
+      if (/^(A|BUTTON|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return;
+      if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "0");
+      if (!el.hasAttribute("role")) el.setAttribute("role", "button");
+    });
+  }
+  document.addEventListener("keydown", ev => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const el = ev.target;
+    if (!clickSel || !el.matches || !el.matches(clickSel) || /^(A|BUTTON|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return;
+    ev.preventDefault(); el.click();
+  });
+
+  /* ---------- 3) 탭 목록 ---------- */
+  function markTabs() {
+    (C.tablists || []).forEach(t => {
+      document.querySelectorAll(t.list).forEach(list => {
+        list.setAttribute("role", "tablist");
+        list.querySelectorAll(t.tab).forEach(b => {
+          b.setAttribute("role", "tab");
+          b.setAttribute("aria-selected", b.classList.contains(t.active) ? "true" : "false");
+          if (b.tagName !== "BUTTON" && !b.hasAttribute("tabindex")) b.setAttribute("tabindex", "0");
+        });
+      });
+    });
+  }
+
+  /* ---------- 4) 토스트 ---------- */
+  function markLive() { (C.live || []).forEach(s => document.querySelectorAll(s).forEach(el => { el.setAttribute("aria-live", "polite"); el.setAttribute("role", "status"); })); }
+
+  /* ---------- 5) 앱 전환 ---------- */
+  function buildSwitcher() {
+    if (!C.apps || !C.switcherHost) return;
+    const host = document.querySelector(C.switcherHost);
+    if (!host || host.querySelector(".inno-apps")) return;
+    const wrap = document.createElement("div");
+    wrap.className = "inno-apps";
+    wrap.innerHTML = `<button type="button" class="inno-apps-btn" aria-haspopup="true" aria-expanded="false" title="INNO 앱" aria-label="INNO 앱 전환">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><g fill="currentColor"><circle cx="5" cy="5" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="12" cy="19" r="2"/><circle cx="19" cy="19" r="2"/></g></svg></button>
+      <div class="inno-apps-menu" role="menu">
+        ${C.apps.map(a => `<a role="menuitem" href="${a.url}" ${a.current ? 'aria-current="page"' : 'target="_blank" rel="noopener"'} class="${a.current ? "cur" : ""}">
+          <img src="${a.icon}" width="36" height="36" alt=""><span><b>${a.name}</b><small>${a.desc}</small></span></a>`).join("")}
+      </div>`;
+    const place = C.switcherBefore ? host.querySelector(C.switcherBefore) : null;
+    host.insertBefore(wrap, place || null);
+    const btn = wrap.querySelector(".inno-apps-btn");
+    /* 메뉴는 body 에 붙인다 — 상단 크롬이 clip-path(전체 폭 띠)라 그 안에 두면 잘린다 */
+    const menu = wrap.querySelector(".inno-apps-menu");
+    menu.classList.add("inno-apps-pop"); document.body.appendChild(menu);
+    const set = open => {
+      wrap.classList.toggle("open", open); menu.classList.toggle("open", open);
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) {
+        const r = btn.getBoundingClientRect();
+        menu.style.top = Math.round(r.bottom + 8) + "px";
+        menu.style.right = Math.max(12, Math.round(window.innerWidth - r.right)) + "px";
+        const c = menu.querySelector("a.cur") || menu.querySelector("a"); c && c.focus();
+      }
+    };
+    btn.addEventListener("click", e => { e.stopPropagation(); set(!wrap.classList.contains("open")); });
+    document.addEventListener("click", e => { if (!wrap.contains(e.target) && !menu.contains(e.target)) set(false); });
+    window.addEventListener("resize", () => set(false));
+    const onKey = e => {
+      if (e.key === "Escape") { set(false); btn.focus(); e.stopPropagation(); }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        const it = [...menu.querySelectorAll("a")], i = it.indexOf(document.activeElement);
+        it[(i + (e.key === "ArrowDown" ? 1 : -1) + it.length) % it.length].focus(); e.preventDefault();
+      }
+    };
+    menu.addEventListener("keydown", onKey);
+    wrap.addEventListener("keydown", e => { if (e.key === "Escape") { set(false); e.stopPropagation(); } if (e.key === "ArrowDown" && !wrap.classList.contains("open")) { set(true); e.preventDefault(); } });
+  }
+
+  function all() { scan(); markClickables(document); markTabs(); markLive(); buildSwitcher(); if (C.after) C.after(); }
+  let pending = false;
+  const mo = new MutationObserver(() => { if (pending) return; pending = true; requestAnimationFrame(() => { pending = false; all(); }); });
+  function start() { all(); mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style"] }); }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
+  window.INNO_UX_API = { closeTop };
+})();
 
 </script>
 </body>
