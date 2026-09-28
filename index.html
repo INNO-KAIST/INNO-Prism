@@ -385,6 +385,13 @@ table.res tr.sel td { background: var(--ui-accent-soft); }
 .brand .brand-mark { display: block; flex: none; }
 .brand .brand-accent { color: var(--chrome-mark); }
 
+/* ── 한글 줄바꿈 (2026-09-29) ──
+   한글은 기본값이 '음절마다 줄바꿈 가능'이라 좁은 폭에서 마지막 한두 글자만 다음 줄로
+   떨어진다. 어절 단위로만 끊고, 한 단어만 남는 줄을 브라우저가 피하게 한다. */
+body { word-break: keep-all; }
+:where(h1, h2, h3, h4) { text-wrap: balance; }
+:where(p, li, td, th, label, small, .notes, .muted, .empty-state) { text-wrap: pretty; }
+
 </style>
 </head>
 <body>
