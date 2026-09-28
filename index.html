@@ -311,6 +311,76 @@ select[multiple] { background: var(--surface-2); color: var(--text-primary); bor
 .rpt-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 @media (max-width: 760px) { .rpt-grid { grid-template-columns: 1fr; } }
 
+/* ════════ INNO suite skin — Workspace 결 (2026-09-29) ════════
+   Prism 은 어두운 화면 전용 측정 도구다. 데이터 캔버스(패널·그래프 바탕)는 색이 섞이지 않은
+   중성 회색을 그대로 둔다 — 색조가 있는 바탕은 계열색의 지각 색상을 바꾸기 때문이다.
+   공통 틀에서 가져오는 것: 짙은 크롬 상단바, 폰트, 모서리, focus ring, 버튼·탭 위계.
+   Prism 고유 강조색은 indigo-violet(UI 전용). --accent(계열1 파랑)는 결과 의미색이라 그대로 둔다. */
+:root {
+  --ui-accent: #a9a4e6;
+  --ui-accent-strong: #bdb9ee;
+  --ui-accent-soft: rgba(169,164,230,.14);
+  --on-ui-accent: #1b1a31;
+  --focus: #b3aeea;
+  --chrome: #1b1a31;
+  --chrome-ink: #f1f4ef;
+  --chrome-ink-2: rgba(241,244,239,.72);
+  --chrome-line: rgba(255,255,255,.09);
+  --chrome-soft: rgba(255,255,255,.08);
+  --chrome-soft-2: rgba(255,255,255,.14);
+  --chrome-mark: #bdb9ec;
+  --font: "DM Sans", "Noto Sans KR", system-ui, -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+}
+body { font-family: var(--font); font-synthesis: none; -webkit-font-smoothing: antialiased; }
+::selection { background: rgba(169,164,230,.30); }
+:where(button, a, input, select, textarea, summary, [tabindex], .tab, .file-item):focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+input[type=number]:focus, input[type=text]:focus, select:focus { outline: none; border-color: var(--ui-accent); box-shadow: 0 0 0 3px rgba(169,164,230,.22); }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+
+/* ── 상단 크롬 ── */
+header { background: var(--chrome); border-bottom: 1px solid var(--chrome-line); color: var(--chrome-ink); }
+.brand { font-weight: 700; letter-spacing: .02em; color: var(--chrome-ink); }
+.brand .ver { color: var(--chrome-ink-2); }
+header > button { background: var(--chrome-soft); border-color: var(--chrome-line); color: var(--chrome-ink); font-weight: 500; }
+header > button:hover { background: var(--chrome-soft-2); border-color: var(--chrome-line); }
+header > span.muted { color: var(--chrome-ink-2); }
+header .ledger-badge { background: var(--chrome-soft); border-color: var(--chrome-line); color: var(--chrome-ink); }
+
+/* ── 버튼 ── */
+button { border-radius: 7px; font-weight: 500; }
+button:hover { border-color: #55554f; }
+button.primary { background: var(--ui-accent); border-color: var(--ui-accent); color: var(--on-ui-accent); font-weight: 600; }
+button.primary:hover { background: var(--ui-accent-strong); border-color: var(--ui-accent-strong); }
+#im-frame { accent-color: var(--ui-accent); }
+#progress-bar { background: var(--ui-accent); }
+
+/* ── 사이드바 ── */
+.file-item.active { background: var(--ui-accent-soft); border-color: rgba(169,164,230,.45); }
+.file-item.active .fname { color: #fff; font-weight: 600; }
+#drop-hint { border-color: #4a4a45; border-radius: 10px; }
+body.dragging #drop-hint { border-color: var(--ui-accent); color: var(--ui-accent); background: var(--ui-accent-soft); }
+
+/* ── 탭: 선택 탭에 강조 밑줄 ── */
+.tab { position: relative; border-radius: 7px 7px 0 0; transition: color .12s, background .12s; }
+.tab:hover { background: var(--surface-2); }
+.tab.active { background: var(--surface-1); font-weight: 600; }
+.tab.active::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: 0; height: 2px; border-radius: 2px; background: var(--ui-accent); }
+
+/* ── 패널 ── */
+.panel { border-radius: 10px; padding: 14px 16px; }
+.panel h3 { color: var(--text-secondary); letter-spacing: .01em; }  /* 대문자 변환 금지 — 제목에 수식·단위·경로(s(P), d log I, µm)가 들어간다 */
+.card { border-radius: 8px; }
+table.res tr.sel td { background: var(--ui-accent-soft); }
+.modal { border-radius: 12px; box-shadow: 0 24px 70px rgba(0,0,0,.55); }
+.modal-back { background: rgba(8,8,16,.62); }
+#toast { background: #e3ebe2; color: var(--chrome); border: 0; font-weight: 500; box-shadow: 0 12px 40px rgba(0,0,0,.45); }
+.empty-state .big { color: var(--text-primary); font-weight: 600; }
+.chip:focus-visible { outline-offset: 1px; }
+
+@media (max-width: 820px) {
+  header > button { padding: 6px 11px; }
+}
+
 </style>
 </head>
 <body>
