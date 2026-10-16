@@ -1,0 +1,202 @@
+[
+ {
+  "id": "C01",
+  "rel": "260616/260616_(power_scan)_WJ-0122c #4.h5",
+  "tag": "random"
+ },
+ {
+  "id": "C02",
+  "rel": "260723/260723_(power_scan)_WJ-0127c #6 (Oil, NIR).h5",
+  "tag": "NIR"
+ },
+ {
+  "id": "C03",
+  "rel": "260706/260706_(power_scan)_WJ-0123c #5 (Oil, Blue).h5",
+  "tag": "random"
+ },
+ {
+  "id": "C04",
+  "rel": "260616/260616_(power_scan)_WJ-0122c #1.h5",
+  "tag": "seg-none"
+ },
+ {
+  "id": "C05",
+  "rel": "260723/260723_(power_scan)_WJ-0127c #8 (Oil, NIR).h5",
+  "tag": "random"
+ },
+ {
+  "id": "C06",
+  "rel": "260709/260709_(power_scan)_WJ-0126c #2 (Oil, Blue).h5",
+  "tag": "unres→seg"
+ },
+ {
+  "id": "C07",
+  "rel": "260702/260702_(power_scan)_WJ-0128c #2 (Oil, NIR).h5",
+  "tag": "NIR"
+ },
+ {
+  "id": "C08",
+  "rel": "260826/260826_(power_scan)_WJ-0143c #1 (Oil, NIR).h5",
+  "tag": "seg-none"
+ },
+ {
+  "id": "C09",
+  "rel": "260604/260604_(power_scan)_WJ-0102c #1.h5",
+  "tag": "unres→seg"
+ },
+ {
+  "id": "C10",
+  "rel": "260723/260723_(power_scan)_WJ-0127c #16 (Oil, NIR).h5",
+  "tag": "sharp-bridge"
+ },
+ {
+  "id": "C11",
+  "rel": "260826/260826_(power_scan)_WJ-0144c #2 (Oil, NIR).h5",
+  "tag": "sharp-bridge"
+ },
+ {
+  "id": "C12",
+  "rel": "260803/260803_(power_scan)_WJ-0138c #1 (Oil, Blue).h5",
+  "tag": "multi"
+ },
+ {
+  "id": "C13",
+  "rel": "260702/260702_(power_scan)_WJ-0128c #8 (Oil, NIR).h5",
+  "tag": "sharp-bridge"
+ },
+ {
+  "id": "C14",
+  "rel": "260622/260621_(power_scan)_WJ-0123c #3.h5",
+  "tag": "random"
+ },
+ {
+  "id": "C15",
+  "rel": "260604/260604_(power_scan)_WJ-0102c #5.h5",
+  "tag": "weak<5"
+ },
+ {
+  "id": "C16",
+  "rel": "260622/260621_(power_scan)_WJ-0126c #1.h5",
+  "tag": "random"
+ },
+ {
+  "id": "C17",
+  "rel": "260723/260723_(power_scan)_WJ-0127c #12 (Oil, NIR).h5",
+  "tag": "sharp-bridge"
+ },
+ {
+  "id": "C18",
+  "rel": "260723/260723_(power_scan)_WJ-0127c #14 (Oil, NIR).h5",
+  "tag": "multi"
+ },
+ {
+  "id": "C19",
+  "rel": "260826/260826_(power_scan)_WJ-0144c #6 (Oil, NIR).h5",
+  "tag": "unres→seg"
+ },
+ {
+  "id": "C20",
+  "rel": "260706/260706_(power_scan)_WJ-0126c #1 (Oil, Blue).h5",
+  "tag": "unres→seg"
+ },
+ {
+  "id": "C21",
+  "rel": "260702/260702_(power_scan)_WJ-0128c #10 (Oil, NIR).h5",
+  "tag": "multi"
+ },
+ {
+  "id": "C22",
+  "rel": "260526/260526_(power_scan)_WJ-0082c #12.h5",
+  "tag": "multi"
+ },
+ {
+  "id": "C23",
+  "rel": "260622/260621_(power_scan)_WJ-0126c #5.h5",
+  "tag": "random"
+ },
+ {
+  "id": "C24",
+  "rel": "260714/260714_(power_scan)_WJ-0122c #1 (Oil, Blue).h5",
+  "tag": "seg-none"
+ },
+ {
+  "id": "C25",
+  "rel": "260629/260629_(power_scan)_WJ-0125c #6 (Oil).h5",
+  "tag": "weak<5"
+ },
+ {
+  "id": "C26",
+  "rel": "260826/260826_(power_scan)_WJ-0143c #2 (Oil, NIR).h5",
+  "tag": "seg-none"
+ },
+ {
+  "id": "C27",
+  "rel": "260702/260702_(power_scan)_WJ-0128c #4 (Oil, NIR).h5",
+  "tag": "sharp-bridge"
+ },
+ {
+  "id": "C28",
+  "rel": "260430/260430_(power_scan)_WJ-0080c #1.h5",
+  "tag": "weak<5"
+ },
+ {
+  "id": "C29",
+  "rel": "260616/260616_(power_scan)_WJ-0121c #2.h5",
+  "tag": "random"
+ },
+ {
+  "id": "C30",
+  "rel": "260604/260604_(power_scan)_WJ-0102c #2.h5",
+  "tag": "unres→seg"
+ },
+ {
+  "id": "C31",
+  "rel": "260808/260808_(power_scan)_WJ-0144c #1 (Oil, Blue).h5",
+  "tag": "unres→seg"
+ },
+ {
+  "id": "C32",
+  "rel": "260706/260706_(power_scan)_WJ-0123c #8 (Oil, Blue).h5",
+  "tag": "random"
+ },
+ {
+  "id": "C33",
+  "rel": "260526/260526_(power_scan)_WJ-0084c #7.h5",
+  "tag": "random"
+ },
+ {
+  "id": "C34",
+  "rel": "260808/260808_(power_scan)_WJ-0143c #3 (Oil, Blue).h5",
+  "tag": "seg-none"
+ },
+ {
+  "id": "C35",
+  "rel": "260826/260826_(power_scan)_WJ-0144c #5 (Oil, NIR).h5",
+  "tag": "NIR"
+ },
+ {
+  "id": "C36",
+  "rel": "260629/260629_(power_scan)_WJ-0123c #5.h5",
+  "tag": "weak<5"
+ },
+ {
+  "id": "C37",
+  "rel": "260616/260616_(power_scan)_WJ-0120c #1.h5",
+  "tag": "weak<5"
+ },
+ {
+  "id": "C38",
+  "rel": "260629/260629_(power_scan)_WJ-0128c #4 (Oil).h5",
+  "tag": "sharp-bridge"
+ },
+ {
+  "id": "C39",
+  "rel": "260430/260430_(power_scan)_WJ-0079c #2.h5",
+  "tag": "unres→seg"
+ },
+ {
+  "id": "C40",
+  "rel": "260622/260621_(power_scan)_WJ-0125c #4.h5",
+  "tag": "weak<5"
+ }
+]

@@ -1,0 +1,29 @@
+/* ════════ INNO suite UX layer — 공통 CSS (2026-09-29) ════════ */
+/* 앱 전환 버튼·메뉴 (크롬 위) */
+.inno-apps{position:relative;display:inline-flex}
+.inno-apps-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:8px;
+  border:1px solid var(--chrome-line);background:var(--chrome-soft);color:var(--chrome-ink);cursor:pointer;padding:0}
+.inno-apps-btn:hover{background:var(--chrome-soft-2)}
+.inno-apps-menu{display:none;position:fixed;z-index:300;width:300px;max-width:calc(100vw - 24px);
+  background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-lg);padding:6px}
+.inno-apps-menu.open{display:block}
+.inno-apps-menu a{display:flex;align-items:center;gap:12px;padding:8px 10px;border-radius:8px;color:inherit;text-decoration:none}
+.inno-apps-menu a:hover,.inno-apps-menu a:focus-visible{background:var(--surface-2);text-decoration:none}
+.inno-apps-menu a.cur{background:var(--accent-soft)}
+.inno-apps-menu img{border-radius:9px;flex:none}
+.inno-apps-menu b{display:block;font-weight:600;font-size:13.5px}
+.inno-apps-menu small{display:block;color:var(--muted);font-size:12px;line-height:1.35}
+/* 키보드로 연 행·칸의 포커스 표시 */
+[role=button][tabindex="0"]:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+/* 대화창 패널 자체에 포커스가 가도 테두리는 그리지 않는다(안의 요소부터 보이게) */
+[role=dialog]:focus{outline:none}
+/* 빈 결과 안내 (앱 공통) */
+.inno-empty{padding:28px 16px;text-align:center;color:var(--muted);font-size:13px}
+.inno-empty b{display:block;color:var(--ink);font-weight:600;font-size:14px;margin-bottom:4px}
+.inno-empty .btn{margin-top:10px}
+
+/* Prism: 앱 전환 버튼은 헤더 오른쪽 끝 */
+header .inno-apps{margin-left:10px}
+/* Prism 토큰 이름에 맞춤 */
+.inno-apps-menu{--surface:var(--surface-1);--ink:var(--text-primary);--muted:var(--text-muted);--accent-soft:var(--ui-accent-soft);--shadow-lg:0 24px 70px rgba(0,0,0,.55)}
+[role=button][tabindex="0"]:focus-visible{outline-color:var(--focus)}
