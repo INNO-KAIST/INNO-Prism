@@ -260,6 +260,11 @@ function detectType(file) {
     !/power/i.test(n.path.split("/").pop()) &&
     /measurement\/[^/]*(2d|scan|map|raster)[^/]*$/i.test(n.path));
   for (const g of scanGroups) {
+    // v3.20 — 3D(z-stack) 스캔을 먼저 본다. volume(Nz,Nv,Nh) 은 아래 2D 판정에도 걸리지만
+    // extract2DMaps 는 앞 차원이 8 을 넘는 3D 를 채널로 보지 않아 버리므로, 여기서 잡지 않으면
+    // "2D 맵" 으로 인식만 되고 맵이 하나도 없는 상태(축 배열 미리보기)가 된다.
+    const vol = findScan3D(tree, g.path);
+    if (vol) return { type: "scan3d", label: `3D scan · ${vol.nz} slice`, scanGroup: g.path, vol, tree };
     const maps = tree.filter((n) => n.kind === "dataset" && n.path.startsWith(g.path + "/") &&
       n.shape && n.shape.filter((s) => s >= 4).length >= 2);
     // waveform scans store only 1D streams — positions are enough to qualify
@@ -609,6 +614,87 @@ function scanAxes(file, scanGroup, ny, nx) {
     return { x: xs, y: ys, xLabel: "x", yLabel: "y" };
   }
   return null;
+}
+/* ------------------------------ 3D (z-stack) scan ------------------------------ */
+/**
+ * ScopeFoundry scan_3d: volume (Nz, Nv, Nh) + h_array · v_array · stack_array.
+ * 판정: 스캔 그룹 바로 아래의 3차원 데이터셋 중 (a) 첫 축 길이가 stack_array 와 같거나
+ * (b) 이름이 volume/stack/3d/cube 인 것. 둘 다 아니면 3D 로 보지 않는다 — 채널×Nv×Nh
+ * (앞 차원 ≤ 8) 묶음은 지금처럼 2D 맵의 slice 로 다룬다.
+ */
+function findScan3D(tree, group) {
+  const ds = (leaf) => tree.find((n) => n.kind === "dataset" && n.path === `${group}/${leaf}`);
+  const st = ds("stack_array");
+  const nStack = st && st.shape ? st.shape.filter((s) => s > 1)[0] : undefined;
+  let best = null;
+  for (const n of tree) {
+    if (n.kind !== "dataset" || !n.path.startsWith(group + "/")) continue;
+    const leaf = n.path.slice(group.length + 1);
+    if (leaf.includes("/")) continue;
+    const eff = (n.shape || []).filter((s) => s > 1);
+    if (eff.length !== 3 || eff[1] < 4 || eff[2] < 4) continue;
+    const zMatch = nStack === eff[0];
+    const named = /volume|stack|3d|cube/i.test(leaf);
+    if (!zMatch && !named) continue;
+    const score = (zMatch ? 10 : 0) + (named ? 5 : 0) + (leaf === "volume" ? 3 : 0);
+    if (!best || score > best.score) best = { score, path: n.path, shape: Array.from(n.shape), nz: eff[0], ny: eff[1], nx: eff[2] };
+  }
+  return best;
+}
+/** 3D 스캔의 축·단위·상태(중단 여부·진행률)·설정. 화소는 포함하지 않는다. */
+function extractScan3D(file, det) {
+  const g = det.scanGroup, v = det.vol;
+  const mA = attrsOf(safeGet(file, g) || {});
+  const sA = attrsOf(safeGet(file, `${g}/settings`) || {});
+  const uA = attrsOf(safeGet(file, `${g}/settings/units`) || {});
+  const axis = (leaf, n, unitKey) => {
+    const r = readDataset(file, `${g}/${leaf}`);
+    const a = attrsOf(safeGet(file, `${g}/${leaf}`) || {});
+    const ok = r && r.data.length === n;
+    let unit = a.unit != null ? String(a.unit) : (uA[unitKey] != null ? String(uA[unitKey]) : null);
+    if (unit && /^(um|µm|μm|micron)/i.test(unit)) unit = "µm";
+    return { values: ok ? Array.from(r.data, Number) : Array.from({ length: n }, (_, i) => i), unit: ok ? unit : "px", fromFile: !!ok };
+  };
+  const xA = axis("h_array", v.nx, "h_range"), yA = axis("v_array", v.ny, "v_range"), zA = axis("stack_array", v.nz, "stack_range");
+  const s = (k) => (sA[k] != null ? sA[k] : mA[k]);
+  return {
+    path: v.path, nz: v.nz, ny: v.ny, nx: v.nx,
+    x: xA.values, y: yA.values, z: zA.values,
+    xUnit: xA.unit, yUnit: yA.unit, zUnit: zA.unit,
+    xName: String(s("h_axis") || "h"), yName: String(s("v_axis") || "v"), zName: String(s("stack_axis") || "z"),
+    state: mA.state != null ? String(mA.state) : null,
+    progress: numOrNull(mA.progress),
+    currentSlice: numOrNull(sA.current_slice),
+    detector: sA.detector_hw != null ? String(sA.detector_hw) : null,
+    stage: sA.stage_hw != null ? String(sA.stage_hw) : null,
+    dwell: numOrNull(sA.dwell), dwellUnit: uA.dwell != null ? String(uA.dwell) : null,
+    bidirectional: attrBool(sA.bidirectional),
+    settings: sA,
+  };
+}
+/** k 번째 slice (Nv×Nh) → Float32Array. 측정되지 않은 화소는 NaN 그대로 둔다. */
+function readScan3DSlice(file, det, k) {
+  const v = det.vol, npx = v.ny * v.nx;
+  const d = safeGet(file, v.path);
+  if (!isDataset(d)) return null;
+  let flat = null;
+  try {
+    const ranges = []; let seen = 0;
+    for (const s of Array.from(d.shape || [])) {
+      if (s === 1) { ranges.push([0, 1]); continue; }
+      ranges.push(seen === 0 ? [k, k + 1] : [0, s]);
+      seen++;
+    }
+    flat = d.slice(ranges);
+  } catch (e) { flat = null; }
+  if (!flat || flat.length < npx) {
+    const all = readDataset(file, v.path);
+    if (!all) return null;
+    flat = all.data.subarray ? all.data.subarray(k * npx, (k + 1) * npx) : all.data.slice(k * npx, (k + 1) * npx);
+  }
+  const out = new Float32Array(npx);
+  for (let j = 0; j < npx; j++) { const x = Number(flat[j]); out[j] = isFinite(x) ? x : NaN; }
+  return out;
 }
 function extract2DMaps(file, tree, scanGroup) {
   // return candidate 2D maps under the scan group (squeeze singleton dims);
@@ -1017,5 +1103,6 @@ return {
   extract2DMaps, readForPreview, extractMeta, findPleGroup, safeGet,
   extractHistogram, scanAxes, extractPATrace, findPowerScanGroup, extractRiseTime, extractWaveScan, extractDarkening,
   findImagingGroup, readImageFrame, extractImaging, extractCameraMeta, extractHardwareSummary, attrBool,
+  findScan3D, extractScan3D, readScan3DSlice,
 };
 });

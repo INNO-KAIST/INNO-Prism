@@ -246,7 +246,8 @@
   }
   function themedFigure(gd, opt) {
     const th = THEMES[opt.theme] || THEMES.light;
-    const data = (gd.data || []).map(cloneFig);
+    // 화면 조작용 표식(탐침 십자 등, meta = "prism-ui-only")은 보고서 그림에 넣지 않는다
+    const data = (gd.data || []).filter((t) => !(t && t.meta === "prism-ui-only")).map(cloneFig);
     const layout = cloneFig(gd.layout || {});
     delete layout.width; delete layout.height; delete layout.title;
     layout.autosize = false;
