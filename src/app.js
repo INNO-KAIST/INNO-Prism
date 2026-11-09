@@ -375,7 +375,30 @@ function renderAll() {
   if (!rec) {
     header.innerHTML = ""; tabs.innerHTML = "";
     view.innerHTML = `<div class="empty-state">
-      <svg width="72" height="72" viewBox="0 0 24 24" fill="none"><path d="M12 3L3 19h18L12 3z" stroke="#3987e5" stroke-width="1.4"/><path d="M9.5 14.5l1.8-3.4 1.4 2.2 1.8-3.8" stroke="#c98500" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <svg class="welcome-mark" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="96" height="96"><defs>
+<linearGradient id="pwlbg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4a3aa8"/><stop offset=".45" stop-color="#26206a"/><stop offset="1" stop-color="#0d0c26"/></linearGradient>
+<radialGradient id="pwlgl" cx=".42" cy=".42" r=".6"><stop offset="0" stop-color="#b9a6ff" stop-opacity=".40"/><stop offset=".55" stop-color="#6c5ce7" stop-opacity=".10"/><stop offset="1" stop-color="#6c5ce7" stop-opacity="0"/></radialGradient>
+<linearGradient id="pwlsp" gradientUnits="userSpaceOnUse" x1="64" y1="20" x2="64" y2="45"><stop offset="0.000" stop-color="#ff2d6f"/><stop offset="0.167" stop-color="#ff7a3c"/><stop offset="0.333" stop-color="#ffd23f"/><stop offset="0.500" stop-color="#4be08a"/><stop offset="0.667" stop-color="#2cb9ff"/><stop offset="0.833" stop-color="#6d7bff"/><stop offset="1.000" stop-color="#a46bff"/></linearGradient>
+<linearGradient id="pwlfd" gradientUnits="userSpaceOnUse" x1="45.2" y1="0" x2="64" y2="0"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#fff" stop-opacity="0.5"/></linearGradient>
+<mask id="pwlmk"><rect width="64" height="64" fill="url(#pwlfd)"/></mask>
+<linearGradient id="pwlin" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="20.6" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".6" stop-color="#fff" stop-opacity=".8"/><stop offset="1" stop-color="#fff"/></linearGradient>
+<linearGradient id="pwlfr" x1="0" y1="0" x2=".4" y2="1"><stop offset="0" stop-color="#e9f8ff" stop-opacity=".62"/><stop offset=".5" stop-color="#a9c8ff" stop-opacity=".30"/><stop offset="1" stop-color="#8a7dff" stop-opacity=".22"/></linearGradient>
+<linearGradient id="pwlsd" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7d8cff" stop-opacity=".45"/><stop offset="1" stop-color="#3b2f8f" stop-opacity=".55"/></linearGradient>
+<linearGradient id="pwled" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset=".6" stop-color="#d8d0ff"/><stop offset="1" stop-color="#ffc2ea"/></linearGradient>
+<linearGradient id="pwlsh" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".18"/><stop offset=".42" stop-color="#fff" stop-opacity="0"/></linearGradient>
+<clipPath id="pwlcl"><rect width="64" height="64" rx="15"/></clipPath><filter id="pwlb" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="2.6"/></filter></defs>
+<rect width="64" height="64" rx="15" fill="url(#pwlbg)"/>
+<g clip-path="url(#pwlcl)">
+<rect width="64" height="64" fill="url(#pwlgl)"/>
+<g mask="url(#pwlmk)"><path d="M45.2 26.8 L64 19.5 L64 45.5 Z" fill="url(#pwlsp)" filter="url(#pwlb)" opacity=".85"/><path d="M45.2 26.8 L64 19.5 L64 45.5 Z" fill="url(#pwlsp)"/></g>
+<path d="M0 34.6 L20.6 30.0 L20.8 31.9 L0 38.4 Z" fill="url(#pwlin)"/>
+<path d="M27.50 12.50 L34.00 8.90 L49.00 43.90 L42.50 47.50 Z" fill="url(#pwlsd)" stroke="url(#pwled)" stroke-width="1.4" stroke-linejoin="round"/>
+<path d="M20.6 30.9 L45.2 26.8" stroke="#fff" stroke-opacity=".7" stroke-width="1.5" stroke-linecap="round"/>
+<path d="M27.50 12.50 L12.50 47.50 L42.50 47.50 Z" fill="url(#pwlfr)" stroke="url(#pwled)" stroke-width="2.0" stroke-linejoin="round"/>
+<path d="M26.60 15.70 L16.10 43.50" stroke="#fff" stroke-opacity=".6" stroke-width="1.1" stroke-linecap="round"/><path d="M14 11.5l.9 2.4 2.4.9-2.4.9-.9 2.4-.9-2.4-2.4-.9 2.4-.9z" fill="#fff" opacity=".85"/><circle cx="9.5" cy="21" r=".8" fill="#fff" opacity=".5"/><circle cx="53" cy="9" r=".7" fill="#fff" opacity=".45"/>
+</g>
+<rect width="64" height="64" rx="15" fill="url(#pwlsh)"/>
+<rect x=".75" y=".75" width="62.5" height="62.5" rx="14.3" fill="none" stroke="#fff" stroke-opacity=".16" stroke-width="1.5"/></svg>
       <div class="big">INNO Prism에 오신 것을 환영합니다</div>
       <div>.h5 광학 측정 파일을 열거나 이 창에 끌어다 놓으세요.<br>
       Power scan는 자동으로 Non-linearity 피팅이 수행됩니다.</div>
