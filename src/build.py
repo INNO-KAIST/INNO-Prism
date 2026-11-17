@@ -3,7 +3,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-VERSION = "3.20.0"
+VERSION = "3.21.1"
 
 # ---------------------------------------------------------------------------
 # 연구실 공용 대물렌즈 목록 (Firebase Realtime Database)

@@ -841,6 +841,357 @@ function noiseFromPair(imgA, imgB) {
   return d.sigma / Math.SQRT2;
 }
 
+/* ------------------- single-particle identification (v3.21) ------------------
+ * 비점멸 발광체(UCNP·PA 입자)의 단일입자 판별 — widefield 영상만으로.
+ *
+ * 근거: B. Krajnik, N. Rybarczyk, M. Święs, "Single non-blinking emitters:
+ *       Strategies for reliable identification", Opt. Mater. 176 (2026) 118085.
+ *   ① 밝기 기준 — 응집체의 평균 밝기는 단일입자 평균의 정수배(μn = n·μ1).
+ *   ② PSF 기준 — 단일 점광원의 PSF 는 대칭. ε = |σa − σb|/(σa + σb) ≤ 0.1.
+ *   둘을 **함께** 만족해야 단일로 본다(논문 결론: 한 기준만으로는 모호한 경우가 남는다).
+ *
+ * 논문과 다르게 구현한 곳 — 이유와 함께:
+ *   (a) ε 를 **회전 2D Gaussian 의 주축**(σmaj, σmin)으로 잰다. 논문은 가로·세로 FWHM 으로
+ *       정의했는데, 그러면 45° 방향으로 붙은 이합체는 σx = σy 가 되어 ε ≈ 0 으로 통과한다.
+ *       가로·세로 ε 도 함께 보고한다(논문 값과 비교용).
+ *   (b) 혼합분포에서 n 입자 응집체의 폭을 σn = √n·σ1 로 묶는다. 독립 입자 n 개의 합이므로
+ *       분산이 더해진다(논문은 성분마다 σ 를 자유롭게 맞췄다). 자유도가 줄어 표본이
+ *       적어도 안정적이다.
+ *   (c) ε 의 **불확도**를 피팅 공분산에서 전파해, 임계값이 불확도 안에 있으면 판정을
+ *       보류한다. 논문도 "낮은 SNR 에서는 폭의 불확도가 값 자체와 비슷해진다"고 경고했다.
+ *   (d) 조명 불균일 점검. widefield 여기광은 시야 안에서 세기가 다르고, 밝기가
+ *       여기세기의 s 제곱(PA 에서는 s ≫ 1)으로 변하므로 "밝기 = 입자 수" 가정이 깨진다.
+ *       밝기와 시야 중심 거리의 순위상관을 재서 경고한다.
+ *   SRRF(논문의 보조 확인)는 구현하지 않았다.
+ * ========================================================================== */
+
+/** 3×3·7×7 정도의 작은 대칭행렬 역행렬 (가우스-조르당, 부분 피벗). 특이하면 null. */
+function invSmall(M) {
+  const n = M.length, A = M.map((r, i) => r.concat(Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))));
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    if (!(Math.abs(A[p][c]) > 1e-300)) return null;
+    [A[c], A[p]] = [A[p], A[c]];
+    const d = A[c][c];
+    for (let j = 0; j < 2 * n; j++) A[c][j] /= d;
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = A[r][c];
+      if (f) for (let j = 0; j < 2 * n; j++) A[r][j] -= f * A[c][j];
+    }
+  }
+  return A.map((r) => r.slice(n));
+}
+
+/**
+ * 회전 2D Gaussian + 상수 배경, Levenberg–Marquardt.
+ *   I(x,y) = B + A·exp(−u²/2σa² − v²/2σb²),  u,v = 회전좌표(θ)
+ * 창: 중심 (xc,yc) 반경 R 정사각형. 잡음 σ 는 잔차에서 추정 → 공분산 = s²(JᵀJ)⁻¹.
+ */
+function fitGauss2D(img, nx, ny, xc, yc, opt) {
+  const o = Object.assign({ R: 5, maxIter: 80 }, opt || {});
+  const R = Math.max(2, Math.round(o.R));
+  const cx = Math.round(xc), cy = Math.round(yc);
+  if (cx - R < 0 || cy - R < 0 || cx + R >= nx || cy + R >= ny) return { ok: false, why: "가장자리" };
+  const X = [], Y = [], Z = [];
+  for (let y = cy - R; y <= cy + R; y++) for (let x = cx - R; x <= cx + R; x++) {
+    const v = img[y * nx + x];
+    if (!isFinite(v)) continue;
+    X.push(x); Y.push(y); Z.push(v);
+  }
+  const N = Z.length;
+  if (N < 25) return { ok: false, why: "화소 부족" };
+  // 초기값: 테두리 중앙값 = 배경, 2차 모멘트 = 폭·방향
+  const border = [];
+  for (let i = 0; i < N; i++) if (Math.abs(X[i] - cx) === R || Math.abs(Y[i] - cy) === R) border.push(Z[i]);
+  border.sort((a, b) => a - b);
+  let B = border[Math.floor(border.length / 2)];
+  let sw = 0, mx = 0, my = 0, pk = -Infinity;
+  for (let i = 0; i < N; i++) { const w = Math.max(0, Z[i] - B); sw += w; mx += w * X[i]; my += w * Y[i]; if (Z[i] > pk) pk = Z[i]; }
+  if (!(sw > 0) || !(pk > B)) return { ok: false, why: "신호 없음" };
+  mx /= sw; my /= sw;
+  let sxx = 0, syy = 0, sxy = 0;
+  for (let i = 0; i < N; i++) { const w = Math.max(0, Z[i] - B); const dx = X[i] - mx, dy = Y[i] - my; sxx += w * dx * dx; syy += w * dy * dy; sxy += w * dx * dy; }
+  sxx /= sw; syy /= sw; sxy /= sw;
+  const tr = sxx + syy, det = sxx * syy - sxy * sxy;
+  const l1 = tr / 2 + Math.sqrt(Math.max(0, tr * tr / 4 - det)), l2 = tr / 2 - Math.sqrt(Math.max(0, tr * tr / 4 - det));
+  const s0 = Math.min(R / 2, Math.max(0.7, Math.sqrt(Math.max(l2, 0.25)) * 0.8));
+  let p = [pk - B, mx, my, Math.min(R / 1.5, Math.max(0.7, Math.sqrt(Math.max(l1, 0.3)) * 0.8)) * 1.02, s0 * 0.98,
+    0.5 * Math.atan2(2 * sxy, sxx - syy) + 1e-3, B];
+  const model = (q, i, J) => {
+    const [A, x0, y0, sa, sb, th] = q;
+    const c = Math.cos(th), s = Math.sin(th);
+    const dx = X[i] - x0, dy = Y[i] - y0;
+    const u = dx * c + dy * s, v = -dx * s + dy * c;
+    const e = Math.exp(-(u * u) / (2 * sa * sa) - (v * v) / (2 * sb * sb));
+    if (J) {
+      const Ae = A * e;
+      const du_dx0 = -c, du_dy0 = -s, dv_dx0 = s, dv_dy0 = -c;
+      const g_u = -u / (sa * sa), g_v = -v / (sb * sb);
+      J[0] = e;
+      J[1] = Ae * (g_u * du_dx0 + g_v * dv_dx0);
+      J[2] = Ae * (g_u * du_dy0 + g_v * dv_dy0);
+      J[3] = Ae * (u * u) / (sa * sa * sa);
+      J[4] = Ae * (v * v) / (sb * sb * sb);
+      J[5] = Ae * (g_u * v + g_v * (-u)); // du/dθ = v, dv/dθ = −u
+      J[6] = 1;
+    }
+    return q[6] + A * e;
+  };
+  const P = 7, J = new Array(P);
+  const sse = (q) => { let s2 = 0; for (let i = 0; i < N; i++) { const r = Z[i] - model(q, i, null); s2 += r * r; } return s2; };
+  let cur = sse(p), lam = 1e-2, it = 0;
+  for (; it < o.maxIter; it++) {
+    const JTJ = Array.from({ length: P }, () => new Array(P).fill(0)), JTr = new Array(P).fill(0);
+    for (let i = 0; i < N; i++) {
+      const r = Z[i] - model(p, i, J);
+      for (let a = 0; a < P; a++) { JTr[a] += J[a] * r; for (let b = a; b < P; b++) JTJ[a][b] += J[a] * J[b]; }
+    }
+    for (let a = 0; a < P; a++) for (let b = 0; b < a; b++) JTJ[a][b] = JTJ[b][a];
+    let improved = false;
+    for (let tries = 0; tries < 8; tries++) {
+      const M = JTJ.map((row, a) => row.map((v, b) => (a === b ? v * (1 + lam) + 1e-12 : v)));
+      const Mi = invSmall(M);
+      if (!Mi) { lam *= 10; continue; }
+      const step = Mi.map((row) => row.reduce((acc, v, b) => acc + v * JTr[b], 0));
+      const q = p.map((v, a) => v + step[a]);
+      q[3] = Math.abs(q[3]); q[4] = Math.abs(q[4]);
+      if (q[3] < 0.3 || q[4] < 0.3 || q[3] > 2 * R || q[4] > 2 * R || !(q[0] > 0) ||
+          Math.abs(q[1] - cx) > R || Math.abs(q[2] - cy) > R) { lam *= 10; continue; }
+      const nv = sse(q);
+      if (nv < cur) {
+        const rel = (cur - nv) / Math.max(cur, 1e-300);
+        p = q; cur = nv; lam = Math.max(lam / 3, 1e-7); improved = true;
+        if (rel < 1e-9) it = o.maxIter;
+        break;
+      }
+      lam *= 10;
+    }
+    if (!improved) break;
+  }
+  // 공분산
+  const JTJ = Array.from({ length: P }, () => new Array(P).fill(0));
+  for (let i = 0; i < N; i++) { model(p, i, J); for (let a = 0; a < P; a++) for (let b = 0; b < P; b++) JTJ[a][b] += J[a] * J[b]; }
+  const s2 = cur / Math.max(1, N - P);
+  const Ci = invSmall(JTJ.map((row, a) => row.map((v, b) => (a === b ? v + 1e-9 * Math.max(1, v) : v))));
+  const cov = Ci ? Ci.map((row) => row.map((v) => v * s2)) : null;
+  let [A, x0, y0, sa, sb, th, Bf] = p;
+  // σa ≥ σb 가 되도록 정렬 (θ 는 장축 방향)
+  let iA = 3, iB = 4;
+  if (sb > sa) { [sa, sb] = [sb, sa]; th += Math.PI / 2; [iA, iB] = [iB, iA]; }
+  th = ((th % Math.PI) + Math.PI) % Math.PI;
+  const c = Math.cos(th), s = Math.sin(th);
+  const sx = Math.sqrt(sa * sa * c * c + sb * sb * s * s), sy = Math.sqrt(sa * sa * s * s + sb * sb * c * c);
+  const eps = (sa - sb) / (sa + sb), epsLab = Math.abs(sx - sy) / (sx + sy);
+  let epsErr = NaN;
+  if (cov) {
+    const da = 2 * sb / ((sa + sb) * (sa + sb)), db = -2 * sa / ((sa + sb) * (sa + sb));
+    const v = da * da * cov[iA][iA] + db * db * cov[iB][iB] + 2 * da * db * cov[iA][iB];
+    epsErr = v > 0 ? Math.sqrt(v) : NaN;
+  }
+  const noise = Math.sqrt(s2);
+  return {
+    ok: true, A, x0, y0, sMaj: sa, sMin: sb, theta: th, B: Bf, sx, sy,
+    volume: 2 * Math.PI * A * sa * sb, eps, epsLab, epsErr,
+    sMajErr: cov ? Math.sqrt(Math.max(0, cov[iA][iA])) : NaN, sMinErr: cov ? Math.sqrt(Math.max(0, cov[iB][iB])) : NaN,
+    noise, snr: noise > 0 ? A / noise : Infinity, iters: it, R,
+  };
+}
+
+/** 정규분포 밀도 */
+function npdf(x, m, s) { const z = (x - m) / s; return Math.exp(-0.5 * z * z) / (s * Math.sqrt(2 * Math.PI)); }
+
+/**
+ * 밝기의 정수배 혼합모형:  I ~ Σ_n w_n · N(n·μ, n·σ²),  n = 1..K
+ * EM 으로 맞추고 K 는 BIC 로 고른다(모수 2 + (K−1)). 여러 초기 μ 에서 시작해 최대우도를 취한다.
+ */
+function intensityMixture(I, opt) {
+  const o = Object.assign({ Kmax: 4, iters: 400 }, opt || {});
+  const x = I.filter((v) => isFinite(v) && v > 0);
+  const N = x.length;
+  if (N < 20) return { ok: false, why: `밝기 통계에 표본이 부족합니다 (${N}개 < 20)` };
+  const sx = x.slice().sort((a, b) => a - b);
+  const fits = [];
+  for (let K = 1; K <= o.Kmax; K++) {
+    let best = null;
+    for (const q0 of [0.15, 0.3, 0.45, 0.6]) {
+      let mu = quantileSorted(sx, q0), sig = Math.max(mu * 0.2, 1e-9);
+      let w = Array.from({ length: K }, (_, k) => (k === 0 ? 0.7 : 0.3 / Math.max(1, K - 1)));
+      if (K === 1) w = [1];
+      let ll = -Infinity;
+      for (let it = 0; it < o.iters; it++) {
+        // E
+        const R = new Array(N);
+        let llNew = 0;
+        for (let i = 0; i < N; i++) {
+          const pr = w.map((wk, k) => wk * npdf(x[i], (k + 1) * mu, Math.sqrt(k + 1) * sig));
+          const t = pr.reduce((a, b) => a + b, 0) || 1e-300;
+          R[i] = pr.map((v) => v / t); llNew += Math.log(t);
+        }
+        // M (닫힌 꼴: μ = Σr·I / Σr·n,  σ² = Σ r(I−nμ)²/n / Σ r)
+        let num = 0, den = 0;
+        for (let i = 0; i < N; i++) for (let k = 0; k < K; k++) { num += R[i][k] * x[i]; den += R[i][k] * (k + 1); }
+        mu = num / den;
+        let v2 = 0;
+        for (let i = 0; i < N; i++) for (let k = 0; k < K; k++) { const d = x[i] - (k + 1) * mu; v2 += R[i][k] * d * d / (k + 1); }
+        sig = Math.max(Math.sqrt(v2 / N), mu * 0.01);
+        w = Array.from({ length: K }, (_, k) => Math.max(1e-6, R.reduce((a, r) => a + r[k], 0) / N));
+        const ws = w.reduce((a, b) => a + b, 0); w = w.map((v) => v / ws);
+        if (Math.abs(llNew - ll) < 1e-9 * Math.abs(llNew)) { ll = llNew; break; }
+        ll = llNew;
+      }
+      if (!best || ll > best.ll) best = { K, mu, sigma: sig, w, ll };
+    }
+    best.bic = -2 * best.ll + (2 + (K - 1)) * Math.log(N);
+    fits.push(best);
+  }
+  const chosen = fits.reduce((a, b) => (b.bic < a.bic ? b : a));
+  const post = (v) => {
+    const pr = chosen.w.map((wk, k) => wk * npdf(v, (k + 1) * chosen.mu, Math.sqrt(k + 1) * chosen.sigma));
+    const t = pr.reduce((a, b) => a + b, 0);
+    return t > 0 ? pr.map((p) => p / t) : pr.map(() => NaN);
+  };
+  const cv = chosen.sigma / chosen.mu;
+  return {
+    ok: true, N, K: chosen.K, mu: chosen.mu, sigma: chosen.sigma, w: chosen.w, cv,
+    // 단일 vs 이합체 분리도 d′ = (2μ−μ)/√(σ²+2σ²) = 1/(CV·√3)
+    dPrime: 1 / (cv * Math.sqrt(3)),
+    fits: fits.map((f) => ({ K: f.K, mu: f.mu, sigma: f.sigma, w: f.w, bic: f.bic })),
+    posterior: post,
+  };
+}
+
+/** 스피어만 순위상관 */
+function spearman(a, b) {
+  const rank = (v) => { const idx = v.map((x, i) => [x, i]).sort((p, q) => p[0] - q[0]); const r = new Array(v.length); idx.forEach(([, i], k) => { r[i] = k; }); return r; };
+  const n = a.length; if (n < 5) return NaN;
+  const ra = rank(a), rb = rank(b);
+  const ma = (n - 1) / 2;
+  let sab = 0, saa = 0, sbb = 0;
+  for (let i = 0; i < n; i++) { const da = ra[i] - ma, db = rb[i] - ma; sab += da * db; saa += da * da; sbb += db * db; }
+  return sab / Math.sqrt(saa * sbb);
+}
+
+/**
+ * 단일입자 판별 — 위 두 기준 + 판정 보류 조건.
+ *   classes: single · multi_bright · multi_shape · uncertain · rejected
+ */
+function classifySingles(img, nx, ny, rois, opt) {
+  const o = Object.assign({ R: 5, epsMax: 0.10, p1Min: 0.90, pMulti: 0.90, Kmax: 4, snrMin: 3, crowd: null,
+    widthTol: 1.35, extTol: 1.7, snrMix: 0, minSigmaPx: 0.5, confineFrac: 0.12, fwhmPx: null }, opt || {});
+  const crowd = o.crowd != null ? o.crowd : 2 * o.R;
+  const pos = rois.map((r) => [r.xc != null ? r.xc : r.x, r.yc != null ? r.yc : r.y]);
+  const fits = pos.map(([x, y]) => fitGauss2D(img, nx, ny, x, y, { R: o.R }));
+  const flux = fits.map((f) => (f.ok ? f.volume : NaN));
+  const gm = fits.map((f) => (f.ok ? Math.sqrt(f.sMaj * f.sMin) : NaN));
+  const g = robustStats(img);
+  // ── 실측(261029·261102 widefield 18 파일)에서 드러난 함정 세 가지를 먼저 걸러낸다 ──
+  // (1) 포화: EMCCD 상한(이 자료 15982–15996)에 닿은 점은 꼭대기가 잘려 폭·밝기 모두 틀린다.
+  let vmax = -Infinity; for (let i = 0; i < img.length; i++) if (img[i] > vmax) vmax = img[i];
+  let nAtMax = 0; for (let i = 0; i < img.length; i++) if (img[i] >= vmax - 0.5) nAtMax++;
+  const satLevel = nAtMax >= 3 && vmax > g.median + 50 * (g.sigma || 1) ? vmax - 0.5 : Infinity;
+  const nSatIn = pos.map(([x, y]) => {
+    if (!isFinite(satLevel)) return 0;
+    let c = 0; const cx = Math.round(x), cy = Math.round(y);
+    for (let yy = cy - o.R; yy <= cy + o.R; yy++) for (let xx = cx - o.R; xx <= cx + o.R; xx++)
+      if (yy >= 0 && xx >= 0 && yy < ny && xx < nx && img[yy * nx + xx] >= satLevel) c++;
+    return c;
+  });
+  // (2) 점광원이 아닌 것: 폭이 화소 하나보다 좁음(핫픽셀·잡음) / 받침(확장 발광) 위의 작은 요철
+  const pedestal = fits.map((f) => (f.ok ? (f.B - g.median) / (g.sigma || 1) : NaN));
+  const kind = fits.map((f, i) => {
+    if (nSatIn[i] > 0) return "sat";   // 포화가 먼저 — 잘린 꼭대기는 피팅도 흔히 실패한다
+    if (!f.ok) return "fail";
+    if (f.sMin < o.minSigmaPx) return "spike";
+    if (pedestal[i] > 5 && f.A < (f.B - g.median)) return "bump";
+    if (Math.sqrt(f.sMaj * f.sMin) > 0.8 * f.R) return "wide";
+    if (f.snr < 1.5) return "noise";
+    return "pt";
+  });
+  // 폭 기준값: 점광원 후보(포화·스파이크·요철 제외, SNR≥5, ε≤0.2) 중 **좁은 쪽 절반**의 중앙값.
+  // 확장 발광이 섞인 시야(필름·defocus 고리)에서 전체 중앙값을 쓰면 기준이 부풀어 고리 조각이 "점"으로 통과한다.
+  const ptIdx = fits.map((f, i) => (kind[i] === "pt" && f.snr >= 5 && f.eps <= 0.2 ? i : -1)).filter((i) => i >= 0);
+  const ws = ptIdx.map((i) => gm[i]).sort((x, y) => x - y);
+  let wRef = ws.length ? median(ws.slice(0, Math.max(1, Math.ceil(ws.length / 2)))) : NaN;
+  if (o.fwhmPx > 0) wRef = o.fwhmPx / 2.3548;          // 이론값(λ·NA·µm/px)이 주어지면 그것을 기준으로
+  const okIdx = fits.map((f, i) => (kind[i] === "pt" ? i : -1)).filter((i) => i >= 0);
+  // (3) 발광이 시야 일부에 국한됐는가 — 비선형(PA) 입자는 여기 빔 안쪽에서만 켜진다.
+  //     그러면 밝기는 입자 수가 아니라 **빔 안 위치**(I^s, s ≫ 1)로 정해지므로 정수배 기준이 성립하지 않는다.
+  let confined = null;
+  if (okIdx.length >= 1) {
+    let sw = 0, cx = 0, cy = 0;
+    for (const i of okIdx) { sw += flux[i]; cx += flux[i] * pos[i][0]; cy += flux[i] * pos[i][1]; }
+    cx /= sw; cy /= sw;
+    const d = okIdx.map((i) => [Math.hypot(pos[i][0] - cx, pos[i][1] - cy), flux[i]]).sort((p, q) => p[0] - q[0]);
+    let acc = 0, r90 = 0; for (const [r, w] of d) { acc += w; r90 = r; if (acc >= 0.9 * sw) break; }
+    confined = { cx, cy, r90, frac: r90 / Math.min(nx, ny), yes: okIdx.length >= 2 && r90 / Math.min(nx, ny) < o.confineFrac };
+  }
+  const mixIdx = okIdx.filter((i) => fits[i].snr >= o.snrMix || o.snrMix <= 0);
+  let mix = intensityMixture(mixIdx.map((i) => flux[i]), { Kmax: o.Kmax });
+  if (mix.ok && confined && confined.yes) {
+    mix = { ok: false, confined: true, fitted: mix,
+      why: `발광이 시야의 좁은 영역(밝기 90% 가 반경 ${confined.r90.toFixed(0)} px 안)에 몰려 있습니다 — 여기 빔 안쪽에서만 켜지는 비선형 입자라면 밝기는 입자 수보다 빔 안 위치에 좌우되므로 정수배 기준을 쓰지 않습니다` };
+  }
+  const rc = okIdx.map((i) => Math.hypot(pos[i][0] - nx / 2, pos[i][1] - ny / 2));
+  const rho = spearman(okIdx.map((i) => flux[i]), rc);
+  const out = rois.map((r, i) => {
+    const f = fits[i], why = [];
+    let near = Infinity;
+    for (let j = 0; j < pos.length; j++) if (j !== i) near = Math.min(near, Math.hypot(pos[j][0] - pos[i][0], pos[j][1] - pos[i][1]));
+    const res = { i, fit: f, flux: flux[i], near, cls: "uncertain", n: null, p1: NaN, why, pedestal: pedestal[i] };
+    if (kind[i] === "fail") { res.cls = "rejected"; why.push(`피팅 실패(${f.why})`); return res; }
+    if (kind[i] === "sat") { res.cls = "saturated"; why.push(`포화 화소 ${nSatIn[i]}개 (상한 ${Math.round(satLevel + 0.5)}) — 꼭대기가 잘려 폭·밝기 판정 불가. 노출·EM gain 을 낮춰 다시 찍어야 합니다`); return res; }
+    if (kind[i] === "spike") { res.cls = "rejected"; why.push(`단축 FWHM ${(2.3548 * f.sMin).toFixed(2)} px — 화소 하나보다 좁음(핫픽셀·잡음 스파이크), 회절한계 점이 아님`); return res; }
+    if (kind[i] === "noise") { res.cls = "rejected"; why.push(`SNR ${f.snr.toFixed(1)} — 잡음 수준, 점으로 볼 근거 없음`); return res; }
+    if (kind[i] === "wide") { res.cls = "extended"; why.push(`FWHM ${(2.3548 * gm[i]).toFixed(1)} px — 피팅 창(반경 ${f.R} px)보다 넓은 확장 발광`); return res; }
+    if (kind[i] === "bump") { res.cls = "extended"; why.push(`확장 발광(받침 +${pedestal[i].toFixed(0)}σ) 위의 작은 요철 — 봉우리 ${f.A.toFixed(0)} < 받침 ${(f.B - g.median).toFixed(0)}`); return res; }
+    if (isFinite(wRef) && gm[i] > o.extTol * wRef) {
+      res.cls = "extended"; why.push(`PSF 폭 ${(gm[i] / wRef).toFixed(2)}× 기준 — 점광원이 아님(초점 이탈 고리·필름·큰 덩어리)`); return res;
+    }
+    if (near < crowd) why.push(`이웃 ${near.toFixed(1)} px — 피팅 창 겹침`);
+    if (pedestal[i] > 5) why.push(`받침 +${pedestal[i].toFixed(0)}σ — 주변 확장 발광 위의 점`);
+    // PSF 기준 (불확도 포함)
+    let shape;
+    const e2 = isFinite(f.epsErr) ? 2 * f.epsErr : Infinity;
+    if (f.snr < o.snrMin || !isFinite(f.epsErr)) { shape = "?"; why.push(`SNR ${f.snr.toFixed(1)} — PSF 모양을 판정할 수 없음`); }
+    else if (f.eps - e2 > o.epsMax) shape = "asym";
+    else if (f.eps + e2 <= o.epsMax) shape = "sym";
+    else if (f.eps > o.epsMax) { shape = "?"; why.push(`ε=${f.eps.toFixed(3)}±${f.epsErr.toFixed(3)} — 임계 ${o.epsMax} 가 불확도 안`); }
+    else shape = f.eps + f.epsErr <= o.epsMax ? "symWeak" : "?";
+    if (shape === "?" && f.eps <= o.epsMax && f.snr >= o.snrMin && isFinite(f.epsErr)) why.push(`ε=${f.eps.toFixed(3)}±${f.epsErr.toFixed(3)} — 대칭이라 단정할 만큼 정밀하지 않음`);
+    const wide = isFinite(wRef) && gm[i] > o.widthTol * wRef;
+    if (wide) why.push(`PSF 폭 ${(gm[i] / wRef).toFixed(2)}× 기준 — 초점 이탈·밀집 군집 의심`);
+    // 밝기 기준
+    let bright = "na";
+    if (mix.ok) {
+      const pp = mix.posterior(flux[i]);
+      res.p = pp; res.p1 = pp[0];
+      const nHat = pp.indexOf(Math.max(...pp)) + 1; res.n = nHat;
+      if (flux[i] < mix.mu - 3 * mix.sigma) { bright = "dim"; why.push(`단일 평균보다 3σ 이상 어두움`); }
+      else if (pp[0] >= o.p1Min) bright = "one";
+      else if (nHat >= 2 && pp[nHat - 1] >= o.pMulti) bright = "many";
+      else { bright = "?"; why.push(`밝기 경계 P(n=1)=${pp[0].toFixed(2)}`); }
+    }
+    if (shape === "asym") { res.cls = "multi_shape"; why.unshift(`PSF 비대칭 ε=${f.eps.toFixed(3)}±${f.epsErr.toFixed(3)}`); }
+    else if (bright === "many") { res.cls = "multi_bright"; why.unshift(`밝기 ≈ ${res.n}×μ₁ (P=${res.p[res.n - 1].toFixed(2)})`); }
+    else if ((shape === "sym" || shape === "symWeak") && (bright === "one" || bright === "na") && near >= crowd && !wide) {
+      // 두 기준을 모두 통과해야 단일이다. 밝기 기준을 쓸 수 없으면 PSF 만 통과한 후보로 남긴다.
+      res.cls = bright === "one" ? "single" : "single_psf";
+      if (bright === "na") why.push(mix.confined ? "밝기 기준 미적용 — 발광이 빔 안에 국한" : "밝기 기준 미적용 — PSF 대칭만 확인 (밝기 통계 표본 부족)");
+      if (shape === "symWeak") why.push(`ε 상한이 불확도로 임계를 넘음 (ε+2δ=${(f.eps + e2).toFixed(3)})`);
+    } else res.cls = "uncertain";
+    return res;
+  });
+  const count = (c) => out.filter((r) => r.cls === c).length;
+  return {
+    results: out, mix, widthRef: wRef, illumRho: rho, params: o, confined, saturation: isFinite(satLevel) ? satLevel + 0.5 : null,
+    background: g.median, bgSigma: g.sigma,
+    counts: { single: count("single"), single_psf: count("single_psf"), multi_bright: count("multi_bright"), multi_shape: count("multi_shape"),
+      uncertain: count("uncertain"), extended: count("extended"), saturated: count("saturated"), rejected: count("rejected") },
+  };
+}
+
 /* ------------------------------ display prep ------------------------------ */
 /** 표시용 0–255 환산. mode: lin | log | sqrt. lo/hi 는 원본 단위. */
 function scaleToBytes(img, lo, hi, mode) {
@@ -873,5 +1224,6 @@ return {
   commonMode, stateEvidence, contrast, modulationDepth, selectivity, suggestTarget,
   matchConstellation, registerShift, transferRois, bandpass, difference, noiseFromPair,
   scaleToBytes, scaleDiverging,
+  fitGauss2D, intensityMixture, classifySingles, spearman,
 };
 });
